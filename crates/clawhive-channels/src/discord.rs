@@ -63,6 +63,8 @@ pub struct DiscordBot {
     connector_id: String,
     gateway: Arc<Gateway>,
     bus: Option<Arc<EventBus>>,
+    allowed_groups: Vec<String>,
+    require_mention: bool,
 }
 
 impl DiscordBot {
@@ -72,11 +74,23 @@ impl DiscordBot {
             connector_id,
             gateway,
             bus: None,
+            allowed_groups: Vec::new(),
+            require_mention: true,
         }
     }
 
     pub fn with_bus(mut self, bus: Arc<EventBus>) -> Self {
         self.bus = Some(bus);
+        self
+    }
+
+    pub fn with_groups(mut self, groups: Vec<String>) -> Self {
+        self.allowed_groups = groups;
+        self
+    }
+
+    pub fn with_require_mention(mut self, require: bool) -> Self {
+        self.require_mention = require;
         self
     }
 
@@ -94,6 +108,8 @@ impl DiscordBot {
             connector_id: self.connector_id,
             gateway: self.gateway,
             http_holder: http_holder.clone(),
+            allowed_groups: self.allowed_groups,
+            require_mention: self.require_mention,
         };
 
         // Spawn delivery listener if bus is available
@@ -132,6 +148,8 @@ struct DiscordHandler {
     connector_id: String,
     gateway: Arc<Gateway>,
     http_holder: Arc<RwLock<Option<Arc<Http>>>>,
+    allowed_groups: Vec<String>,
+    require_mention: bool,
 }
 
 #[async_trait]
@@ -164,8 +182,16 @@ impl EventHandler for DiscordHandler {
         let current_user_id = ctx.cache.current_user().id;
         let is_mention = msg.mentions.iter().any(|u| u.id == current_user_id);
 
-        // In guild channels, only respond if this bot is @mentioned
-        if guild_id.is_some() && !is_mention {
+        // Group filtering: if groups whitelist is configured, only respond in specified channels
+        if !self.allowed_groups.is_empty() && guild_id.is_some() {
+            let ch = channel_id.get().to_string();
+            if !self.allowed_groups.contains(&ch) {
+                return;
+            }
+        }
+
+        // Mention check: configurable via require_mention (DMs always pass through)
+        if guild_id.is_some() && self.require_mention && !is_mention {
             return;
         }
 

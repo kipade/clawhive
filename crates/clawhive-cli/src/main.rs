@@ -1627,10 +1627,21 @@ async fn start_bot(root: &Path, with_tui: bool, port: u16) -> Result<()> {
                     );
                     continue;
                 }
-                tracing::info!("Registering Discord bot: {}", connector.connector_id);
+                tracing::info!(
+                    "Registering Discord bot: {} (groups: {}, require_mention: {})",
+                    connector.connector_id,
+                    if connector.groups.is_empty() {
+                        "all".to_string()
+                    } else {
+                        connector.groups.len().to_string()
+                    },
+                    connector.require_mention
+                );
                 bots.push(Box::new(
                     DiscordBot::new(token, connector.connector_id.clone(), gateway.clone())
-                        .with_bus(bus.clone()),
+                        .with_bus(bus.clone())
+                        .with_groups(connector.groups.clone())
+                        .with_require_mention(connector.require_mention),
                 ));
             }
         }

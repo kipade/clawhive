@@ -107,6 +107,8 @@ enum AuthChoice {
 struct ChannelConfig {
     connector_id: String,
     token: String,
+    groups: Vec<String>,
+    require_mention: bool,
 }
 
 pub async fn run_setup(config_root: &Path, force: bool) -> Result<()> {
@@ -376,6 +378,26 @@ fn handle_add_channel(
     let masked = mask_secret(&token);
     println!("  {ARROW} Token saved: {masked}");
 
+    let (groups, require_mention) = if channel_type == "discord" {
+        let groups_input: String = Input::with_theme(theme)
+            .with_prompt("Groups (comma-separated Discord channel IDs, leave empty for all)")
+            .default(String::new())
+            .allow_empty(true)
+            .interact_text()?;
+        let groups: Vec<String> = groups_input
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let require_mention = Confirm::with_theme(theme)
+            .with_prompt("Require @mention in groups?")
+            .default(true)
+            .interact()?;
+        (groups, require_mention)
+    } else {
+        (Vec::new(), true)
+    };
+
     if !state.agents.is_empty() {
         let agent_labels: Vec<&str> = state.agents.iter().map(|a| a.agent_id.as_str()).collect();
         let agent_idx = Select::with_theme(theme)
@@ -396,6 +418,8 @@ fn handle_add_channel(
     let cfg = ChannelConfig {
         connector_id: connector_id.clone(),
         token,
+        groups,
+        require_mention,
     };
     add_channel_to_config(config_root, channel_type, &cfg)?;
     print_done(
@@ -628,6 +652,25 @@ fn add_channel_to_config(
         serde_yaml::Value::String("token".into()),
         serde_yaml::Value::String(cfg.token.clone()),
     );
+    if channel_type == "discord" {
+        if !cfg.groups.is_empty() {
+            let groups_seq: Vec<serde_yaml::Value> = cfg
+                .groups
+                .iter()
+                .map(|g| serde_yaml::Value::String(g.clone()))
+                .collect();
+            connector_map.insert(
+                serde_yaml::Value::String("groups".into()),
+                serde_yaml::Value::Sequence(groups_seq),
+            );
+        }
+        if !cfg.require_mention {
+            connector_map.insert(
+                serde_yaml::Value::String("require_mention".into()),
+                serde_yaml::Value::Bool(false),
+            );
+        }
+    }
     let connector_value = serde_yaml::Value::Mapping(connector_map);
 
     let channel_key = serde_yaml::Value::String(channel_type.to_string());
@@ -673,6 +716,8 @@ fn add_routing_binding(
         let cfg = ChannelConfig {
             connector_id: connector_id.to_string(),
             token: String::new(),
+            groups: Vec::new(),
+            require_mention: true,
         };
         let (tg, dc) = match channel_type {
             "telegram" => (Some(cfg), None),
@@ -1054,6 +1099,15 @@ fn generate_main_yaml(
                 "      - connector_id: {}\n        token: \"{}\"\n",
                 cfg.connector_id, cfg.token
             ));
+            if !cfg.groups.is_empty() {
+                out.push_str("        groups:\n");
+                for g in &cfg.groups {
+                    out.push_str(&format!("          - \"{g}\"\n"));
+                }
+            }
+            if !cfg.require_mention {
+                out.push_str("        require_mention: false\n");
+            }
         }
         None => {
             out.push_str("  discord:\n    enabled: false\n    connectors: []\n");
@@ -1196,10 +1250,14 @@ mod tests {
             Some(ChannelConfig {
                 connector_id: "tg-main".to_string(),
                 token: "123:telegram-token".to_string(),
+                groups: Vec::new(),
+                require_mention: true,
             }),
             Some(ChannelConfig {
                 connector_id: "dc-main".to_string(),
                 token: "discord-token".to_string(),
+                groups: Vec::new(),
+                require_mention: true,
             }),
         );
 
@@ -1217,6 +1275,8 @@ mod tests {
             Some(ChannelConfig {
                 connector_id: "tg-main".into(),
                 token: "tok1".into(),
+                groups: Vec::new(),
+                require_mention: true,
             }),
             None,
         );
@@ -1227,6 +1287,8 @@ mod tests {
             &ChannelConfig {
                 connector_id: "dc-main".into(),
                 token: "tok2".into(),
+                groups: Vec::new(),
+                require_mention: true,
             },
         )
         .unwrap();
@@ -1244,10 +1306,14 @@ mod tests {
             Some(ChannelConfig {
                 connector_id: "tg-main".into(),
                 token: "tok1".into(),
+                groups: Vec::new(),
+                require_mention: true,
             }),
             Some(ChannelConfig {
                 connector_id: "dc-main".into(),
                 token: "tok2".into(),
+                groups: Vec::new(),
+                require_mention: true,
             }),
         );
         std::fs::write(temp.path().join("config/main.yaml"), &initial).unwrap();
@@ -1267,10 +1333,14 @@ mod tests {
             Some(ChannelConfig {
                 connector_id: "tg-main".into(),
                 token: "tok1".into(),
+                groups: Vec::new(),
+                require_mention: true,
             }),
             Some(ChannelConfig {
                 connector_id: "dc-main".into(),
                 token: "tok2".into(),
+                groups: Vec::new(),
+                require_mention: true,
             }),
         );
         std::fs::write(temp.path().join("config/routing.yaml"), &initial).unwrap();
@@ -1288,10 +1358,14 @@ mod tests {
             Some(ChannelConfig {
                 connector_id: "tg-main".to_string(),
                 token: "ignored".to_string(),
+                groups: Vec::new(),
+                require_mention: true,
             }),
             Some(ChannelConfig {
                 connector_id: "dc-main".to_string(),
                 token: "ignored".to_string(),
+                groups: Vec::new(),
+                require_mention: true,
             }),
         );
 

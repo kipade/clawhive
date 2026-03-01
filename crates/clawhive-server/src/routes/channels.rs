@@ -27,6 +27,10 @@ struct ConnectorStatus {
 struct AddConnectorRequest {
     connector_id: String,
     token: String,
+    #[serde(default)]
+    groups: Option<Vec<String>>,
+    #[serde(default)]
+    require_mention: Option<bool>,
 }
 
 async fn get_channels(
@@ -201,6 +205,26 @@ async fn add_connector(
         serde_yaml::Value::String("token".to_string()),
         serde_yaml::Value::String(body.token.clone()),
     );
+    if let Some(groups) = &body.groups {
+        if !groups.is_empty() {
+            let groups_seq: Vec<serde_yaml::Value> = groups
+                .iter()
+                .map(|g| serde_yaml::Value::String(g.clone()))
+                .collect();
+            connector.insert(
+                serde_yaml::Value::String("groups".to_string()),
+                serde_yaml::Value::Sequence(groups_seq),
+            );
+        }
+    }
+    if let Some(require_mention) = body.require_mention {
+        if !require_mention {
+            connector.insert(
+                serde_yaml::Value::String("require_mention".to_string()),
+                serde_yaml::Value::Bool(false),
+            );
+        }
+    }
     connectors.push(serde_yaml::Value::Mapping(connector));
 
     write_main_config(&state, &main)?;

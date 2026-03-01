@@ -75,10 +75,18 @@ pub struct TelegramChannelConfig {
     pub connectors: Vec<TelegramConnectorConfig>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordConnectorConfig {
     pub connector_id: String,
     pub token: String,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    #[serde(default = "default_true")]
+    pub require_mention: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

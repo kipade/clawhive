@@ -42,6 +42,8 @@ export default function SetupPage() {
   const [channelKind, setChannelKind] = useState<"telegram" | "discord" | null>(null);
   const [channelToken, setChannelToken] = useState("");
   const [channelConnectorId, setChannelConnectorId] = useState("");
+  const [channelGroups, setChannelGroups] = useState("");
+  const [channelRequireMention, setChannelRequireMention] = useState(true);
   const [channelCreated, setChannelCreated] = useState(false);
 
   // Step 4: Web Search
@@ -127,11 +129,17 @@ export default function SetupPage() {
 
   const handleAddChannel = async () => {
     if (!channelKind || !channelToken || !channelConnectorId) return;
+    const groups = channelGroups
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     try {
       await addConnector.mutateAsync({
         kind: channelKind,
         connectorId: channelConnectorId,
         token: channelToken,
+        ...(channelKind === "discord" && groups.length > 0 ? { groups } : {}),
+        ...(channelKind === "discord" ? { requireMention: channelRequireMention } : {}),
       });
       setChannelCreated(true);
     } catch {
@@ -276,6 +284,10 @@ export default function SetupPage() {
               onTokenChange={setChannelToken}
               connectorId={channelConnectorId}
               onConnectorIdChange={setChannelConnectorId}
+              groups={channelGroups}
+              onGroupsChange={setChannelGroups}
+              requireMention={channelRequireMention}
+              onRequireMentionChange={setChannelRequireMention}
               onSubmit={handleAddChannel}
               isCreating={addConnector.isPending}
               isCreated={channelCreated}
@@ -599,6 +611,10 @@ function StepChannel({
   onTokenChange,
   connectorId,
   onConnectorIdChange,
+  groups,
+  onGroupsChange,
+  requireMention,
+  onRequireMentionChange,
   onSubmit,
   isCreating,
   isCreated,
@@ -610,6 +626,10 @@ function StepChannel({
   onTokenChange: (v: string) => void;
   connectorId: string;
   onConnectorIdChange: (v: string) => void;
+  groups: string;
+  onGroupsChange: (v: string) => void;
+  requireMention: boolean;
+  onRequireMentionChange: (v: boolean) => void;
   onSubmit: () => void;
   isCreating: boolean;
   isCreated: boolean;
@@ -674,6 +694,43 @@ function StepChannel({
                 className="mt-1.5"
               />
             </div>
+
+            {kind === "discord" && (
+              <>
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                    Group IDs (optional)
+                  </label>
+                  <Input
+                    placeholder="Comma-separated Discord channel IDs, leave empty for all"
+                    value={groups}
+                    onChange={(e) => onGroupsChange(e.target.value)}
+                    disabled={isCreated}
+                    className="mt-1.5"
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">Only respond in these channels. Empty = all channels.</p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                    Require @mention
+                  </label>
+                  <button
+                    onClick={() => { if (!isCreated) onRequireMentionChange(!requireMention); }}
+                    disabled={isCreated}
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                      requireMention ? "bg-primary" : "bg-muted-foreground/30"
+                    } ${isCreated ? "cursor-not-allowed" : "cursor-pointer"}`}
+                  >
+                    <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                      requireMention ? "translate-x-4.5" : "translate-x-0.5"
+                    }`} />
+                  </button>
+                  <span className="text-xs text-muted-foreground">
+                    {requireMention ? "Bot responds only when @mentioned" : "Bot responds to all messages"}
+                  </span>
+                </div>
+              </>
+            )}
 
             <div className="flex items-center justify-between">
               <a

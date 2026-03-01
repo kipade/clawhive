@@ -249,10 +249,21 @@ export function useUpdateChannels() {
 export function useAddConnector() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ kind, connectorId, token }: { kind: string; connectorId: string; token: string }) =>
+    mutationFn: ({ kind, connectorId, token, groups, requireMention }: {
+      kind: string;
+      connectorId: string;
+      token: string;
+      groups?: string[];
+      requireMention?: boolean;
+    }) =>
       apiFetch(`/api/channels/${kind}/connectors`, {
         method: "POST",
-        body: JSON.stringify({ connector_id: connectorId, token }),
+        body: JSON.stringify({
+          connector_id: connectorId,
+          token,
+          ...(groups && groups.length > 0 ? { groups } : {}),
+          ...(requireMention !== undefined ? { require_mention: requireMention } : {}),
+        }),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["channels"] });
