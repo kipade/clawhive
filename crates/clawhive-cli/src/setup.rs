@@ -222,17 +222,14 @@ async fn handle_add_provider(
         None => return Ok(()),
     };
 
-    // For OpenAI we allow separate API-key and OAuth configs to coexist,
-    // so only block when both auth types are already present.
+    // For OpenAI we allow separate API-key ("openai") and OAuth ("openai-chatgpt")
+    // configs to coexist, so only block when both are already present.
     let fully_configured = if provider == ProviderId::OpenAi {
-        let has_key = state.providers.iter().any(|i| {
-            i.provider_id == "openai"
-                && matches!(i.auth_summary, crate::setup_scan::AuthSummary::ApiKey)
-        });
-        let has_oauth = state.providers.iter().any(|i| {
-            i.provider_id == "openai"
-                && matches!(i.auth_summary, crate::setup_scan::AuthSummary::OAuth { .. })
-        });
+        let has_key = state.providers.iter().any(|i| i.provider_id == "openai");
+        let has_oauth = state
+            .providers
+            .iter()
+            .any(|i| i.provider_id == "openai-chatgpt");
         has_key && has_oauth
     } else {
         state
@@ -1067,13 +1064,14 @@ fn write_provider_config_unchecked(
     fs::create_dir_all(&providers_dir)
         .with_context(|| format!("failed to create {}", providers_dir.display()))?;
 
-    // OpenAI OAuth config gets a distinct filename so it can coexist with the API-key config.
-    let filename = match (provider, auth) {
-        (ProviderId::OpenAi, AuthChoice::OAuth { .. }) => "openai-oauth".to_string(),
-        _ => provider.as_str().to_string(),
-    };
-    let target = providers_dir.join(format!("{filename}.yaml"));
     let yaml = generate_provider_yaml(provider, auth, api_base_override);
+    // Derive filename from the provider_id in the generated yaml so that
+    // OpenAI OAuth ("openai-chatgpt") gets its own file alongside "openai".
+    let pid = yaml
+        .lines()
+        .find_map(|l| l.strip_prefix("provider_id: "))
+        .unwrap_or(provider.as_str());
+    let target = providers_dir.join(format!("{pid}.yaml"));
     fs::write(&target, yaml).with_context(|| format!("failed to write {}", target.display()))?;
     Ok(target)
 }
@@ -1103,16 +1101,23 @@ fn generate_provider_yaml(
     let base_url = api_base_override.unwrap_or(provider.api_base());
     match auth {
         AuthChoice::OAuth { profile_name } => {
-            let base = match provider {
-                ProviderId::OpenAi => "https://chatgpt.com/backend-api/codex",
-                _ => base_url,
+            // OpenAI OAuth uses the chatgpt codex endpoint and registers as
+            // a separate "openai-chatgpt" provider so it can coexist with
+            // the API-key-based "openai" provider.
+            let (pid, base, model) = match provider {
+                ProviderId::OpenAi => (
+                    "openai-chatgpt",
+                    "https://chatgpt.com/backend-api/codex",
+                    "gpt-5.3-codex",
+                ),
+                _ => (provider.as_str(), base_url, provider.default_model()),
             };
             format!(
-                "provider_id: {provider}\nenabled: true\napi_base: {base}\nauth_profile: \"{profile}\"\nmodels:\n  - {model}\n",
-                provider = provider.as_str(),
+                "provider_id: {pid}\nenabled: true\napi_base: {base}\nauth_profile: \"{profile}\"\nmodels:\n  - {model}\n",
+                pid = pid,
                 base = base,
                 profile = profile_name,
-                model = provider.default_model(),
+                model = model,
             )
         }
         AuthChoice::ApiKey { api_key } => {
@@ -1247,9 +1252,10 @@ mod tests {
             None,
         );
 
-        assert!(yaml.contains("provider_id: openai"));
+        assert!(yaml.contains("provider_id: openai-chatgpt"));
         assert!(yaml.contains("auth_profile: \"openai-oauth\""));
         assert!(yaml.contains("api_base: https://chatgpt.com/backend-api/codex"));
+        assert!(yaml.contains("gpt-5.3-codex"));
         assert!(!yaml.contains("api_key:"));
     }
 
@@ -1269,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_yaml_openai_oauth_uses_codex_base() {
+    fn provider_yaml_openai_oauth_uses_chatgpt_provider_id() {
         let yaml = generate_provider_yaml(
             ProviderId::OpenAi,
             &AuthChoice::OAuth {
@@ -1278,9 +1284,12 @@ mod tests {
             None,
         );
 
-        assert!(yaml.contains("provider_id: openai"));
+        // OpenAI OAuth should produce provider_id "openai-chatgpt" so it
+        // registers separately from the API-key-based "openai" provider.
+        assert!(yaml.contains("provider_id: openai-chatgpt"));
         assert!(yaml.contains("auth_profile: \"openai-oauth-123\""));
         assert!(yaml.contains("api_base: https://chatgpt.com/backend-api/codex"));
+        assert!(yaml.contains("gpt-5.3-codex"));
         assert!(!yaml.contains("api_key:"));
     }
 
