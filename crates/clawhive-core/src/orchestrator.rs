@@ -145,18 +145,9 @@ impl Orchestrator {
             effective_project_root.clone(),
             effective_project_root.join("access_policy.json"),
         ));
-        tool_registry.register(Box::new(ReadFileTool::new(
-            workspace_root.clone(),
-            default_access_gate.clone(),
-        )));
-        tool_registry.register(Box::new(WriteFileTool::new(
-            workspace_root.clone(),
-            default_access_gate.clone(),
-        )));
-        tool_registry.register(Box::new(EditFileTool::new(
-            workspace_root.clone(),
-            default_access_gate.clone(),
-        )));
+        // Note: read_file/write_file/edit_file are NOT registered in the global
+        // registry — they are dispatched per-agent in execute_tool_for_agent()
+        // to ensure the correct workspace root is used.
         tool_registry.register(Box::new(ExecuteCommandTool::new(
             workspace_root.clone(),
             30,
@@ -352,9 +343,9 @@ impl Orchestrator {
                 )
             });
         match name {
-            "read" => ReadFileTool::new(ws, gate).execute(input, ctx).await,
-            "write" => WriteFileTool::new(ws, gate).execute(input, ctx).await,
-            "edit" => EditFileTool::new(ws, gate).execute(input, ctx).await,
+            "read" | "read_file" => ReadFileTool::new(ws, gate).execute(input, ctx).await,
+            "write" | "write_file" => WriteFileTool::new(ws, gate).execute(input, ctx).await,
+            "edit" | "edit_file" => EditFileTool::new(ws, gate).execute(input, ctx).await,
             "exec" | "execute_command" => {
                 ExecuteCommandTool::new(
                     ws,
