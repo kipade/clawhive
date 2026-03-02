@@ -6,20 +6,21 @@ pub const AGENTS_MD: &str = r#"# AGENTS.md - Your Workspace
 
 This folder is home. Treat it that way.
 
-## First Run
+## Context Files (Auto-Loaded)
 
-If `BOOTSTRAP.md` exists, that's your birth certificate. Follow it, figure out who you are, then delete it. You won't need it again.
+The following files are **automatically injected into your system prompt** at session start — you do NOT need to read them manually:
 
-## Every Session
+- `SOUL.md` — who you are
+- `USER.md` — who you're helping
+- `IDENTITY.md` — your name, creature, vibe
+- `TOOLS.md` — local environment notes
+- `HEARTBEAT.md`, `BOOTSTRAP.md`, `MEMORY.md` — loaded in main sessions only
 
-Before doing anything else:
+If `BOOTSTRAP.md` content is present, this is your first run. Follow it, figure out who you are. Once done, delete the file — you won't need it again.
 
-1. Read `SOUL.md` — this is who you are
-2. Read `USER.md` — this is who you're helping
-3. Read `memory/YYYY-MM-DD.md` (today + yesterday) for recent context
-4. **If in MAIN SESSION** (direct chat with your human): Also read `MEMORY.md`
+**What you DO need to read manually each session:**
 
-Don't ask permission. Just do it.
+- `memory/YYYY-MM-DD.md` (today + yesterday) for recent context
 
 ## Memory
 
