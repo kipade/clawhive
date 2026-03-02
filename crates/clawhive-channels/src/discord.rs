@@ -5,7 +5,10 @@ use clawhive_bus::{EventBus, Topic};
 use clawhive_gateway::Gateway;
 use clawhive_schema::{BusMessage, GroupContext, GroupMember, InboundMessage, OutboundMessage};
 use serenity::all::{
-    ChannelId, Client, Context, EventHandler, GatewayIntents, Http, Message, Ready,
+    ChannelId, Client, Command, CommandInteraction, CommandOptionType, Context, CreateCommand,
+    CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, EditInteractionResponse, EventHandler, GatewayIntents, Http,
+    Interaction, Message, Ready,
 };
 use serenity::async_trait;
 use tokio::sync::RwLock;
@@ -160,6 +163,26 @@ impl EventHandler for DiscordHandler {
             ready.user.name,
             self.connector_id
         );
+        // Register slash commands
+        let commands = vec![
+            CreateCommand::new("new")
+                .description("Start a fresh session")
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "model",
+                        "Model hint (e.g. opus, sonnet)",
+                    )
+                    .required(false),
+                ),
+            CreateCommand::new("status").description("Show session status"),
+            CreateCommand::new("model").description("Show current model info"),
+            CreateCommand::new("help").description("Show available commands"),
+        ];
+        if let Err(e) = Command::set_global_commands(&ctx.http, commands).await {
+            tracing::warn!("Failed to register Discord slash commands: {e}");
+        }
+
         // Store HTTP client for delivery listener
         let mut holder = self.http_holder.write().await;
         *holder = Some(ctx.http.clone());
@@ -274,11 +297,68 @@ impl EventHandler for DiscordHandler {
             }
         });
     }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let Interaction::Command(cmd) = interaction else {
+            return;
+        };
+
+        // Build command text (matching text command format, reuses parse_command)
+        let text = match cmd.data.name.as_str() {
+            "new" => {
+                let model_hint = cmd.data.options.first().and_then(|o| o.value.as_str());
+                match model_hint {
+                    Some(hint) => format!("/new {hint}"),
+                    None => "/new".to_string(),
+                }
+            }
+            "help" => {
+                // /help replies directly, doesn't go through gateway
+                let help_text = "**Available Commands**\n\
+                    /new — Start a fresh session\n\
+                    /status — Show session status\n\
+                    /model — Show current model info";
+                respond_to_interaction(&ctx, &cmd, help_text).await;
+                return;
+            }
+            other => format!("/{other}"),
+        };
+
+        // Defer response (gateway processing may exceed 3s)
+        defer_interaction(&ctx, &cmd).await;
+
+        // Build InboundMessage and route through gateway
+        let adapter = DiscordAdapter::new(self.connector_id.clone());
+        let guild_id = cmd.guild_id.map(|id| id.get());
+        let channel_id = cmd.channel_id;
+        let user_id = cmd.user.id.get();
+        let inbound = adapter.to_inbound(guild_id, channel_id.get(), user_id, &text);
+
+        match self.gateway.handle_inbound(inbound).await {
+            Ok(outbound) => edit_deferred_response(&ctx, &cmd, &outbound.text).await,
+            Err(err) => {
+                tracing::error!("discord slash command gateway error: {err}");
+                edit_deferred_response(&ctx, &cmd, "Internal error, please try again later.").await;
+            }
+        }
+    }
 }
 
 const DISCORD_MAX_LEN: usize = 2000;
 
-/// Split a message into chunks that fit within Discord's 2000-char limit.
+/// Find the largest byte index <= `max` that lies on a UTF-8 char boundary.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut i = max;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Split a message into chunks that fit within Discord's 2000-byte limit.
 /// Tries to break at newlines, then spaces, to keep messages readable.
 fn split_message(text: &str) -> Vec<&str> {
     if text.len() <= DISCORD_MAX_LEN {
@@ -291,12 +371,13 @@ fn split_message(text: &str) -> Vec<&str> {
             chunks.push(rest);
             break;
         }
-        let boundary = &rest[..DISCORD_MAX_LEN];
+        let safe_end = floor_char_boundary(rest, DISCORD_MAX_LEN);
+        let boundary = &rest[..safe_end];
         let split_at = boundary
             .rfind('\n')
             .or_else(|| boundary.rfind(' '))
             .map(|i| i + 1)
-            .unwrap_or(DISCORD_MAX_LEN);
+            .unwrap_or(safe_end);
         chunks.push(&rest[..split_at]);
         rest = &rest[split_at..];
     }
@@ -313,6 +394,50 @@ async fn send_chunked(
         channel_id.say(http, chunk).await?;
     }
     Ok(())
+}
+
+/// Defer an interaction response (for long-running commands).
+async fn defer_interaction(ctx: &Context, cmd: &CommandInteraction) {
+    let response = CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new());
+    if let Err(e) = cmd.create_response(&ctx.http, response).await {
+        tracing::error!("Failed to defer Discord interaction: {e}");
+    }
+}
+
+/// Edit the deferred response with actual content.
+async fn edit_deferred_response(ctx: &Context, cmd: &CommandInteraction, text: &str) {
+    // Use split_message which already handles char boundaries
+    let chunks = split_message(text);
+
+    // First chunk goes into the deferred response edit
+    if let Some(&first) = chunks.first() {
+        let builder = EditInteractionResponse::new().content(first);
+        if let Err(e) = cmd.edit_response(&ctx.http, builder).await {
+            tracing::error!("Failed to edit Discord interaction response: {e}");
+        }
+    }
+
+    // Remaining chunks sent as followups
+    for &chunk in chunks.iter().skip(1) {
+        if let Err(e) = cmd
+            .create_followup(
+                &ctx.http,
+                CreateInteractionResponseFollowup::new().content(chunk),
+            )
+            .await
+        {
+            tracing::error!("Failed to send followup: {e}");
+        }
+    }
+}
+
+/// Respond immediately to an interaction (for simple commands like /help).
+async fn respond_to_interaction(ctx: &Context, cmd: &CommandInteraction, text: &str) {
+    let response =
+        CreateInteractionResponse::Message(CreateInteractionResponseMessage::new().content(text));
+    if let Err(e) = cmd.create_response(&ctx.http, response).await {
+        tracing::error!("Failed to respond to Discord interaction: {e}");
+    }
 }
 
 /// Parse conversation_scope to extract channel ID
@@ -513,5 +638,33 @@ mod tests {
         for chunk in &chunks {
             assert!(chunk.len() <= DISCORD_MAX_LEN);
         }
+    }
+
+    #[test]
+    fn split_message_multibyte_chars_no_panic() {
+        // Each Chinese char is 3 bytes in UTF-8; fill to just over DISCORD_MAX_LEN
+        let text = "中".repeat(700); // 700 * 3 = 2100 bytes
+        let chunks = split_message(&text);
+        assert_eq!(chunks.len(), 2);
+        for chunk in &chunks {
+            assert!(chunk.len() <= DISCORD_MAX_LEN);
+            // Every chunk must be valid UTF-8 (no split mid-char)
+            assert!(chunk.is_ascii() || chunk.chars().count() > 0);
+        }
+    }
+
+    #[test]
+    fn floor_char_boundary_on_ascii() {
+        let s = "hello world";
+        assert_eq!(floor_char_boundary(s, 5), 5);
+    }
+
+    #[test]
+    fn floor_char_boundary_mid_multibyte() {
+        let s = "ab中"; // bytes: 61 62 e4 b8 ad
+                        // index 3 is the start of '中', index 4 is mid-char
+        assert_eq!(floor_char_boundary(s, 4), 2);
+        assert_eq!(floor_char_boundary(s, 3), 2);
+        assert_eq!(floor_char_boundary(s, 5), 5); // end of string
     }
 }
