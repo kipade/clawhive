@@ -457,21 +457,30 @@ fn parse_sse_event(
 
         // Error events
         "error" => {
-            let message = event.message.unwrap_or_else(|| "unknown error".to_string());
-            if let Some(code) = event.code {
-                Err(anyhow!("chatgpt responses api error: {message} ({code})"))
+            let message = event.message.unwrap_or_default();
+            let code = event.code.unwrap_or_default();
+            let extra = if event.extra.is_empty() {
+                String::new()
             } else {
-                Err(anyhow!("chatgpt responses api error: {message}"))
-            }
+                format!(" extra={}", serde_json::to_string(&event.extra).unwrap_or_default())
+            };
+            Err(anyhow!("chatgpt responses api error: message={message:?} code={code:?}{extra}"))
         }
 
         "response.failed" => {
-            let message = event
+            let error_msg = event
                 .response
                 .and_then(|resp| resp.error)
-                .map(|err| err.message)
-                .unwrap_or_else(|| "unknown error".to_string());
-            Err(anyhow!("chatgpt responses api error: {message}"))
+                .map(|err| err.message);
+            let extra = if event.extra.is_empty() {
+                String::new()
+            } else {
+                format!(" extra={}", serde_json::to_string(&event.extra).unwrap_or_default())
+            };
+            Err(anyhow!(
+                "chatgpt responses api failed: message={:?}{extra}",
+                error_msg.as_deref().unwrap_or("")
+            ))
         }
 
         _ => Ok(None),
@@ -567,6 +576,9 @@ pub(crate) struct ResponsesStreamEvent {
     pub call_id: Option<String>,
     #[serde(default)]
     pub arguments: Option<String>,
+    /// Capture any extra fields for diagnostic logging
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
