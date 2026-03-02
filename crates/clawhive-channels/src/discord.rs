@@ -5,10 +5,11 @@ use clawhive_bus::{EventBus, Topic};
 use clawhive_gateway::Gateway;
 use clawhive_schema::{BusMessage, GroupContext, GroupMember, InboundMessage, OutboundMessage};
 use serenity::all::{
-    ChannelId, Client, Command, CommandInteraction, CommandOptionType, Context, CreateCommand,
+    ButtonStyle, ChannelId, Client, Command, CommandInteraction, CommandOptionType,
+    ComponentInteraction, Context, CreateActionRow, CreateButton, CreateCommand,
     CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseFollowup,
-    CreateInteractionResponseMessage, EditInteractionResponse, EventHandler, GatewayIntents, Http,
-    Interaction, Message, Ready,
+    CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, EventHandler,
+    GatewayIntents, Http, Interaction, Message, Ready,
 };
 use serenity::async_trait;
 use tokio::sync::RwLock;
@@ -118,9 +119,16 @@ impl DiscordBot {
         // Spawn delivery listener if bus is available
         if let Some(bus) = self.bus {
             let http_holder_clone = http_holder.clone();
-            let connector_id = connector_id_for_delivery.clone();
+            let connector_id_delivery = connector_id_for_delivery.clone();
+            let bus_clone = bus.clone();
             tokio::spawn(async move {
-                spawn_delivery_listener(bus, http_holder_clone, connector_id).await;
+                spawn_delivery_listener(bus_clone, http_holder_clone, connector_id_delivery).await;
+            });
+
+            let http_holder_approval = http_holder.clone();
+            let connector_id_approval = connector_id_for_delivery;
+            tokio::spawn(async move {
+                spawn_approval_listener(bus, http_holder_approval, connector_id_approval).await;
             });
         }
 
@@ -304,10 +312,54 @@ impl EventHandler for DiscordHandler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        let Interaction::Command(cmd) = interaction else {
+        match interaction {
+            Interaction::Command(cmd) => {
+                self.handle_command_interaction(&ctx, cmd).await;
+            }
+            Interaction::Component(component) => {
+                self.handle_component_interaction(&ctx, component).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl DiscordHandler {
+    async fn handle_component_interaction(&self, ctx: &Context, component: ComponentInteraction) {
+        let custom_id = &component.data.custom_id;
+        let Some(rest) = custom_id.strip_prefix("approve:") else {
             return;
         };
 
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            return;
+        }
+
+        let short_id = parts[0];
+        let decision = parts[1];
+
+        let adapter = DiscordAdapter::new(self.connector_id.clone());
+        let guild_id = component.guild_id.map(|id| id.get());
+        let channel_id = component.channel_id;
+        let user_id = component.user.id.get();
+        let text = format!("/approve {short_id} {decision}");
+        let inbound = adapter.to_inbound(guild_id, channel_id.get(), user_id, &text);
+
+        let reply_text = match self.gateway.handle_inbound(inbound).await {
+            Ok(outbound) => outbound.text,
+            Err(e) => format!("❌ Error: {e}"),
+        };
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(reply_text)
+                .ephemeral(true),
+        );
+        let _ = component.create_response(&ctx.http, response).await;
+    }
+
+    async fn handle_command_interaction(&self, ctx: &Context, cmd: CommandInteraction) {
         // Build command text (matching text command format, reuses parse_command)
         let text = match cmd.data.name.as_str() {
             "new" => {
@@ -323,14 +375,14 @@ impl EventHandler for DiscordHandler {
                     /new — Start a fresh session\n\
                     /status — Show session status\n\
                     /model — Show current model info";
-                respond_to_interaction(&ctx, &cmd, help_text).await;
+                respond_to_interaction(ctx, &cmd, help_text).await;
                 return;
             }
             other => format!("/{other}"),
         };
 
         // Defer response (gateway processing may exceed 3s)
-        defer_interaction(&ctx, &cmd).await;
+        defer_interaction(ctx, &cmd).await;
 
         // Build InboundMessage and route through gateway
         let adapter = DiscordAdapter::new(self.connector_id.clone());
@@ -346,11 +398,11 @@ impl EventHandler for DiscordHandler {
                 } else {
                     outbound.text.as_str()
                 };
-                edit_deferred_response(&ctx, &cmd, reply).await;
+                edit_deferred_response(ctx, &cmd, reply).await;
             }
             Err(err) => {
                 tracing::error!("discord slash command gateway error: {err}");
-                edit_deferred_response(&ctx, &cmd, "Internal error, please try again later.").await;
+                edit_deferred_response(ctx, &cmd, "Internal error, please try again later.").await;
             }
         }
     }
@@ -515,6 +567,74 @@ async fn spawn_delivery_listener(
             tracing::error!("Failed to deliver announce message: {e}");
         } else {
             tracing::info!("Delivered scheduled task result to channel {}", channel_id);
+        }
+    }
+}
+
+/// Spawn a listener for DeliverApprovalRequest messages — sends buttons
+async fn spawn_approval_listener(
+    bus: Arc<EventBus>,
+    http_holder: Arc<RwLock<Option<Arc<Http>>>>,
+    connector_id: String,
+) {
+    let mut rx = bus.subscribe(Topic::DeliverApprovalRequest).await;
+    while let Some(msg) = rx.recv().await {
+        let BusMessage::DeliverApprovalRequest {
+            channel_type,
+            connector_id: msg_connector_id,
+            conversation_scope,
+            short_id,
+            agent_id,
+            command,
+        } = msg
+        else {
+            continue;
+        };
+
+        if channel_type != "discord" || msg_connector_id != connector_id {
+            continue;
+        }
+
+        let http = {
+            let holder = http_holder.read().await;
+            holder.clone()
+        };
+
+        let Some(http) = http else {
+            tracing::warn!("Discord HTTP client not ready for approval delivery");
+            continue;
+        };
+
+        let Some(channel_id) = parse_channel_id(&conversation_scope) else {
+            tracing::warn!(
+                "Could not parse channel ID from conversation_scope: {}",
+                conversation_scope
+            );
+            continue;
+        };
+
+        let text =
+            format!("⚠️ **Command Approval Required**\nAgent: `{agent_id}`\nCommand: `{command}`");
+
+        let buttons = CreateActionRow::Buttons(vec![
+            CreateButton::new(format!("approve:{short_id}:allow"))
+                .label("✅ Allow Once")
+                .style(ButtonStyle::Success),
+            CreateButton::new(format!("approve:{short_id}:always"))
+                .label("🔓 Always Allow")
+                .style(ButtonStyle::Primary),
+            CreateButton::new(format!("approve:{short_id}:deny"))
+                .label("❌ Deny")
+                .style(ButtonStyle::Danger),
+        ]);
+
+        let message = CreateMessage::new()
+            .content(&text)
+            .components(vec![buttons]);
+
+        let channel = ChannelId::new(channel_id);
+        if let Err(e) = channel.send_message(&http, message).await {
+            tracing::error!("Failed to send approval buttons: {e}");
         }
     }
 }

@@ -99,9 +99,7 @@ impl ExecuteCommandTool {
                 tracing::info!(pattern, "adding to exec allowlist");
                 Ok(None)
             }
-            Ok(ApprovalDecision::Deny) | Err(_) => {
-                Ok(Some("Command denied by user".to_string()))
-            }
+            Ok(ApprovalDecision::Deny) | Err(_) => Ok(Some("Command denied by user".to_string())),
         }
     }
 

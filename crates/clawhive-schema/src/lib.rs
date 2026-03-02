@@ -252,6 +252,14 @@ pub enum BusMessage {
         conversation_scope: String,
         text: String,
     },
+    DeliverApprovalRequest {
+        channel_type: String,
+        connector_id: String,
+        conversation_scope: String,
+        short_id: String,
+        agent_id: String,
+        command: String,
+    },
     WaitTaskCompleted {
         task_id: String,
         session_key: String,

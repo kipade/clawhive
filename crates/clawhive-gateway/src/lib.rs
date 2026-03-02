@@ -420,17 +420,16 @@ pub fn spawn_approval_delivery_listener(bus: Arc<EventBus>) -> tokio::task::Join
                 continue;
             };
 
-            let short_id = &trace_id.to_string()[..8];
-            let text = format!(
-                "⚠️ *Command Approval Required*\nAgent: `{agent_id}`\nCommand: `{command}`\n\nReply with:\n`/approve {short_id} allow` - Allow once\n`/approve {short_id} always` - Always allow\n`/approve {short_id} deny` - Deny"
-            );
+            let short_id = trace_id.to_string()[..8].to_string();
 
             let _ = publisher
-                .publish(BusMessage::DeliverAnnounce {
+                .publish(BusMessage::DeliverApprovalRequest {
                     channel_type: ch_type,
                     connector_id: conn_id,
                     conversation_scope: conv_scope,
-                    text,
+                    short_id,
+                    agent_id,
+                    command,
                 })
                 .await;
         }

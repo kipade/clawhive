@@ -22,6 +22,7 @@ pub enum Topic {
     ScheduledTaskTriggered,
     ScheduledTaskCompleted,
     DeliverAnnounce,
+    DeliverApprovalRequest,
     WaitTaskCompleted,
 }
 
@@ -43,6 +44,7 @@ impl Topic {
             BusMessage::ScheduledTaskTriggered { .. } => Topic::ScheduledTaskTriggered,
             BusMessage::ScheduledTaskCompleted { .. } => Topic::ScheduledTaskCompleted,
             BusMessage::DeliverAnnounce { .. } => Topic::DeliverAnnounce,
+            BusMessage::DeliverApprovalRequest { .. } => Topic::DeliverApprovalRequest,
             BusMessage::WaitTaskCompleted { .. } => Topic::WaitTaskCompleted,
         }
     }
@@ -353,6 +355,17 @@ mod tests {
                     response: Some("ok".into()),
                 },
                 Topic::ScheduledTaskCompleted,
+            ),
+            (
+                BusMessage::DeliverApprovalRequest {
+                    channel_type: "discord".into(),
+                    connector_id: "dc_main".into(),
+                    conversation_scope: "guild:1:channel:2".into(),
+                    short_id: "abc12345".into(),
+                    agent_id: "agent-1".into(),
+                    command: "echo ok".into(),
+                },
+                Topic::DeliverApprovalRequest,
             ),
         ];
 

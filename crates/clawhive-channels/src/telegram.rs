@@ -8,7 +8,8 @@ use clawhive_schema::{ActionKind, Attachment, AttachmentKind, InboundMessage, Ou
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{
-    BotCommand, ChatAction, Message, MessageEntityKind, MessageId, ParseMode, ReactionType,
+    BotCommand, CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    MessageEntityKind, MessageId, ParseMode, ReactionType,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -111,19 +112,30 @@ impl TelegramBot {
         // Spawn delivery listener for scheduled task announcements
         let bot_holder_clone = bot_holder.clone();
         let connector_id_clone = connector_id.clone();
-        let bus_clone = bus.clone();
+        let bus_delivery = bus.clone();
+        let bus_action = bus.clone();
+        let bus_approval = bus.clone();
         tokio::spawn(spawn_delivery_listener(
-            bus_clone,
+            bus_delivery,
             bot_holder_clone.clone(),
             connector_id_clone.clone(),
         ));
         tokio::spawn(spawn_action_listener(
-            bus,
+            bus_action,
+            bot_holder_clone.clone(),
+            connector_id_clone.clone(),
+        ));
+        tokio::spawn(spawn_approval_listener(
+            bus_approval,
             bot_holder_clone,
             connector_id_clone,
         ));
 
-        let handler = Update::filter_message().endpoint(move |bot: Bot, msg: Message| {
+        let gateway_for_callback = gateway.clone();
+        let adapter_for_callback = adapter.clone();
+        let connector_id_for_callback = self.connector_id.clone();
+
+        let message_handler = Update::filter_message().endpoint(move |bot: Bot, msg: Message| {
             let adapter = adapter.clone();
             let gateway = gateway.clone();
 
@@ -229,6 +241,77 @@ impl TelegramBot {
             }
         });
 
+        let callback_handler =
+            Update::filter_callback_query().endpoint(move |bot: Bot, q: CallbackQuery| {
+                let gateway = gateway_for_callback.clone();
+                let adapter = adapter_for_callback.clone();
+                let connector_id = connector_id_for_callback.clone();
+
+                async move {
+                    let Some(data) = q.data else {
+                        return Ok::<(), teloxide::RequestError>(());
+                    };
+
+                    let Some(rest) = data.strip_prefix("approve:") else {
+                        return Ok::<(), teloxide::RequestError>(());
+                    };
+
+                    let parts: Vec<&str> = rest.splitn(2, ':').collect();
+                    if parts.len() != 2 {
+                        return Ok::<(), teloxide::RequestError>(());
+                    }
+
+                    let short_id = parts[0];
+                    let decision = parts[1];
+
+                    // Extract chat_id from the callback's message
+                    let (chat_id, msg_id) = match &q.message {
+                        Some(msg) => (msg.chat().id, msg.id()),
+                        None => {
+                            let _ = bot
+                                .answer_callback_query(&q.id)
+                                .text("❌ Message expired")
+                                .await;
+                            return Ok::<(), teloxide::RequestError>(());
+                        }
+                    };
+
+                    let user_id = q.from.id.0 as i64;
+                    let text = format!("/approve {short_id} {decision}");
+                    let inbound = adapter.to_inbound(chat_id.0, user_id, &text, None);
+
+                    // Construct synthetic inbound with proper connector_id
+                    let mut inbound = InboundMessage {
+                        connector_id: connector_id.clone(),
+                        ..inbound
+                    };
+                    // Ensure channel_type is correct
+                    inbound.channel_type = "telegram".to_string();
+
+                    let reply_text = match gateway.handle_inbound(inbound).await {
+                        Ok(outbound) => outbound.text,
+                        Err(e) => format!("❌ Error: {e}"),
+                    };
+
+                    // Answer callback query with result
+                    let _ = bot.answer_callback_query(&q.id).text(&reply_text).await;
+
+                    // Remove inline keyboard from the original message
+                    let _ = bot
+                        .edit_message_reply_markup(chat_id, msg_id)
+                        .reply_markup(InlineKeyboardMarkup::new(
+                            Vec::<Vec<InlineKeyboardButton>>::new(),
+                        ))
+                        .await;
+
+                    Ok::<(), teloxide::RequestError>(())
+                }
+            });
+
+        let handler = dptree::entry()
+            .branch(message_handler)
+            .branch(callback_handler);
+
         Dispatcher::builder(bot, handler)
             .enable_ctrlc_handler()
             .build()
@@ -327,6 +410,70 @@ async fn spawn_delivery_listener(
                 "Delivered scheduled task result to Telegram chat {}",
                 chat_id
             );
+        }
+    }
+}
+
+/// Spawn a listener for DeliverApprovalRequest messages — sends inline keyboard buttons
+async fn spawn_approval_listener(
+    bus: Arc<EventBus>,
+    bot_holder: Arc<RwLock<Option<Bot>>>,
+    connector_id: String,
+) {
+    let mut rx = bus.subscribe(Topic::DeliverApprovalRequest).await;
+    while let Some(msg) = rx.recv().await {
+        let BusMessage::DeliverApprovalRequest {
+            channel_type,
+            connector_id: msg_connector_id,
+            conversation_scope,
+            short_id,
+            agent_id,
+            command,
+        } = msg
+        else {
+            continue;
+        };
+
+        if channel_type != "telegram" || msg_connector_id != connector_id {
+            continue;
+        }
+
+        let bot = {
+            let holder = bot_holder.read().await;
+            holder.clone()
+        };
+
+        let Some(bot) = bot else {
+            tracing::warn!("Telegram bot not ready for approval delivery");
+            continue;
+        };
+
+        let Some(chat_id) = parse_chat_id(&conversation_scope) else {
+            tracing::warn!(
+                "Could not parse chat ID from conversation_scope: {}",
+                conversation_scope
+            );
+            continue;
+        };
+
+        let text = format!(
+            "⚠️ <b>Command Approval Required</b>\nAgent: <code>{agent_id}</code>\nCommand: <code>{command}</code>"
+        );
+
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback("✅ Allow Once", format!("approve:{short_id}:allow")),
+            InlineKeyboardButton::callback("🔓 Always Allow", format!("approve:{short_id}:always")),
+            InlineKeyboardButton::callback("❌ Deny", format!("approve:{short_id}:deny")),
+        ]]);
+
+        let chat = ChatId(chat_id);
+        if let Err(e) = bot
+            .send_message(chat, &text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+            .await
+        {
+            tracing::error!("Failed to send approval keyboard to Telegram: {e}");
         }
     }
 }

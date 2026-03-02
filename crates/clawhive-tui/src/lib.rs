@@ -410,6 +410,19 @@ impl App {
             BusMessage::ActionReady { ref action } => {
                 self.push_event(format!("[{ts}] ActionReady: {:?}", action.action));
             }
+            BusMessage::DeliverApprovalRequest {
+                ref channel_type,
+                ref connector_id,
+                ref short_id,
+                ref agent_id,
+                ref command,
+                ..
+            } => {
+                self.push_event(format!(
+                    "[{ts}] DeliverApprovalRequest {channel_type}:{connector_id} id={short_id}"
+                ));
+                self.push_log(format!("[{ts}] Approval → agent={agent_id} cmd={command}"));
+            }
         }
     }
 }
