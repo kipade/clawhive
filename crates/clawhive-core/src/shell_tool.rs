@@ -88,9 +88,9 @@ impl ExecuteCommandTool {
                 .await;
         }
 
-        match tokio::time::timeout(Duration::from_secs(60), rx).await {
-            Ok(Ok(ApprovalDecision::AllowOnce)) => Ok(None),
-            Ok(Ok(ApprovalDecision::AlwaysAllow)) => {
+        match rx.await {
+            Ok(ApprovalDecision::AllowOnce) => Ok(None),
+            Ok(ApprovalDecision::AlwaysAllow) => {
                 let first_token = command.split_whitespace().next().unwrap_or(command);
                 let pattern = format!("{first_token} *");
                 registry
@@ -99,10 +99,9 @@ impl ExecuteCommandTool {
                 tracing::info!(pattern, "adding to exec allowlist");
                 Ok(None)
             }
-            Ok(Ok(ApprovalDecision::Deny)) | Ok(Err(_)) => {
+            Ok(ApprovalDecision::Deny) | Err(_) => {
                 Ok(Some("Command denied by user".to_string()))
             }
-            Err(_) => Ok(Some("Exec approval timed out (60s)".to_string())),
         }
     }
 
