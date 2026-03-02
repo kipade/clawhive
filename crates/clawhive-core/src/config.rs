@@ -180,7 +180,7 @@ pub struct ToolPolicyConfig {
 }
 
 /// Master security mode for an agent
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum SecurityMode {
     /// All security checks enabled (default)

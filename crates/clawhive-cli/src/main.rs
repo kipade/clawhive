@@ -67,6 +67,12 @@ enum Commands {
         tui: bool,
         #[arg(long, default_value = "8848", help = "HTTP API server port")]
         port: u16,
+        /// Override security mode (overrides agent config)
+        #[arg(long, value_name = "MODE")]
+        security: Option<SecurityMode>,
+        /// Shorthand for --security off
+        #[arg(long)]
+        no_security: bool,
     },
     #[command(about = "Stop a running clawhive process")]
     Stop,
@@ -78,11 +84,23 @@ enum Commands {
         tui: bool,
         #[arg(long, default_value = "8848", help = "HTTP API server port")]
         port: u16,
+        /// Override security mode (overrides agent config)
+        #[arg(long, value_name = "MODE")]
+        security: Option<SecurityMode>,
+        /// Shorthand for --security off
+        #[arg(long)]
+        no_security: bool,
     },
     #[command(about = "Code mode: open developer TUI")]
     Code {
         #[arg(long, default_value = "8848", help = "HTTP API server port")]
         port: u16,
+        /// Override security mode (overrides agent config)
+        #[arg(long, value_name = "MODE")]
+        security: Option<SecurityMode>,
+        /// Shorthand for --security off
+        #[arg(long)]
+        no_security: bool,
     },
     #[command(about = "Dashboard mode: attach TUI observability panel to running gateway")]
     Dashboard {
@@ -93,6 +111,12 @@ enum Commands {
     Chat {
         #[arg(long, default_value = "clawhive-main", help = "Agent ID to use")]
         agent: String,
+        /// Override security mode (overrides agent config)
+        #[arg(long, value_name = "MODE")]
+        security: Option<SecurityMode>,
+        /// Shorthand for --security off
+        #[arg(long)]
+        no_security: bool,
     },
     #[command(about = "Validate config files")]
     Validate,
@@ -300,38 +324,62 @@ async fn main() -> Result<()> {
                 config.routing.bindings.len()
             );
         }
-        Commands::Start { daemon, tui, port } => {
+        Commands::Start {
+            daemon,
+            tui,
+            port,
+            security,
+            no_security,
+        } => {
             ensure_skeleton_config(&cli.config_root, port)?;
+            let security_override = resolve_security_override(security, no_security);
             if daemon {
-                daemonize(&cli.config_root, tui, port)?;
+                daemonize(&cli.config_root, tui, port, security_override)?;
             } else {
-                start_bot(&cli.config_root, tui, port).await?;
+                start_bot(&cli.config_root, tui, port, security_override).await?;
             }
         }
         Commands::Stop => {
             stop_process(&cli.config_root)?;
         }
-        Commands::Restart { daemon, tui, port } => {
+        Commands::Restart {
+            daemon,
+            tui,
+            port,
+            security,
+            no_security,
+        } => {
             let was_running = stop_process(&cli.config_root)?;
             if was_running {
                 // Brief pause to let ports release
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             ensure_skeleton_config(&cli.config_root, port)?;
+            let security_override = resolve_security_override(security, no_security);
             if daemon {
-                daemonize(&cli.config_root, tui, port)?;
+                daemonize(&cli.config_root, tui, port, security_override)?;
             } else {
-                start_bot(&cli.config_root, tui, port).await?;
+                start_bot(&cli.config_root, tui, port, security_override).await?;
             }
         }
-        Commands::Code { port } => {
-            run_code_tui(&cli.config_root, port).await?;
+        Commands::Code {
+            port,
+            security,
+            no_security,
+        } => {
+            let security_override = resolve_security_override(security, no_security);
+            run_code_tui(&cli.config_root, port, security_override).await?;
         }
         Commands::Dashboard { port } => {
             run_dashboard_tui(port).await?;
         }
-        Commands::Chat { agent } => {
-            run_repl(&cli.config_root, &agent).await?;
+        Commands::Chat {
+            agent,
+            security,
+            no_security,
+        } => {
+            let security_override = resolve_security_override(security, no_security);
+            run_repl(&cli.config_root, &agent, security_override).await?;
         }
         Commands::Consolidate => {
             run_consolidate(&cli.config_root).await?;
@@ -481,7 +529,7 @@ async fn main() -> Result<()> {
                 _schedule_manager,
                 _wait_manager,
                 _approval_registry,
-            ) = bootstrap(&cli.config_root).await?;
+            ) = bootstrap(&cli.config_root, None).await?;
             let session_mgr = SessionManager::new(memory, 1800);
             match cmd {
                 SessionCommands::Reset { session_key } => {
@@ -502,7 +550,7 @@ async fn main() -> Result<()> {
                 _schedule_manager,
                 _wait_manager,
                 _approval_registry,
-            ) = bootstrap(&cli.config_root).await?;
+            ) = bootstrap(&cli.config_root, None).await?;
             match cmd {
                 TaskCommands::Trigger {
                     agent: _agent,
@@ -542,7 +590,7 @@ async fn main() -> Result<()> {
                 schedule_manager,
                 _wait_manager,
                 _approval_registry,
-            ) = bootstrap(&cli.config_root).await?;
+            ) = bootstrap(&cli.config_root, None).await?;
             match cmd {
                 ScheduleCommands::List => {
                     let entries = schedule_manager.list().await;
@@ -753,9 +801,21 @@ fn format_schedule_type(schedule: &ScheduleType) -> String {
     }
 }
 
+fn resolve_security_override(
+    security: Option<SecurityMode>,
+    no_security: bool,
+) -> Option<SecurityMode> {
+    if no_security {
+        Some(SecurityMode::Off)
+    } else {
+        security
+    }
+}
+
 #[allow(clippy::type_complexity)]
 async fn bootstrap(
     root: &Path,
+    security_override: Option<SecurityMode>,
 ) -> Result<(
     Arc<EventBus>,
     Arc<MemoryStore>,
@@ -765,7 +825,21 @@ async fn bootstrap(
     Arc<WaitTaskManager>,
     Arc<ApprovalRegistry>,
 )> {
-    let config = load_config(&root.join("config"))?;
+    let mut config = load_config(&root.join("config"))?;
+
+    if let Some(mode) = security_override {
+        for agent in &mut config.agents {
+            agent.security = mode.clone();
+        }
+        if mode == SecurityMode::Off {
+            tracing::warn!(
+                "⚠️  Security disabled via --no-security flag. All security checks are OFF."
+            );
+            eprintln!(
+                "⚠️  WARNING: Security disabled. All security checks (HardBaseline, approval, sandbox restrictions) are OFF."
+            );
+        }
+    }
 
     let db_path = root.join("data/clawhive.db");
     if let Some(parent) = db_path.parent() {
@@ -1352,7 +1426,12 @@ fn check_and_clean_pid(root: &Path) -> Result<()> {
 }
 
 /// Daemonize clawhive by forking to background
-fn daemonize(root: &Path, tui: bool, port: u16) -> Result<()> {
+fn daemonize(
+    root: &Path,
+    tui: bool,
+    port: u16,
+    security_override: Option<SecurityMode>,
+) -> Result<()> {
     use std::process::{Command, Stdio};
 
     if tui {
@@ -1372,12 +1451,25 @@ fn daemonize(root: &Path, tui: bool, port: u16) -> Result<()> {
     let log_file_err = log_file.try_clone()?;
 
     // Spawn the process in background
-    let child = Command::new(&exe)
+    let mut command = Command::new(&exe);
+    command
         .arg("--config-root")
         .arg(root)
         .arg("start")
         .arg("--port")
-        .arg(port.to_string())
+        .arg(port.to_string());
+
+    match security_override {
+        Some(SecurityMode::Off) => {
+            command.arg("--no-security");
+        }
+        Some(SecurityMode::Standard) => {
+            command.arg("--security").arg("standard");
+        }
+        None => {}
+    }
+
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err))
@@ -1430,14 +1522,19 @@ fn stop_process(root: &Path) -> Result<bool> {
     Ok(true)
 }
 
-async fn start_bot(root: &Path, with_tui: bool, port: u16) -> Result<()> {
+async fn start_bot(
+    root: &Path,
+    with_tui: bool,
+    port: u16,
+    security_override: Option<SecurityMode>,
+) -> Result<()> {
     // PID file: check stale → write
     check_and_clean_pid(root)?;
     write_pid_file(root)?;
     tracing::info!("PID file written (pid: {})", std::process::id());
 
     let (bus, memory, gateway, config, schedule_manager, wait_task_manager, approval_registry) =
-        bootstrap(root).await?;
+        bootstrap(root, security_override).await?;
 
     let workspace_dir = root.to_path_buf();
     let file_store_for_consolidation =
@@ -1799,7 +1896,7 @@ async fn start_bot(root: &Path, with_tui: bool, port: u16) -> Result<()> {
 
 async fn run_consolidate(root: &Path) -> Result<()> {
     let (_bus, memory, _gateway, config, _schedule_manager, _wait_manager, _approval_registry) =
-        bootstrap(root).await?;
+        bootstrap(root, None).await?;
 
     let workspace_dir = root.to_path_buf();
     let file_store = clawhive_memory::file_store::MemoryFileStore::new(&workspace_dir);
@@ -1867,10 +1964,14 @@ async fn run_dashboard_tui(port: u16) -> Result<()> {
     clawhive_tui::run_tui(&bus, None).await
 }
 
-async fn run_code_tui(root: &Path, port: u16) -> Result<()> {
+async fn run_code_tui(
+    root: &Path,
+    port: u16,
+    security_override: Option<SecurityMode>,
+) -> Result<()> {
     let _ = port;
     let (bus, _memory, gateway, _config, _schedule_manager, _wait_manager, approval_registry) =
-        bootstrap(root).await?;
+        bootstrap(root, security_override).await?;
     clawhive_tui::run_code_tui(bus.as_ref(), gateway, Some(approval_registry)).await
 }
 
@@ -1953,9 +2054,13 @@ async fn forward_sse_to_bus(
     }
 }
 
-async fn run_repl(root: &Path, _agent_id: &str) -> Result<()> {
+async fn run_repl(
+    root: &Path,
+    _agent_id: &str,
+    security_override: Option<SecurityMode>,
+) -> Result<()> {
     let (_bus, _memory, gateway, _config, _schedule_manager, _wait_manager, _approval_registry) =
-        bootstrap(root).await?;
+        bootstrap(root, security_override).await?;
 
     println!("clawhive REPL. Type 'quit' to exit.");
     println!("---");
@@ -2519,6 +2624,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_start_no_security_flag() {
+        let cli = Cli::try_parse_from(["clawhive", "start", "--no-security"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Commands::Start {
+                no_security: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_start_security_off() {
+        let cli = Cli::try_parse_from(["clawhive", "start", "--security", "off"]).unwrap();
+        if let Commands::Start { security, .. } = cli.command.unwrap() {
+            assert_eq!(security, Some(SecurityMode::Off));
+        } else {
+            panic!("expected Start command");
+        }
+    }
+
+    #[test]
+    fn parses_chat_no_security_flag() {
+        let cli = Cli::try_parse_from(["clawhive", "chat", "--no-security"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Commands::Chat {
+                no_security: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn parses_agent_list_subcommand() {
         let cli = Cli::try_parse_from(["clawhive", "agent", "list"]).unwrap();
         assert!(matches!(
@@ -2639,7 +2778,7 @@ mod tests {
         let cli = Cli::try_parse_from(["clawhive", "code", "--port", "8082"]).unwrap();
         assert!(matches!(
             cli.command.unwrap(),
-            Commands::Code { port: 8082 }
+            Commands::Code { port: 8082, .. }
         ));
     }
 
