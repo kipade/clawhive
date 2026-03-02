@@ -548,6 +548,7 @@ mod tests {
         let agents = vec![FullAgentConfig {
             agent_id: "clawhive-main".into(),
             enabled: true,
+            security: SecurityMode::default(),
             identity: None,
             model_policy: ModelPolicy {
                 primary: "sonnet".into(),
@@ -629,6 +630,7 @@ mod tests {
         let agents = vec![FullAgentConfig {
             agent_id: "clawhive-main".into(),
             enabled: true,
+            security: SecurityMode::default(),
             identity: None,
             model_policy: ModelPolicy {
                 primary: "sonnet".into(),

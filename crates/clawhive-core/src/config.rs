@@ -179,6 +179,17 @@ pub struct ToolPolicyConfig {
     pub allow: Vec<String>,
 }
 
+/// Master security mode for an agent
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SecurityMode {
+    /// All security checks enabled (default)
+    #[default]
+    Standard,
+    /// All security checks disabled - HardBaseline, approval, sandbox restrictions all off
+    Off,
+}
+
 /// How exec command security is enforced
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -346,6 +357,8 @@ impl Default for HeartbeatPolicyConfig {
 pub struct FullAgentConfig {
     pub agent_id: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub security: SecurityMode,
     #[serde(default)]
     pub workspace: Option<String>,
     pub identity: Option<IdentityConfig>,
@@ -697,6 +710,7 @@ mod tests {
             agents: vec![FullAgentConfig {
                 agent_id: "agent-a".into(),
                 enabled: true,
+                security: SecurityMode::default(),
                 identity: None,
                 model_policy: super::super::ModelPolicy {
                     primary: "m".into(),
@@ -732,5 +746,22 @@ mod tests {
         assert_eq!(cfg.max_memory_mb, 512);
         assert_eq!(cfg.env_inherit, vec!["PATH", "HOME", "TMPDIR"]);
         assert_eq!(cfg.exec_allow, vec!["sh"]);
+    }
+
+    #[test]
+    fn security_mode_defaults_to_standard() {
+        let cfg: SecurityMode = serde_json::from_str("\"standard\"").unwrap();
+        assert_eq!(cfg, SecurityMode::Standard);
+    }
+
+    #[test]
+    fn security_mode_off() {
+        let cfg: SecurityMode = serde_json::from_str("\"off\"").unwrap();
+        assert_eq!(cfg, SecurityMode::Off);
+    }
+
+    #[test]
+    fn security_mode_default_is_standard() {
+        assert_eq!(SecurityMode::default(), SecurityMode::Standard);
     }
 }
