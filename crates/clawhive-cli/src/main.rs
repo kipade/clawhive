@@ -903,9 +903,16 @@ async fn bootstrap(
 
     let bus = Arc::new(EventBus::new(256));
     let publisher = bus.publisher();
-    let approval_registry = Arc::new(ApprovalRegistry::with_persistence(
-        root.join("data/exec_allowlist.json"),
-    ));
+    let new_path = root.join("data/runtime_allowlist.json");
+    let old_path = root.join("data/exec_allowlist.json");
+    if !new_path.exists() && old_path.exists() {
+        if let Err(e) = std::fs::rename(&old_path, &new_path) {
+            tracing::warn!("Failed to migrate exec_allowlist.json to runtime_allowlist.json: {e}");
+        } else {
+            tracing::info!("Migrated exec_allowlist.json -> runtime_allowlist.json");
+        }
+    }
+    let approval_registry = Arc::new(ApprovalRegistry::with_persistence(new_path));
     let schedule_manager = Arc::new(ScheduleManager::new(
         &root.join("config/schedules.d"),
         &root.join("data/schedules"),
