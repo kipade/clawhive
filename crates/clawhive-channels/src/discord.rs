@@ -127,9 +127,17 @@ impl DiscordBot {
             });
 
             let http_holder_approval = http_holder.clone();
-            let connector_id_approval = connector_id_for_delivery;
+            let connector_id_approval = connector_id_for_delivery.clone();
+            let bus_approval = bus.clone();
             tokio::spawn(async move {
-                spawn_approval_listener(bus, http_holder_approval, connector_id_approval).await;
+                spawn_approval_listener(bus_approval, http_holder_approval, connector_id_approval)
+                    .await;
+            });
+
+            let http_holder_skill = http_holder.clone();
+            let connector_id_skill = connector_id_for_delivery;
+            tokio::spawn(async move {
+                spawn_skill_confirm_listener(bus, http_holder_skill, connector_id_skill).await;
             });
         }
 
@@ -384,6 +392,24 @@ impl EventHandler for DiscordHandler {
 impl DiscordHandler {
     async fn handle_component_interaction(&self, ctx: &Context, component: ComponentInteraction) {
         let custom_id = &component.data.custom_id;
+
+        // Skill install confirm/cancel buttons
+        if let Some(token) = custom_id.strip_prefix("skill_confirm:") {
+            let text = format!("/skill confirm {token}");
+            self.handle_button_command(ctx, &component, &text).await;
+            return;
+        }
+        if custom_id.starts_with("skill_cancel:") {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("Installation cancelled.")
+                    .ephemeral(true),
+            );
+            let _ = component.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        // Approval buttons
         let Some(rest) = custom_id.strip_prefix("approve:") else {
             return;
         };
@@ -395,13 +421,22 @@ impl DiscordHandler {
 
         let short_id = parts[0];
         let decision = parts[1];
+        let text = format!("/approve {short_id} {decision}");
+        self.handle_button_command(ctx, &component, &text).await;
+    }
 
+    /// Route a button click through the gateway as a command and reply ephemerally.
+    async fn handle_button_command(
+        &self,
+        ctx: &Context,
+        component: &ComponentInteraction,
+        text: &str,
+    ) {
         let adapter = DiscordAdapter::new(self.connector_id.clone());
         let guild_id = component.guild_id.map(|id| id.get());
         let channel_id = component.channel_id;
         let user_id = component.user.id.get();
-        let text = format!("/approve {short_id} {decision}");
-        let inbound = adapter.to_inbound(guild_id, channel_id.get(), user_id, &text);
+        let inbound = adapter.to_inbound(guild_id, channel_id.get(), user_id, text);
 
         let reply_text = match self.gateway.handle_inbound(inbound).await {
             Ok(outbound) => outbound.text,
@@ -716,6 +751,65 @@ async fn spawn_approval_listener(
         let channel = ChannelId::new(channel_id);
         if let Err(e) = channel.send_message(&http, message).await {
             tracing::error!("Failed to send approval buttons: {e}");
+        }
+    }
+}
+
+/// Spawn a listener for DeliverSkillConfirm messages — sends confirm/cancel buttons
+async fn spawn_skill_confirm_listener(
+    bus: Arc<EventBus>,
+    http_holder: Arc<RwLock<Option<Arc<Http>>>>,
+    connector_id: String,
+) {
+    let mut rx = bus.subscribe(Topic::DeliverSkillConfirm).await;
+    while let Some(msg) = rx.recv().await {
+        let BusMessage::DeliverSkillConfirm {
+            channel_type,
+            connector_id: msg_connector_id,
+            conversation_scope,
+            token,
+            skill_name,
+            analysis_text: _,
+        } = msg
+        else {
+            continue;
+        };
+
+        if channel_type != "discord" || msg_connector_id != connector_id {
+            continue;
+        }
+
+        let http = {
+            let holder = http_holder.read().await;
+            holder.clone()
+        };
+
+        let Some(http) = http else {
+            tracing::warn!("Discord HTTP client not ready for skill confirm delivery");
+            continue;
+        };
+
+        let Some(channel_id) = parse_channel_id(&conversation_scope) else {
+            tracing::warn!(
+                "Could not parse channel ID from conversation_scope: {}",
+                conversation_scope
+            );
+            continue;
+        };
+
+        let buttons = CreateActionRow::Buttons(vec![
+            CreateButton::new(format!("skill_confirm:{token}"))
+                .label(format!("\u{2705} Install {skill_name}"))
+                .style(ButtonStyle::Success),
+            CreateButton::new(format!("skill_cancel:{token}"))
+                .label("\u{274c} Cancel".to_string())
+                .style(ButtonStyle::Danger),
+        ]);
+
+        let channel = ChannelId::new(channel_id);
+        let message = CreateMessage::new().components(vec![buttons]);
+        if let Err(e) = channel.send_message(&http, message).await {
+            tracing::error!("Failed to send skill confirm buttons: {e}");
         }
     }
 }

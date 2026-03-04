@@ -282,13 +282,31 @@ fn normalize_github_url(url: &str) -> NormalizedGitHubUrl {
     let owner = segments[0];
     let repo = segments[1];
 
-    // github.com/user/repo/blob/branch/path/to/SKILL.md → raw URL
+    // github.com/user/repo/blob/branch/path/to/SKILL.md → raw URL (single file)
+    // github.com/user/repo/blob/branch/sub/path (directory) → treat as tree URL
     if segments.len() >= 4 && segments[2] == "blob" {
         let branch = segments[3];
         let file_path = segments[4..].join("/");
+        // If the last segment contains a dot, assume it's a file → raw URL.
+        // Otherwise it's likely a directory → fall through to tree-style handling.
+        let last = segments.last().unwrap_or(&"");
+        if last.contains('.') {
+            return NormalizedGitHubUrl {
+                url: format!(
+                    "https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
+                ),
+                subpath: None,
+            };
+        }
+        // Directory blob URL → archive + subpath (same as tree URL)
+        let subpath = if segments.len() > 4 {
+            Some(segments[4..].join("/"))
+        } else {
+            None
+        };
         return NormalizedGitHubUrl {
-            url: format!("https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"),
-            subpath: None,
+            url: format!("https://github.com/{owner}/{repo}/archive/refs/heads/{branch}.tar.gz"),
+            subpath,
         };
     }
 
@@ -874,6 +892,19 @@ mod tests {
         let r = normalize_github_url("https://github.com/sundial-org/awesome-openclaw-skills/blob/main/skills/weather/SKILL.md");
         assert_eq!(r.url, "https://raw.githubusercontent.com/sundial-org/awesome-openclaw-skills/main/skills/weather/SKILL.md");
         assert!(r.subpath.is_none());
+    }
+
+    #[test]
+    fn normalize_github_blob_url_directory() {
+        // blob URL pointing to a directory (no file extension) should be treated like tree URL
+        let r = normalize_github_url(
+            "https://github.com/sundial-org/awesome-openclaw-skills/blob/main/skills/weather",
+        );
+        assert_eq!(
+            r.url,
+            "https://github.com/sundial-org/awesome-openclaw-skills/archive/refs/heads/main.tar.gz"
+        );
+        assert_eq!(r.subpath.as_deref(), Some("skills/weather"));
     }
 
     #[test]

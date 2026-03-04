@@ -23,6 +23,7 @@ pub enum Topic {
     ScheduledTaskCompleted,
     DeliverAnnounce,
     DeliverApprovalRequest,
+    DeliverSkillConfirm,
     WaitTaskCompleted,
 }
 
@@ -45,6 +46,7 @@ impl Topic {
             BusMessage::ScheduledTaskCompleted { .. } => Topic::ScheduledTaskCompleted,
             BusMessage::DeliverAnnounce { .. } => Topic::DeliverAnnounce,
             BusMessage::DeliverApprovalRequest { .. } => Topic::DeliverApprovalRequest,
+            BusMessage::DeliverSkillConfirm { .. } => Topic::DeliverSkillConfirm,
             BusMessage::WaitTaskCompleted { .. } => Topic::WaitTaskCompleted,
         }
     }
@@ -367,6 +369,17 @@ mod tests {
                     command: "echo ok".into(),
                 },
                 Topic::DeliverApprovalRequest,
+            ),
+            (
+                BusMessage::DeliverSkillConfirm {
+                    channel_type: "discord".into(),
+                    connector_id: "dc_main".into(),
+                    conversation_scope: "guild:1:channel:2".into(),
+                    token: "abc-123".into(),
+                    skill_name: "weather".into(),
+                    analysis_text: "looks good".into(),
+                },
+                Topic::DeliverSkillConfirm,
             ),
         ];
 

@@ -229,11 +229,21 @@ impl Orchestrator {
         } else {
             "Analyze complete."
         };
-        let text = format!(
-            "{mode_text}\n\n{}\n\nTo continue, run: /skill confirm {}",
-            super::skill_install::render_skill_analysis(&report),
-            token
-        );
+        let analysis = super::skill_install::render_skill_analysis(&report);
+        let text = format!("{mode_text}\n\n{analysis}\n\nTo continue, run: /skill confirm {token}");
+
+        // Publish bus message so Discord/Telegram can render confirm buttons
+        let _ = self
+            .bus
+            .publish(clawhive_schema::BusMessage::DeliverSkillConfirm {
+                channel_type: inbound.channel_type.clone(),
+                connector_id: inbound.connector_id.clone(),
+                conversation_scope: inbound.conversation_scope.clone(),
+                token: token.clone(),
+                skill_name: report.skill_name.clone(),
+                analysis_text: analysis,
+            })
+            .await;
 
         Ok(OutboundMessage {
             trace_id: inbound.trace_id,
@@ -246,7 +256,6 @@ impl Orchestrator {
             attachments: vec![],
         })
     }
-
     async fn handle_skill_confirm_command(
         &self,
         inbound: InboundMessage,

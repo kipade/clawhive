@@ -130,10 +130,15 @@ impl TelegramBot {
         ));
         tokio::spawn(spawn_approval_listener(
             bus_approval,
+            bot_holder_clone.clone(),
+            connector_id_clone.clone(),
+        ));
+        let bus_skill_confirm = bus.clone();
+        tokio::spawn(spawn_skill_confirm_listener(
+            bus_skill_confirm,
             bot_holder_clone,
             connector_id_clone,
         ));
-
         let gateway_for_callback = gateway.clone();
         let adapter_for_callback = adapter.clone();
         let connector_id_for_callback = self.connector_id.clone();
@@ -259,6 +264,57 @@ impl TelegramBot {
                         return Ok::<(), teloxide::RequestError>(());
                     };
 
+                    // Skill confirm/cancel buttons
+                    if let Some(token) = data.strip_prefix("skill_confirm:") {
+                        let (chat_id, msg_id) = match &q.message {
+                            Some(msg) => (msg.chat().id, msg.id()),
+                            None => {
+                                let _ = bot
+                                    .answer_callback_query(&q.id)
+                                    .text("❌ Message expired")
+                                    .await;
+                                return Ok::<(), teloxide::RequestError>(());
+                            }
+                        };
+                        let user_id = q.from.id.0 as i64;
+                        let text = format!("/skill confirm {token}");
+                        let inbound = adapter.to_inbound(chat_id.0, user_id, &text, None);
+                        let inbound = InboundMessage {
+                            connector_id: connector_id.clone(),
+                            channel_type: "telegram".to_string(),
+                            ..inbound
+                        };
+                        let reply_text = match gateway.handle_inbound(inbound).await {
+                            Ok(outbound) => outbound.text,
+                            Err(e) => format!("❌ Error: {e}"),
+                        };
+                        let _ = bot.answer_callback_query(&q.id).text(&reply_text).await;
+                        let _ = bot
+                            .edit_message_reply_markup(chat_id, msg_id)
+                            .reply_markup(InlineKeyboardMarkup::new(
+                                Vec::<Vec<InlineKeyboardButton>>::new(),
+                            ))
+                            .await;
+                        return Ok::<(), teloxide::RequestError>(());
+                    }
+                    if data.starts_with("skill_cancel:") {
+                        if let Some(msg) = &q.message {
+                            let _ = bot
+                                .edit_message_reply_markup(msg.chat().id, msg.id())
+                                .reply_markup(InlineKeyboardMarkup::new(Vec::<
+                                    Vec<InlineKeyboardButton>,
+                                >::new(
+                                )))
+                                .await;
+                        }
+                        let _ = bot
+                            .answer_callback_query(&q.id)
+                            .text("Installation cancelled.")
+                            .await;
+                        return Ok::<(), teloxide::RequestError>(());
+                    }
+
+                    // Approval buttons
                     let Some(rest) = data.strip_prefix("approve:") else {
                         return Ok::<(), teloxide::RequestError>(());
                     };
@@ -487,6 +543,70 @@ async fn spawn_approval_listener(
             .await
         {
             tracing::error!("Failed to send approval keyboard to Telegram: {e}");
+        }
+    }
+}
+
+/// Spawn a listener for DeliverSkillConfirm messages — sends inline keyboard buttons
+async fn spawn_skill_confirm_listener(
+    bus: Arc<EventBus>,
+    bot_holder: Arc<RwLock<Option<Bot>>>,
+    connector_id: String,
+) {
+    let mut rx = bus.subscribe(Topic::DeliverSkillConfirm).await;
+    while let Some(msg) = rx.recv().await {
+        let BusMessage::DeliverSkillConfirm {
+            channel_type,
+            connector_id: msg_connector_id,
+            conversation_scope,
+            token,
+            skill_name,
+            analysis_text: _,
+        } = msg
+        else {
+            continue;
+        };
+
+        if channel_type != "telegram" || msg_connector_id != connector_id {
+            continue;
+        }
+
+        let bot = {
+            let holder = bot_holder.read().await;
+            holder.clone()
+        };
+
+        let Some(bot) = bot else {
+            tracing::warn!("Telegram bot not ready for skill confirm delivery");
+            continue;
+        };
+
+        let Some(chat_id) = parse_chat_id(&conversation_scope) else {
+            tracing::warn!(
+                "Could not parse chat ID from conversation_scope: {}",
+                conversation_scope
+            );
+            continue;
+        };
+
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback(
+                format!("\u{2705} Install {skill_name}"),
+                format!("skill_confirm:{token}"),
+            ),
+            InlineKeyboardButton::callback(
+                "\u{274c} Cancel".to_string(),
+                format!("skill_cancel:{token}"),
+            ),
+        ]]);
+
+        let chat = ChatId(chat_id);
+        if let Err(e) = bot
+            .send_message(chat, "\u{1f4e6} Confirm skill installation?")
+            .reply_markup(keyboard)
+            .await
+        {
+            tracing::error!("Failed to send skill confirm keyboard to Telegram: {e}");
         }
     }
 }

@@ -431,6 +431,20 @@ impl App {
                 ));
                 self.push_log(format!("[{ts}] Approval → agent={agent_id} cmd={command}"));
             }
+            BusMessage::DeliverSkillConfirm {
+                ref channel_type,
+                ref connector_id,
+                ref skill_name,
+                ref token,
+                ..
+            } => {
+                self.push_event(format!(
+                    "[{ts}] DeliverSkillConfirm {channel_type}:{connector_id} skill={skill_name}"
+                ));
+                self.push_log(format!(
+                    "[{ts}] SkillConfirm → skill={skill_name} token={token}"
+                ));
+            }
         }
     }
 }

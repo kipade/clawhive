@@ -262,6 +262,14 @@ pub enum BusMessage {
         agent_id: String,
         command: String,
     },
+    DeliverSkillConfirm {
+        channel_type: String,
+        connector_id: String,
+        conversation_scope: String,
+        token: String,
+        skill_name: String,
+        analysis_text: String,
+    },
     WaitTaskCompleted {
         task_id: String,
         session_key: String,
