@@ -23,5 +23,5 @@ fix: fmt
 install-hooks:
   bash scripts/install-git-hooks.sh
 
-release version:
-  bash scripts/release.sh "{{version}}"
+release *args:
+  cargo release {{args}} --workspace --execute

@@ -991,7 +991,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "corral-core"
 version = "0.1.0"
-source = "git+https://github.com/longzhi/corral#86fb3ae018f9d62d4ea468d67c2bfa3b4b9031b3"
+source = "git+https://github.com/longzhi/corral?rev=99c6361#99c63617168b64118276359eb745dc2b7c625066"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1000,6 +1000,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

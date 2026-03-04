@@ -14,6 +14,7 @@ if [[ ! -d "$ROOT/.git" ]]; then
 fi
 
 chmod +x "$ROOT/.githooks/pre-commit"
+chmod +x "$ROOT/.githooks/pre-push"
 git -C "$ROOT" config core.hooksPath .githooks
 
 echo "Installed git hooks. core.hooksPath=.githooks"
