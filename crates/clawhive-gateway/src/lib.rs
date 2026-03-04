@@ -486,14 +486,37 @@ pub fn spawn_scheduled_task_listener(
                     timeout_seconds,
                     light_context: _,
                 } => {
-                    let conversation_scope = format!("schedule:{}:{}", schedule_id, Uuid::new_v4());
+                    let (channel_type, connector_id, conversation_scope) = match (
+                        &delivery.source_channel_type,
+                        &delivery.source_connector_id,
+                        &delivery.source_conversation_scope,
+                    ) {
+                        (Some(ct), Some(ci), Some(cs)) => (ct.clone(), ci.clone(), cs.clone()),
+                        _ => {
+                            tracing::warn!(
+                                schedule_id = %schedule_id,
+                                "AgentTurn schedule {} has no source channel configured — approval requests will not be routable",
+                                schedule_id
+                            );
+                            (
+                                "scheduler".into(),
+                                schedule_id.clone(),
+                                format!("schedule:{}:{}", schedule_id, Uuid::new_v4()),
+                            )
+                        }
+                    };
+
+                    let user_scope = delivery
+                        .source_user_scope
+                        .clone()
+                        .unwrap_or_else(|| "user:scheduler".into());
 
                     let inbound = InboundMessage {
                         trace_id: Uuid::new_v4(),
-                        channel_type: "scheduler".into(),
-                        connector_id: schedule_id.clone(),
+                        channel_type,
+                        connector_id,
                         conversation_scope,
-                        user_scope: "user:scheduler".into(),
+                        user_scope,
                         text: message,
                         at: triggered_at,
                         thread_id: None,
@@ -1442,5 +1465,125 @@ mod tests {
             group_context: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-main");
+    }
+
+    #[tokio::test]
+    async fn agent_turn_uses_delivery_source_for_approval() {
+        let (gw, _tmp) = make_gateway();
+        let sched_bus = Arc::new(EventBus::new(16));
+        let mut completed_rx = sched_bus.subscribe(Topic::ScheduledTaskCompleted).await;
+
+        let _handle = spawn_scheduled_task_listener(Arc::new(gw), sched_bus.clone());
+        // Yield to let the spawned listener subscribe before we publish.
+        tokio::task::yield_now().await;
+
+        sched_bus
+            .publish(BusMessage::ScheduledTaskTriggered {
+                schedule_id: "sched-approval-test".into(),
+                agent_id: "clawhive-main".into(),
+                payload: clawhive_schema::ScheduledTaskPayload::AgentTurn {
+                    message: "/model".into(),
+                    model: None,
+                    thinking: None,
+                    timeout_seconds: 30,
+                    light_context: false,
+                },
+                delivery: clawhive_schema::ScheduledDeliveryInfo {
+                    mode: clawhive_schema::ScheduledDeliveryMode::None,
+                    channel: None,
+                    connector_id: None,
+                    source_channel_type: Some("telegram".into()),
+                    source_connector_id: Some("tg_main".into()),
+                    source_conversation_scope: Some("chat:tg_123".into()),
+                    source_user_scope: Some("user:tg_user".into()),
+                    webhook_url: None,
+                    failure_destination: None,
+                    best_effort: true,
+                },
+                triggered_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), completed_rx.recv())
+            .await
+            .expect("timed out waiting for ScheduledTaskCompleted")
+            .expect("channel closed");
+
+        if let BusMessage::ScheduledTaskCompleted { response, .. } = msg {
+            let resp = response.expect("expected a response from /model command");
+            assert!(
+                resp.contains("telegram:tg_main"),
+                "Expected telegram channel in session key, got: {resp}"
+            );
+            assert!(
+                !resp.contains("scheduler:"),
+                "Should not contain scheduler channel, got: {resp}"
+            );
+        } else {
+            panic!("Expected BusMessage::ScheduledTaskCompleted");
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_turn_fallback_when_no_delivery_source() {
+        let (gw, _tmp) = make_gateway();
+        let sched_bus = Arc::new(EventBus::new(16));
+        let mut completed_rx = sched_bus.subscribe(Topic::ScheduledTaskCompleted).await;
+
+        let _handle = spawn_scheduled_task_listener(Arc::new(gw), sched_bus.clone());
+        // Yield to let the spawned listener subscribe before we publish.
+        tokio::task::yield_now().await;
+
+        sched_bus
+            .publish(BusMessage::ScheduledTaskTriggered {
+                schedule_id: "sched-fallback-test".into(),
+                agent_id: "clawhive-main".into(),
+                payload: clawhive_schema::ScheduledTaskPayload::AgentTurn {
+                    message: "/model".into(),
+                    model: None,
+                    thinking: None,
+                    timeout_seconds: 30,
+                    light_context: false,
+                },
+                delivery: clawhive_schema::ScheduledDeliveryInfo {
+                    mode: clawhive_schema::ScheduledDeliveryMode::None,
+                    channel: None,
+                    connector_id: None,
+                    source_channel_type: None,
+                    source_connector_id: None,
+                    source_conversation_scope: None,
+                    source_user_scope: None,
+                    webhook_url: None,
+                    failure_destination: None,
+                    best_effort: true,
+                },
+                triggered_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), completed_rx.recv())
+            .await
+            .expect("timed out waiting for ScheduledTaskCompleted")
+            .expect("channel closed");
+
+        if let BusMessage::ScheduledTaskCompleted {
+            status, response, ..
+        } = msg
+        {
+            // Task completed without panicking — fallback worked
+            assert!(
+                matches!(status, clawhive_schema::ScheduledRunStatus::Ok),
+                "Expected Ok status with fallback behavior"
+            );
+            let resp = response.expect("expected a response from /model command");
+            assert!(
+                resp.contains("scheduler:sched-fallback-test"),
+                "Expected scheduler fallback channel in session key, got: {resp}"
+            );
+        } else {
+            panic!("Expected BusMessage::ScheduledTaskCompleted");
+        }
     }
 }
