@@ -519,15 +519,7 @@ async fn spawn_approval_listener(
             continue;
         };
 
-        let text = if let Some((cmd, target)) = command.split_once("\nNetwork: ") {
-            format!(
-                "⚠️ <b>Approval Required</b>\nAgent: <code>{agent_id}</code>\nCommand: <code>{cmd}</code>\nNetwork: <code>{target}</code>"
-            )
-        } else {
-            format!(
-                "⚠️ <b>Command Approval Required</b>\nAgent: <code>{agent_id}</code>\nCommand: <code>{command}</code>"
-            )
-        };
+        let text = approval_request_html(&agent_id, &command);
 
         let keyboard = InlineKeyboardMarkup::new(vec![vec![
             InlineKeyboardButton::callback("✅ Allow Once", format!("approve:{short_id}:allow")),
@@ -544,6 +536,22 @@ async fn spawn_approval_listener(
         {
             tracing::error!("Failed to send approval keyboard to Telegram: {e}");
         }
+    }
+}
+
+fn approval_request_html(agent_id: &str, command: &str) -> String {
+    let safe_agent_id = escape_html(agent_id);
+    if let Some((cmd, target)) = command.split_once("\nNetwork: ") {
+        let safe_cmd = escape_html(cmd);
+        let safe_target = escape_html(target);
+        format!(
+            "⚠️ <b>Approval Required</b>\nAgent: <code>{safe_agent_id}</code>\nCommand: <code>{safe_cmd}</code>\nNetwork: <code>{safe_target}</code>"
+        )
+    } else {
+        let safe_command = escape_html(command);
+        format!(
+            "⚠️ <b>Command Approval Required</b>\nAgent: <code>{safe_agent_id}</code>\nCommand: <code>{safe_command}</code>"
+        )
     }
 }
 
@@ -1160,5 +1168,17 @@ mod tests {
         let input = "this is **very important** info";
         let expected = "this is <b>very important</b> info";
         assert_eq!(md_to_telegram_html(input), expected);
+    }
+
+    #[test]
+    fn approval_html_escapes_untrusted_command_and_agent() {
+        let command = "python3 - <<'PY'\nprint('<tag>')\nPY\nNetwork: example.com:443";
+        let html = approval_request_html("agent<one>", command);
+
+        assert!(html.contains("<b>Approval Required</b>"));
+        assert!(html.contains("agent&lt;one&gt;"));
+        assert!(html.contains("&lt;'PY'"));
+        assert!(html.contains("&lt;tag&gt;"));
+        assert!(!html.contains("<'PY'"));
     }
 }
