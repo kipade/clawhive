@@ -2,12 +2,15 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
+use clawhive_core::HardBaseline;
 use reqwest::Client;
 use serde::Serialize;
+use tokio::sync::OnceCell;
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 2;
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+static WEBHOOK_CLIENT: OnceCell<Client> = OnceCell::const_new();
 
 #[derive(Debug, Serialize)]
 pub struct WebhookPayload {
@@ -20,8 +23,44 @@ pub struct WebhookPayload {
     pub duration_ms: u64,
 }
 
+fn validate_webhook_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| anyhow!("invalid webhook_url: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(anyhow!(
+                "invalid webhook_url scheme '{other}', expected http or https"
+            ));
+        }
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("invalid webhook_url: missing host"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("invalid webhook_url: unknown default port"))?;
+
+    if HardBaseline::network_denied(host, port) {
+        return Err(anyhow!(
+            "webhook_url denied by hard baseline: {host}:{port} (private/internal target blocked)"
+        ));
+    }
+
+    Ok(())
+}
+
 pub async fn deliver_webhook(url: &str, payload: &WebhookPayload) -> Result<()> {
-    let client = Client::builder().timeout(WEBHOOK_TIMEOUT).build()?;
+    validate_webhook_url(url)?;
+
+    let client = WEBHOOK_CLIENT
+        .get_or_try_init(|| async {
+            Client::builder()
+                .timeout(WEBHOOK_TIMEOUT)
+                .build()
+                .map_err(anyhow::Error::from)
+        })
+        .await?;
 
     let mut last_error = None;
 
@@ -98,5 +137,22 @@ mod tests {
         assert!(json.contains("fail-job"));
         assert!(json.contains("timeout after 300s"));
         assert!(!json.contains("result text"));
+    }
+
+    #[test]
+    fn webhook_url_blocks_private_targets() {
+        let err = validate_webhook_url("http://127.0.0.1:8080/hook").unwrap_err();
+        assert!(err.to_string().contains("hard baseline"));
+    }
+
+    #[test]
+    fn webhook_url_blocks_metadata_targets() {
+        let err = validate_webhook_url("http://169.254.169.254/latest/meta-data").unwrap_err();
+        assert!(err.to_string().contains("hard baseline"));
+    }
+
+    #[test]
+    fn webhook_url_allows_public_https() {
+        validate_webhook_url("https://example.com/hook").unwrap();
     }
 }

@@ -5,6 +5,7 @@ use clawhive_provider::ToolDef;
 use clawhive_schema::BusMessage;
 use serde::Deserialize;
 
+use crate::policy::ToolOrigin;
 use crate::tool::{ToolContext, ToolExecutor, ToolOutput};
 
 pub const MESSAGE_TOOL_NAME: &str = "message";
@@ -70,7 +71,7 @@ impl ToolExecutor for MessageTool {
         }
     }
 
-    async fn execute(&self, input: serde_json::Value, _ctx: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> Result<ToolOutput> {
         let parsed: MessageInput = serde_json::from_value(input)
             .map_err(|e| anyhow!("invalid message tool input: {e}"))?;
 
@@ -87,6 +88,27 @@ impl ToolExecutor for MessageTool {
                 let connector_id = parsed
                     .connector_id
                     .unwrap_or_else(|| format!("{}_main", channel));
+
+                if matches!(ctx.origin(), ToolOrigin::External) {
+                    let src_channel = ctx.source_channel_type().ok_or_else(|| {
+                        anyhow!("message tool denied: external context missing source channel")
+                    })?;
+                    let src_connector = ctx.source_connector_id().ok_or_else(|| {
+                        anyhow!("message tool denied: external context missing source connector")
+                    })?;
+                    let src_scope = ctx.source_conversation_scope().ok_or_else(|| {
+                        anyhow!("message tool denied: external context missing source conversation")
+                    })?;
+
+                    if channel != src_channel
+                        || connector_id != src_connector
+                        || target != src_scope
+                    {
+                        return Err(anyhow!(
+                            "message tool denied: external agents can only send to source conversation"
+                        ));
+                    }
+                }
 
                 self.bus
                     .publish(BusMessage::DeliverAnnounce {
@@ -248,5 +270,75 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn external_context_denies_cross_channel_send() {
+        let bus = EventBus::new(16);
+        let publisher = bus.publisher();
+        let tool = MessageTool::new(publisher);
+
+        let ctx = ToolContext::external(corral_core::Permissions::default()).with_source(
+            "telegram".into(),
+            "tg_main".into(),
+            "chat:123".into(),
+        );
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "action": "send",
+                    "channel": "discord",
+                    "connector_id": "dc_main",
+                    "target": "guild:1:channel:2",
+                    "message": "cross channel"
+                }),
+                &ctx,
+            )
+            .await;
+
+        match result {
+            Err(e) => {
+                assert!(e
+                    .to_string()
+                    .contains("can only send to source conversation"));
+            }
+            Ok(_) => panic!("expected permission error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn external_context_allows_source_conversation_send() {
+        let bus = EventBus::new(16);
+        let publisher = bus.publisher();
+        let mut rx = bus.subscribe(Topic::DeliverAnnounce).await;
+        let tool = MessageTool::new(publisher);
+
+        let ctx = ToolContext::external(corral_core::Permissions::default()).with_source(
+            "telegram".into(),
+            "tg_main".into(),
+            "chat:123".into(),
+        );
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "action": "send",
+                    "channel": "telegram",
+                    "connector_id": "tg_main",
+                    "target": "chat:123",
+                    "message": "same scope"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg, BusMessage::DeliverAnnounce { .. }));
     }
 }
