@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use clawhive_provider::ToolDef;
 use clawhive_scheduler::{
-    DeliveryConfig, DeliveryMode, ScheduleConfig, ScheduleManager, ScheduleType, SessionMode,
+    resolve_payload, DeliveryConfig, DeliveryMode, ScheduleConfig, ScheduleManager, ScheduleType,
+    SessionMode, TaskPayload,
 };
 use serde::Deserialize;
 
@@ -48,7 +49,10 @@ struct ScheduleJobInput {
     #[serde(default)]
     description: Option<String>,
     schedule: ScheduleType,
-    task: String,
+    #[serde(default)]
+    task: Option<String>,
+    #[serde(default)]
+    payload: Option<TaskPayload>,
     #[serde(default)]
     session_mode: Option<SessionMode>,
     #[serde(default)]
@@ -71,11 +75,23 @@ struct DeliveryInput {
     channel: Option<String>,
     #[serde(default)]
     connector_id: Option<String>,
+    #[serde(default)]
+    webhook_url: Option<String>,
 }
 
 impl ScheduleJobInput {
-    fn into_config(self, default_agent_id: &str, ctx: &ToolContext) -> ScheduleConfig {
-        let mut task = self.task;
+    fn into_config(
+        self,
+        default_agent_id: &str,
+        ctx: &ToolContext,
+    ) -> Result<ScheduleConfig, anyhow::Error> {
+        let resolved = resolve_payload(self.task.clone(), self.payload)?;
+
+        let mut task = match &resolved {
+            TaskPayload::AgentTurn { message, .. } => message.clone(),
+            TaskPayload::SystemEvent { text } => text.clone(),
+            TaskPayload::DirectDeliver { text } => text.clone(),
+        };
 
         if let Some(limit) = self.context_messages {
             if limit > 0 {
@@ -96,6 +112,7 @@ impl ScheduleJobInput {
             mode: None,
             channel: None,
             connector_id: None,
+            webhook_url: None,
         });
 
         // Default to Announce delivery if source info available and mode not specified
@@ -117,7 +134,7 @@ impl ScheduleJobInput {
             .delete_after_run
             .unwrap_or_else(|| matches!(schedule, ScheduleType::At { .. }));
 
-        ScheduleConfig {
+        Ok(ScheduleConfig {
             schedule_id: self
                 .schedule_id
                 .filter(|id| !id.trim().is_empty())
@@ -142,11 +159,11 @@ impl ScheduleJobInput {
                 source_connector_id: ctx.source_connector_id().map(String::from),
                 source_conversation_scope: ctx.source_conversation_scope().map(String::from),
                 source_user_scope: ctx.source_user_scope().map(String::from),
-                webhook_url: None,
+                webhook_url: delivery.webhook_url,
                 failure_destination: None,
                 best_effort: false,
             },
-        }
+        })
     }
 }
 
@@ -265,7 +282,24 @@ impl ToolExecutor for ScheduleTool {
                             },
                             "task": { 
                                 "type": "string",
-                                "description": "The task/reminder text to deliver"
+                                "description": "Legacy: task/reminder text. Prefer 'payload' for typed control."
+                            },
+                            "payload": {
+                                "type": "object",
+                                "description": "Typed task payload. Use instead of 'task' for typed control. Kinds: system_event (inject into source session), agent_turn (isolated agent execution), direct_deliver (simple text delivery).",
+                                "properties": {
+                                    "kind": {
+                                        "type": "string",
+                                        "enum": ["system_event", "agent_turn", "direct_deliver"],
+                                        "description": "Payload type"
+                                    },
+                                    "text": { "type": "string", "description": "For system_event/direct_deliver: the text content" },
+                                    "message": { "type": "string", "description": "For agent_turn: the task message" },
+                                    "model": { "type": "string", "description": "For agent_turn: model override" },
+                                    "thinking": { "type": "string", "description": "For agent_turn: thinking level" },
+                                    "timeout_seconds": { "type": "number", "description": "For agent_turn: timeout in seconds (default 300)" }
+                                },
+                                "required": ["kind"]
                             },
                             "session_mode": { 
                                 "type": "string", 
@@ -281,7 +315,7 @@ impl ToolExecutor for ScheduleTool {
                                 "description": "Number of recent messages to include as context (0-10)"
                             }
                         },
-                        "required": ["name", "schedule", "task"]
+                        "required": ["name", "schedule"]
                     },
                     "schedule_id": { 
                         "type": "string",
@@ -324,7 +358,10 @@ impl ToolExecutor for ScheduleTool {
                     return Ok(tool_error("job is required for add action"));
                 };
 
-                let config = job.into_config(&self.default_agent_id, ctx);
+                let config = match job.into_config(&self.default_agent_id, ctx) {
+                    Ok(c) => c,
+                    Err(e) => return Ok(tool_error(format!("Invalid job: {e}"))),
+                };
                 self.manager.add_schedule(config.clone()).await?;
                 let next = self.manager.get_next_run(&config.schedule_id).await;
 
@@ -435,6 +472,92 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].config.schedule_id, "milk-reminder");
         assert!(entries[0].config.task.contains("Recent context"));
+    }
+
+    #[tokio::test]
+    async fn add_action_with_payload_direct_deliver() {
+        let (manager, _bus, _tmp) = setup();
+        let tool = ScheduleTool::new(manager.clone());
+        let ctx = ToolContext::builtin();
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "action": "add",
+                    "job": {
+                        "name": "Direct reminder",
+                        "schedule": { "kind": "at", "at": "5m" },
+                        "payload": {
+                            "kind": "direct_deliver",
+                            "text": "Time to eat!"
+                        }
+                    }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        let entries = manager.list().await;
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_action_with_payload_agent_turn() {
+        let (manager, _bus, _tmp) = setup();
+        let tool = ScheduleTool::new(manager.clone());
+        let ctx = ToolContext::builtin();
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "action": "add",
+                    "job": {
+                        "name": "Agent task",
+                        "schedule": { "kind": "cron", "expr": "0 9 * * *" },
+                        "payload": {
+                            "kind": "agent_turn",
+                            "message": "Generate daily report",
+                            "timeout_seconds": 600
+                        }
+                    }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        let entries = manager.list().await;
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_action_legacy_task_still_works_without_payload() {
+        let (manager, _bus, _tmp) = setup();
+        let tool = ScheduleTool::new(manager.clone());
+        let ctx = ToolContext::builtin();
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "action": "add",
+                    "job": {
+                        "name": "Legacy task",
+                        "schedule": { "kind": "at", "at": "5m" },
+                        "task": "Old style task"
+                    }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        let entries = manager.list().await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].config.task, "Old style task");
     }
 
     #[tokio::test]
