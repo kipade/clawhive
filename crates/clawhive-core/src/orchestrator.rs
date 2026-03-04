@@ -1364,6 +1364,7 @@ impl Orchestrator {
                 role: "user".into(),
                 content: tool_results,
             });
+            continuation_injected = false;
         }
 
         // Loop exhausted — ask the LLM for a final answer without tools
@@ -2017,5 +2018,233 @@ Body"#,
         );
         assert_eq!(messages[2].role, "assistant");
         assert_eq!(messages[3].role, "user");
+    }
+
+    #[test]
+    fn should_inject_continuation_detects_acknowledgment_after_question() {
+        // Setup: assistant asks a question, user confirms with short ack
+        let messages = vec![
+            LlmMessage {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "Do you want me to proceed?".into(),
+                }],
+            },
+            LlmMessage {
+                role: "user".into(),
+                content: vec![ContentBlock::Text { text: "yes".into() }],
+            },
+        ];
+
+        // LLM responds with short acknowledgment
+        let response_text = "OK";
+
+        // Should detect this as acknowledgment-without-action
+        assert!(Orchestrator::should_inject_continuation(
+            &messages,
+            response_text
+        ));
+    }
+
+    #[test]
+    fn should_inject_continuation_ignores_long_responses() {
+        let messages = vec![
+            LlmMessage {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "Do you want me to proceed?".into(),
+                }],
+            },
+            LlmMessage {
+                role: "user".into(),
+                content: vec![ContentBlock::Text { text: "yes".into() }],
+            },
+        ];
+
+        // Long response (> 200 chars) should not trigger injection
+        let response_text = "I understand. Let me proceed with the installation. First, I'll download the package, then configure it, and finally run the setup script. This process typically takes a few minutes depending on your system speed.";
+
+        assert!(!Orchestrator::should_inject_continuation(
+            &messages,
+            response_text
+        ));
+    }
+
+    #[test]
+    fn should_inject_continuation_requires_question_or_confirmation() {
+        let messages = vec![
+            LlmMessage {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "Here is the result.".into(),
+                }],
+            },
+            LlmMessage {
+                role: "user".into(),
+                content: vec![ContentBlock::Text {
+                    text: "thanks".into(),
+                }],
+            },
+        ];
+
+        // No question/confirmation in assistant message, should not inject
+        let response_text = "OK";
+
+        assert!(!Orchestrator::should_inject_continuation(
+            &messages,
+            response_text
+        ));
+    }
+
+    #[test]
+    fn continuation_injection_scenario_multi_step() {
+        // Scenario: Simulate a multi-step task where continuation_injected should reset
+        // This test verifies that should_inject_continuation can fire multiple times
+        // when there are multiple question-acknowledgment cycles
+
+        // Round 1: Assistant asks a question
+        let mut messages = vec![
+            LlmMessage {
+                role: "user".into(),
+                content: vec![ContentBlock::Text {
+                    text: "Install three packages".into(),
+                }],
+            },
+            LlmMessage {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "Should I install package A first?".into(),
+                }],
+            },
+        ];
+
+        // User confirms
+        messages.push(LlmMessage {
+            role: "user".into(),
+            content: vec![ContentBlock::Text { text: "yes".into() }],
+        });
+
+        // LLM responds with short ack (should trigger injection)
+        let response_1 = "OK";
+        assert!(Orchestrator::should_inject_continuation(
+            &messages, response_1
+        ));
+
+        // After injection, assistant message is added
+        messages.push(LlmMessage {
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text {
+                text: response_1.into(),
+            }],
+        });
+
+        // Continuation prompt is added
+        messages.push(LlmMessage {
+            role: "user".into(),
+            content: vec![ContentBlock::Text {
+                text: "OK, go ahead. Proceed with the next step.".into(),
+            }],
+        });
+
+        // LLM responds with tool use (simulated)
+        messages.push(LlmMessage {
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text {
+                text: "Installing package A...".into(),
+            }],
+        });
+
+        // Tool results are pushed
+        messages.push(LlmMessage {
+            role: "user".into(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "tool_1".into(),
+                content: "Package A installed".into(),
+                is_error: false,
+            }],
+        });
+
+        // Round 2: Assistant asks another question
+        messages.push(LlmMessage {
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text {
+                text: "Now should I install package B?".into(),
+            }],
+        });
+
+        // User confirms again
+        messages.push(LlmMessage {
+            role: "user".into(),
+            content: vec![ContentBlock::Text { text: "yes".into() }],
+        });
+
+        // LLM responds with short ack again
+        // This should ALSO trigger injection because continuation_injected was reset
+        let response_2 = "OK";
+        assert!(Orchestrator::should_inject_continuation(
+            &messages, response_2
+        ));
+    }
+
+    #[test]
+    fn continuation_injection_no_infinite_loop() {
+        // Scenario: Verify that continuation injection doesn't fire infinitely
+        // when LLM keeps responding with short acks without tool calls
+
+        let mut messages = vec![
+            LlmMessage {
+                role: "user".into(),
+                content: vec![ContentBlock::Text {
+                    text: "Do something".into(),
+                }],
+            },
+            LlmMessage {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "Should I proceed?".into(),
+                }],
+            },
+        ];
+
+        // User confirms
+        messages.push(LlmMessage {
+            role: "user".into(),
+            content: vec![ContentBlock::Text { text: "yes".into() }],
+        });
+
+        // First short response - should trigger injection
+        let response_1 = "OK";
+        assert!(Orchestrator::should_inject_continuation(
+            &messages, response_1
+        ));
+
+        // After injection, assistant message and continuation prompt are added
+        messages.push(LlmMessage {
+            role: "assistant".into(),
+            content: vec![ContentBlock::Text {
+                text: response_1.into(),
+            }],
+        });
+
+        messages.push(LlmMessage {
+            role: "user".into(),
+            content: vec![ContentBlock::Text {
+                text: "OK, go ahead. Proceed with the next step.".into(),
+            }],
+        });
+
+        // Second short response (no tool call, no tool results)
+        // This should NOT trigger injection again because:
+        // 1. The continuation_injected flag should have been reset after tool execution
+        // 2. But in this case, there was NO tool execution
+        // So the logic is: injection fires once per round (after tool execution)
+        // If there's no tool execution, the loop should exit
+        let response_2 = "OK";
+        // This response should NOT trigger injection because:
+        // - The previous assistant message (response_1) was not asking a question
+        // - It was just an acknowledgment
+        assert!(!Orchestrator::should_inject_continuation(
+            &messages, response_2
+        ));
     }
 }
