@@ -911,6 +911,7 @@ impl Orchestrator {
             inbound.channel_type.clone(),
             inbound.connector_id.clone(),
             inbound.conversation_scope.clone(),
+            inbound.user_scope.clone(),
         ));
         let private_network_overrides = agent
             .sandbox
@@ -1138,6 +1139,7 @@ impl Orchestrator {
             inbound.channel_type.clone(),
             inbound.connector_id.clone(),
             inbound.conversation_scope.clone(),
+            inbound.user_scope.clone(),
         ));
         let private_network_overrides_stream = agent
             .sandbox
@@ -1213,7 +1215,7 @@ impl Orchestrator {
         merged_permissions: Option<corral_core::Permissions>,
         security_mode: SecurityMode,
         private_network_overrides: Vec<String>,
-        source_info: Option<(String, String, String)>, // (channel_type, connector_id, conversation_scope)
+        source_info: Option<(String, String, String, String)>, // (channel_type, connector_id, conversation_scope, user_scope)
     ) -> Result<(clawhive_provider::LlmResponse, Vec<LlmMessage>)> {
         let mut messages = initial_messages;
         let tool_defs: Vec<_> = match allowed_tools {
@@ -1320,8 +1322,9 @@ impl Orchestrator {
                 ),
             }
             .with_recent_messages(recent_messages);
-            let ctx = if let Some((ref ch, ref co, ref cv)) = source_info {
+            let ctx = if let Some((ref ch, ref co, ref cv, ref us)) = source_info {
                 ctx.with_source(ch.clone(), co.clone(), cv.clone())
+                    .with_source_user_scope(us.clone())
             } else {
                 ctx
             };
@@ -1516,6 +1519,7 @@ impl Orchestrator {
             inbound.channel_type.clone(),
             inbound.connector_id.clone(),
             inbound.conversation_scope.clone(),
+            inbound.user_scope.clone(),
         ));
 
         // Run the tool-use loop

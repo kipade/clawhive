@@ -46,6 +46,8 @@ pub struct ToolContext {
     source_connector_id: Option<String>,
     /// Source conversation scope (e.g., "guild:123:channel:456")
     source_conversation_scope: Option<String>,
+    /// Source user scope (e.g., "user:12345")
+    source_user_scope: Option<String>,
     /// Session key for the current conversation
     session_key: String,
 }
@@ -66,6 +68,7 @@ impl ToolContext {
             source_channel_type: None,
             source_connector_id: None,
             source_conversation_scope: None,
+            source_user_scope: None,
             session_key: String::new(),
         }
     }
@@ -78,6 +81,7 @@ impl ToolContext {
             source_channel_type: None,
             source_connector_id: None,
             source_conversation_scope: None,
+            source_user_scope: None,
             session_key: String::new(),
         }
     }
@@ -92,6 +96,7 @@ impl ToolContext {
             source_channel_type: None,
             source_connector_id: None,
             source_conversation_scope: None,
+            source_user_scope: None,
             session_key: String::new(),
         }
     }
@@ -107,6 +112,7 @@ impl ToolContext {
             source_channel_type: None,
             source_connector_id: None,
             source_conversation_scope: None,
+            source_user_scope: None,
             session_key: String::new(),
         }
     }
@@ -122,6 +128,7 @@ impl ToolContext {
             source_channel_type: None,
             source_connector_id: None,
             source_conversation_scope: None,
+            source_user_scope: None,
             session_key: String::new(),
         }
     }
@@ -141,6 +148,7 @@ impl ToolContext {
             source_channel_type: None,
             source_connector_id: None,
             source_conversation_scope: None,
+            source_user_scope: None,
             session_key: String::new(),
         }
     }
@@ -157,6 +165,7 @@ impl ToolContext {
             source_channel_type: None,
             source_connector_id: None,
             source_conversation_scope: None,
+            source_user_scope: None,
             session_key: String::new(),
         }
     }
@@ -198,6 +207,12 @@ impl ToolContext {
         self
     }
 
+    /// Set the source user scope.
+    pub fn with_source_user_scope(mut self, user_scope: String) -> Self {
+        self.source_user_scope = Some(user_scope);
+        self
+    }
+
     /// Set the session key for the current conversation.
     pub fn with_session_key(mut self, session_key: impl Into<String>) -> Self {
         self.session_key = session_key.into();
@@ -226,6 +241,11 @@ impl ToolContext {
     /// Get the source conversation scope.
     pub fn source_conversation_scope(&self) -> Option<&str> {
         self.source_conversation_scope.as_deref()
+    }
+
+    /// Get the source user scope.
+    pub fn source_user_scope(&self) -> Option<&str> {
+        self.source_user_scope.as_deref()
     }
 
     /// Get the session key for the current conversation.
@@ -477,6 +497,22 @@ mod tests {
         assert_eq!(ctx.source_channel_type(), Some("telegram"));
         assert_eq!(ctx.source_connector_id(), Some("tg_main"));
         assert_eq!(ctx.source_conversation_scope(), Some("chat:12345"));
+    }
+
+    #[test]
+    fn context_with_source_includes_user_scope() {
+        let ctx = ToolContext::builtin()
+            .with_source(
+                "telegram".to_string(),
+                "tg_main".to_string(),
+                "chat:12345".to_string(),
+            )
+            .with_source_user_scope("user:999".to_string());
+
+        assert_eq!(ctx.source_channel_type(), Some("telegram"));
+        assert_eq!(ctx.source_connector_id(), Some("tg_main"));
+        assert_eq!(ctx.source_conversation_scope(), Some("chat:12345"));
+        assert_eq!(ctx.source_user_scope(), Some("user:999"));
     }
 
     #[test]
