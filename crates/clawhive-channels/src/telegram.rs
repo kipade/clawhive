@@ -272,11 +272,27 @@ impl TelegramBot {
                             None => {
                                 let _ = bot
                                     .answer_callback_query(&q.id)
-                                    .text("❌ Message expired")
+                                    .text("\u{274c} Message expired")
                                     .await;
                                 return Ok::<(), teloxide::RequestError>(());
                             }
                         };
+
+                        // Answer callback immediately — skill confirm may block on approval
+                        let _ = bot
+                            .answer_callback_query(&q.id)
+                            .text("\u{23f3} Processing installation...")
+                            .await;
+
+                        // Remove confirm/cancel buttons right away
+                        let _ = bot
+                            .edit_message_reply_markup(chat_id, msg_id)
+                            .reply_markup(InlineKeyboardMarkup::new(
+                                Vec::<Vec<InlineKeyboardButton>>::new(),
+                            ))
+                            .await;
+
+                        // Process in background — handle_inbound blocks waiting for approval
                         let user_id = q.from.id.0 as i64;
                         let text = format!("/skill confirm {token}");
                         let inbound = adapter.to_inbound(chat_id.0, user_id, &text, None);
@@ -285,17 +301,13 @@ impl TelegramBot {
                             channel_type: "telegram".to_string(),
                             ..inbound
                         };
-                        let reply_text = match gateway.handle_inbound(inbound).await {
-                            Ok(outbound) => outbound.text,
-                            Err(e) => format!("❌ Error: {e}"),
-                        };
-                        let _ = bot.answer_callback_query(&q.id).text(&reply_text).await;
-                        let _ = bot
-                            .edit_message_reply_markup(chat_id, msg_id)
-                            .reply_markup(InlineKeyboardMarkup::new(
-                                Vec::<Vec<InlineKeyboardButton>>::new(),
-                            ))
-                            .await;
+                        tokio::spawn(async move {
+                            let reply_text = match gateway.handle_inbound(inbound).await {
+                                Ok(outbound) => outbound.text,
+                                Err(e) => format!("\u{274c} Error: {e}"),
+                            };
+                            let _ = bot.send_message(chat_id, &reply_text).await;
+                        });
                         return Ok::<(), teloxide::RequestError>(());
                     }
                     if data.starts_with("skill_cancel:") {
@@ -334,11 +346,25 @@ impl TelegramBot {
                         None => {
                             let _ = bot
                                 .answer_callback_query(&q.id)
-                                .text("❌ Message expired")
+                                .text("\u{274c} Message expired")
                                 .await;
                             return Ok::<(), teloxide::RequestError>(());
                         }
                     };
+
+                    // Answer callback immediately to dismiss loading indicator
+                    let _ = bot
+                        .answer_callback_query(&q.id)
+                        .text("\u{23f3} Processing...")
+                        .await;
+
+                    // Remove inline keyboard from the approval message
+                    let _ = bot
+                        .edit_message_reply_markup(chat_id, msg_id)
+                        .reply_markup(InlineKeyboardMarkup::new(
+                            Vec::<Vec<InlineKeyboardButton>>::new(),
+                        ))
+                        .await;
 
                     let user_id = q.from.id.0 as i64;
                     let text = format!("/approve {short_id} {decision}");
@@ -349,24 +375,16 @@ impl TelegramBot {
                         connector_id: connector_id.clone(),
                         ..inbound
                     };
-                    // Ensure channel_type is correct
                     inbound.channel_type = "telegram".to_string();
 
-                    let reply_text = match gateway.handle_inbound(inbound).await {
-                        Ok(outbound) => outbound.text,
-                        Err(e) => format!("❌ Error: {e}"),
-                    };
-
-                    // Answer callback query with result
-                    let _ = bot.answer_callback_query(&q.id).text(&reply_text).await;
-
-                    // Remove inline keyboard from the original message
-                    let _ = bot
-                        .edit_message_reply_markup(chat_id, msg_id)
-                        .reply_markup(InlineKeyboardMarkup::new(
-                            Vec::<Vec<InlineKeyboardButton>>::new(),
-                        ))
-                        .await;
+                    // Process in background
+                    tokio::spawn(async move {
+                        let reply_text = match gateway.handle_inbound(inbound).await {
+                            Ok(outbound) => outbound.text,
+                            Err(e) => format!("\u{274c} Error: {e}"),
+                        };
+                        let _ = bot.send_message(chat_id, &reply_text).await;
+                    });
 
                     Ok::<(), teloxide::RequestError>(())
                 }
