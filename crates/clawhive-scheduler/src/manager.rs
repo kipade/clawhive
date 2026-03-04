@@ -267,6 +267,7 @@ impl ScheduleManager {
                 mode: match entry.config.delivery.mode {
                     DeliveryMode::None => ScheduledDeliveryMode::None,
                     DeliveryMode::Announce => ScheduledDeliveryMode::Announce,
+                    DeliveryMode::Webhook => ScheduledDeliveryMode::Webhook,
                 },
                 channel: entry.config.delivery.channel.clone(),
                 connector_id: entry.config.delivery.connector_id.clone(),
@@ -274,7 +275,7 @@ impl ScheduleManager {
                 source_connector_id: entry.config.delivery.source_connector_id.clone(),
                 source_conversation_scope: entry.config.delivery.source_conversation_scope.clone(),
                 source_user_scope: entry.config.delivery.source_user_scope.clone(),
-                webhook_url: None,
+                webhook_url: entry.config.delivery.webhook_url.clone(),
             },
             triggered_at: Utc::now(),
         };
@@ -361,6 +362,7 @@ impl ScheduleManager {
                             mode: match entry.config.delivery.mode {
                                 DeliveryMode::None => ScheduledDeliveryMode::None,
                                 DeliveryMode::Announce => ScheduledDeliveryMode::Announce,
+                                DeliveryMode::Webhook => ScheduledDeliveryMode::Webhook,
                             },
                             channel: entry.config.delivery.channel.clone(),
                             connector_id: entry.config.delivery.connector_id.clone(),
@@ -372,7 +374,7 @@ impl ScheduleManager {
                                 .source_conversation_scope
                                 .clone(),
                             source_user_scope: entry.config.delivery.source_user_scope.clone(),
-                            webhook_url: None,
+                            webhook_url: entry.config.delivery.webhook_url.clone(),
                         },
                         triggered_at: Utc::now(),
                     })

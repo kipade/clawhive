@@ -119,6 +119,16 @@ pub fn resolve_payload(
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct FailureDestination {
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub connector_id: Option<String>,
+    #[serde(default)]
+    pub conversation_scope: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct DeliveryConfig {
     #[serde(default)]
     pub mode: DeliveryMode,
@@ -138,6 +148,15 @@ pub struct DeliveryConfig {
     /// Source user scope for preserving session key identity in SystemEvent execution
     #[serde(default)]
     pub source_user_scope: Option<String>,
+    /// Webhook URL for webhook delivery mode
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Where to deliver failure notifications
+    #[serde(default)]
+    pub failure_destination: Option<FailureDestination>,
+    /// Best-effort delivery: don't report delivery failure as error
+    #[serde(default)]
+    pub best_effort: bool,
 }
 
 impl Default for DeliveryConfig {
@@ -150,6 +169,9 @@ impl Default for DeliveryConfig {
             source_connector_id: None,
             source_conversation_scope: None,
             source_user_scope: None,
+            webhook_url: None,
+            failure_destination: None,
+            best_effort: false,
         }
     }
 }
@@ -161,6 +183,8 @@ pub enum DeliveryMode {
     None,
     #[serde(rename = "announce")]
     Announce,
+    #[serde(rename = "webhook")]
+    Webhook,
 }
 
 fn default_true() -> bool {
@@ -255,5 +279,42 @@ mod tests {
         assert!(json.contains("user:456"));
         let back: DeliveryConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.source_user_scope.as_deref(), Some("user:456"));
+    }
+
+    #[test]
+    fn delivery_config_serde_with_webhook() {
+        let config = DeliveryConfig {
+            mode: DeliveryMode::Webhook,
+            webhook_url: Some("https://example.com/hook".into()),
+            best_effort: true,
+            failure_destination: Some(FailureDestination {
+                channel: Some("discord".into()),
+                connector_id: Some("dc_main".into()),
+                conversation_scope: Some("guild:1:channel:2".into()),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("webhook"));
+        assert!(json.contains("https://example.com/hook"));
+        assert!(json.contains("best_effort"));
+        let back: DeliveryConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mode, DeliveryMode::Webhook);
+        assert_eq!(
+            back.webhook_url.as_deref(),
+            Some("https://example.com/hook")
+        );
+        assert!(back.best_effort);
+        assert!(back.failure_destination.is_some());
+    }
+
+    #[test]
+    fn delivery_config_defaults_backward_compatible() {
+        let json = r#"{"mode":"none"}"#;
+        let config: DeliveryConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mode, DeliveryMode::None);
+        assert!(config.webhook_url.is_none());
+        assert!(!config.best_effort);
+        assert!(config.failure_destination.is_none());
     }
 }

@@ -142,6 +142,9 @@ impl ScheduleJobInput {
                 source_connector_id: ctx.source_connector_id().map(String::from),
                 source_conversation_scope: ctx.source_conversation_scope().map(String::from),
                 source_user_scope: ctx.source_user_scope().map(String::from),
+                webhook_url: None,
+                failure_destination: None,
+                best_effort: false,
             },
         }
     }
