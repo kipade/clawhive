@@ -43,6 +43,8 @@ struct ScheduleInput {
     include_history: Option<bool>,
     #[serde(default)]
     history_limit: Option<usize>,
+    #[serde(default)]
+    include_payload_summary: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,12 +275,49 @@ fn format_timestamp_ms(ms: Option<i64>) -> Option<String> {
     ms.and_then(|v| chrono::DateTime::<Utc>::from_timestamp_millis(v).map(|dt| dt.to_rfc3339()))
 }
 
+fn payload_kind(payload: Option<&TaskPayload>) -> Option<&'static str> {
+    match payload {
+        Some(TaskPayload::SystemEvent { .. }) => Some("system_event"),
+        Some(TaskPayload::AgentTurn { .. }) => Some("agent_turn"),
+        Some(TaskPayload::DirectDeliver { .. }) => Some("direct_deliver"),
+        None => None,
+    }
+}
+
+fn payload_text(payload: Option<&TaskPayload>) -> Option<&str> {
+    match payload {
+        Some(TaskPayload::SystemEvent { text }) => Some(text.as_str()),
+        Some(TaskPayload::AgentTurn { message, .. }) => Some(message.as_str()),
+        Some(TaskPayload::DirectDeliver { text }) => Some(text.as_str()),
+        None => None,
+    }
+}
+
+fn payload_preview(payload: Option<&TaskPayload>, max_chars: usize) -> Option<String> {
+    let raw = payload_text(payload)?;
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    Some(truncate_for_preview(&compact, max_chars))
+}
+
+fn truncate_for_preview(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
 #[async_trait]
 impl ToolExecutor for ScheduleTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: SCHEDULE_TOOL_NAME.to_string(),
-            description: "Manage scheduled tasks: list/add/update/remove/run for reminders and recurring jobs."
+            description: "Manage scheduled tasks: list/get/add/update/remove/run for reminders and recurring jobs. 'list' returns summary metadata. For full payload details, call action='get' with schedule_id."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -375,6 +414,10 @@ impl ToolExecutor for ScheduleTool {
                     "patch": { 
                         "type": "object",
                         "description": "Partial update for 'update' action"
+                    },
+                    "include_payload_summary": {
+                        "type": "boolean",
+                        "description": "For action='list': include compact payload_preview text (default false). Use action='get' for full payload."
                     }
                 },
                 "required": ["action"]
@@ -389,9 +432,11 @@ impl ToolExecutor for ScheduleTool {
         match parsed.action.as_str() {
             "list" => {
                 let entries = self.manager.list().await;
+                let include_payload_summary = parsed.include_payload_summary.unwrap_or(false);
                 let summary = entries
                     .iter()
                     .map(|entry| {
+                        let payload = entry.config.payload.as_ref();
                         serde_json::json!({
                             "schedule_id": entry.config.schedule_id,
                             "name": entry.config.name,
@@ -401,6 +446,13 @@ impl ToolExecutor for ScheduleTool {
                             "last_run_at": format_timestamp_ms(entry.state.last_run_at_ms),
                             "last_status": entry.state.last_run_status,
                             "consecutive_errors": entry.state.consecutive_errors,
+                            "has_payload": payload.is_some(),
+                            "payload_kind": payload_kind(payload),
+                            "payload_preview": if include_payload_summary {
+                                payload_preview(payload, 120)
+                            } else {
+                                None
+                            },
                         })
                     })
                     .collect::<Vec<_>>();
@@ -742,6 +794,95 @@ mod tests {
         assert_eq!(as_json[0]["schedule_id"], "daily-report");
         assert!(as_json[0]["next_run"].is_string() || as_json[0]["next_run"].is_null());
         assert!(as_json[0]["next_run_ms"].is_number() || as_json[0]["next_run_ms"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_action_exposes_payload_hints_without_full_payload_by_default() {
+        let (manager, _bus, _tmp) = setup();
+        manager
+            .add_schedule(clawhive_scheduler::ScheduleConfig {
+                schedule_id: "daily-digest".to_string(),
+                enabled: true,
+                name: "Daily Digest".to_string(),
+                description: None,
+                schedule: clawhive_scheduler::ScheduleType::Cron {
+                    expr: "0 9 * * *".to_string(),
+                    tz: "UTC".to_string(),
+                },
+                agent_id: "clawhive-main".to_string(),
+                session_mode: clawhive_scheduler::SessionMode::Isolated,
+                task: "Generate daily digest from news headlines".to_string(),
+                payload: Some(clawhive_scheduler::TaskPayload::AgentTurn {
+                    message: "Generate daily digest from news headlines".to_string(),
+                    model: None,
+                    thinking: None,
+                    timeout_seconds: 300,
+                    light_context: false,
+                }),
+                timeout_seconds: 300,
+                delete_after_run: false,
+                delivery: clawhive_scheduler::DeliveryConfig::default(),
+            })
+            .await
+            .unwrap();
+
+        let tool = ScheduleTool::new(manager);
+        let ctx = ToolContext::builtin();
+        let result = tool
+            .execute(serde_json::json!({ "action": "list" }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        let as_json: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(as_json[0]["has_payload"], true);
+        assert_eq!(as_json[0]["payload_kind"], "agent_turn");
+        assert!(as_json[0]["payload_preview"].is_null());
+    }
+
+    #[tokio::test]
+    async fn list_action_can_include_payload_preview_when_requested() {
+        let (manager, _bus, _tmp) = setup();
+        manager
+            .add_schedule(clawhive_scheduler::ScheduleConfig {
+                schedule_id: "payload-preview".to_string(),
+                enabled: true,
+                name: "Payload Preview".to_string(),
+                description: None,
+                schedule: clawhive_scheduler::ScheduleType::Cron {
+                    expr: "0 9 * * *".to_string(),
+                    tz: "UTC".to_string(),
+                },
+                agent_id: "clawhive-main".to_string(),
+                session_mode: clawhive_scheduler::SessionMode::Isolated,
+                task: "Generate and summarize long daily payload text".to_string(),
+                payload: Some(clawhive_scheduler::TaskPayload::AgentTurn {
+                    message: "Generate and summarize long daily payload text".to_string(),
+                    model: None,
+                    thinking: None,
+                    timeout_seconds: 300,
+                    light_context: false,
+                }),
+                timeout_seconds: 300,
+                delete_after_run: false,
+                delivery: clawhive_scheduler::DeliveryConfig::default(),
+            })
+            .await
+            .unwrap();
+
+        let tool = ScheduleTool::new(manager);
+        let ctx = ToolContext::builtin();
+        let result = tool
+            .execute(
+                serde_json::json!({ "action": "list", "include_payload_summary": true }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        let as_json: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert!(as_json[0]["payload_preview"].is_string());
     }
 
     #[tokio::test]
