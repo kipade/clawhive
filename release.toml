@@ -1,7 +1,5 @@
-[workspace]
 shared-version = true
 consolidate-commits = true
-
 publish = false
 verify = false
 tag-name = "v{{version}}"
