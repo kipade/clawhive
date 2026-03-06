@@ -3,7 +3,10 @@ use std::sync::Arc;
 use chrono::Utc;
 use clawhive_bus::{EventBus, Topic};
 use clawhive_gateway::Gateway;
-use clawhive_schema::{BusMessage, GroupContext, GroupMember, InboundMessage, OutboundMessage};
+use clawhive_schema::{
+    Attachment, AttachmentKind, BusMessage, GroupContext, GroupMember, InboundMessage,
+    OutboundMessage,
+};
 use serenity::all::{
     ButtonStyle, ChannelId, Client, Command, CommandInteraction, CommandOptionType,
     ComponentInteraction, Context, CreateActionRow, CreateButton, CreateCommand,
@@ -258,7 +261,7 @@ impl EventHandler for DiscordHandler {
         }
 
         let text = msg.content.trim();
-        if text.is_empty() {
+        if text.is_empty() && msg.attachments.is_empty() {
             return;
         }
 
@@ -300,6 +303,35 @@ impl EventHandler for DiscordHandler {
         } else {
             None
         };
+
+        // Extract attachments — download images and encode as base64
+        for att in &msg.attachments {
+            let kind = match att.content_type.as_deref() {
+                Some(ct) if ct.starts_with("image/") => AttachmentKind::Image,
+                Some(ct) if ct.starts_with("video/") => AttachmentKind::Video,
+                Some(ct) if ct.starts_with("audio/") => AttachmentKind::Audio,
+                _ => AttachmentKind::Other,
+            };
+            // For images, download and base64-encode (LLM providers require base64)
+            let url_or_data = if kind == AttachmentKind::Image {
+                match download_attachment(&att.url).await {
+                    Ok(base64_data) => base64_data,
+                    Err(e) => {
+                        tracing::warn!("Failed to download Discord attachment: {e}");
+                        continue;
+                    }
+                }
+            } else {
+                att.url.clone()
+            };
+            inbound.attachments.push(Attachment {
+                kind,
+                url: url_or_data,
+                mime_type: att.content_type.clone(),
+                file_name: Some(att.filename.clone()),
+                size: Some(att.size as u64),
+            });
+        }
 
         // Populate group context for guild channels
         if let Some(gid) = msg.guild_id {
@@ -821,6 +853,15 @@ async fn spawn_skill_confirm_listener(
             tracing::error!("Failed to send skill confirm buttons: {e}");
         }
     }
+}
+
+/// Download a Discord attachment and return its content as a base64-encoded string.
+async fn download_attachment(url: &str) -> anyhow::Result<String> {
+    use base64::Engine;
+
+    let bytes = reqwest::get(url).await?.bytes().await?;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(base64_data)
 }
 
 #[cfg(test)]
