@@ -10,6 +10,8 @@ import {
   useAddConnector,
   useRestart,
   useUpdateWebSearch,
+  useActionbookConfig,
+  useUpdateActionbook,
   useProviderPresets,
   useRouting,
   useUpdateRouting,
@@ -55,6 +57,9 @@ export default function SetupPage() {
   const [wsApiKey, setWsApiKey] = useState("");
   const [wsSaved, setWsSaved] = useState(false);
 
+  const [abEnabled, setAbEnabled] = useState(false);
+  const [abSaved, setAbSaved] = useState(false);
+
   // Step 5: Launch
   const [restarting, setRestarting] = useState(false);
 
@@ -62,6 +67,8 @@ export default function SetupPage() {
   const createAgent = useCreateAgent();
   const addConnector = useAddConnector();
   const updateWebSearch = useUpdateWebSearch();
+  const { data: abConfig } = useActionbookConfig();
+  const updateActionbook = useUpdateActionbook();
   const restart = useRestart();
   const { data: providerPresets } = useProviderPresets();
   const { data: routingData } = useRouting();
@@ -183,6 +190,19 @@ export default function SetupPage() {
         api_key: wsApiKey || null,
       });
       setWsSaved(true);
+    } catch {
+      // error handled by mutation state
+    }
+  };
+
+  const handleSaveActionbook = async () => {
+    if (!abEnabled) {
+      setAbSaved(true);
+      return;
+    }
+    try {
+      await updateActionbook.mutateAsync({ enabled: true });
+      setAbSaved(true);
     } catch {
       // error handled by mutation state
     }
@@ -321,18 +341,102 @@ export default function SetupPage() {
             />
           )}
           {step === 3 && (
-            <StepWebSearch
-              enabled={wsEnabled}
-              onEnabledChange={setWsEnabled}
-              provider={wsProvider}
-              onProviderChange={setWsProvider}
-              apiKey={wsApiKey}
-              onApiKeyChange={setWsApiKey}
-              onSubmit={handleSaveWebSearch}
-              isSaving={updateWebSearch.isPending}
-              isSaved={wsSaved}
-              error={updateWebSearch.error?.message}
-            />
+            <div className="space-y-10">
+              <StepWebSearch
+                enabled={wsEnabled}
+                onEnabledChange={setWsEnabled}
+                provider={wsProvider}
+                onProviderChange={setWsProvider}
+                apiKey={wsApiKey}
+                onApiKeyChange={setWsApiKey}
+                onSubmit={handleSaveWebSearch}
+                isSaving={updateWebSearch.isPending}
+                isSaved={wsSaved}
+                error={updateWebSearch.error?.message}
+              />
+              <div className="border-t pt-8">
+                <div>
+                  <h2 className="text-lg font-semibold">Browser Automation</h2>
+                  <p className="text-sm text-muted-foreground mt-1">
+                    Optional: enable browser automation so your agent can interact with web pages,
+                    fill forms, and extract data. Requires the actionbook CLI tool.
+                  </p>
+                </div>
+                <div className="mt-4 grid grid-cols-2 gap-3">
+                  <button
+                    onClick={() => { if (!abSaved) setAbEnabled(true); }}
+                    disabled={abSaved}
+                    className={`rounded-lg border px-4 py-4 text-left transition-all ${
+                      abEnabled
+                        ? "border-primary bg-primary/5 ring-1 ring-primary/20"
+                        : "border-border hover:border-primary/40 hover:bg-muted/50"
+                    } ${abSaved ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
+                  >
+                    <div className="text-sm font-medium">Enable</div>
+                    <div className="mt-0.5 text-xs text-muted-foreground">Give your agent browser control</div>
+                  </button>
+                  <button
+                    onClick={() => { if (!abSaved) setAbEnabled(false); }}
+                    disabled={abSaved}
+                    className={`rounded-lg border px-4 py-4 text-left transition-all ${
+                      !abEnabled
+                        ? "border-primary bg-primary/5 ring-1 ring-primary/20"
+                        : "border-border hover:border-primary/40 hover:bg-muted/50"
+                    } ${abSaved ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
+                  >
+                    <div className="text-sm font-medium">Skip</div>
+                    <div className="mt-0.5 text-xs text-muted-foreground">No browser automation for now</div>
+                  </button>
+                </div>
+                {abEnabled && (
+                  <Card className="mt-4 border-primary/20 bg-primary/[0.02]">
+                    <CardContent className="space-y-4">
+                      <div className="flex items-center gap-2">
+                        {abConfig?.installed ? (
+                          <span className="flex items-center gap-1 text-xs font-medium text-emerald-600">
+                            <CheckCircle2 className="h-3.5 w-3.5" />
+                            actionbook CLI installed
+                          </span>
+                        ) : (
+                          <div className="space-y-2">
+                            <p className="text-xs text-amber-600 font-medium">actionbook CLI not found</p>
+                            <p className="text-xs text-muted-foreground">
+                              Install it with:{" "}
+                              <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px]">
+                                curl -fsSL https://actionbook.dev/install.sh | bash
+                              </code>
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center justify-end">
+                        {abSaved ? (
+                          <span className="flex items-center gap-1 text-xs font-medium text-emerald-600">
+                            <CheckCircle2 className="h-3.5 w-3.5" />
+                            Saved
+                          </span>
+                        ) : (
+                          <Button
+                            size="sm"
+                            onClick={handleSaveActionbook}
+                            disabled={updateActionbook.isPending}
+                          >
+                            {updateActionbook.isPending ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              "Save"
+                            )}
+                          </Button>
+                        )}
+                      </div>
+                      {updateActionbook.error?.message && (
+                        <p className="text-xs text-destructive">{updateActionbook.error.message}</p>
+                      )}
+                    </CardContent>
+                  </Card>
+                )}
+              </div>
+            </div>
           )}
           {step === 4 && (
             <StepLaunch
@@ -365,7 +469,7 @@ export default function SetupPage() {
               disabled={!canAdvance()}
             >
               {(step === 2 || step === 3) ? (
-                (step === 2 && channelCreated) || (step === 3 && wsSaved) ? "Next" : "Skip"
+                (step === 2 && channelCreated) || (step === 3 && wsSaved && abSaved) ? "Next" : "Skip"
               ) : "Next"}
               <ChevronRight className="h-4 w-4" />
             </Button>

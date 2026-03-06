@@ -70,6 +70,11 @@ export interface WebSearchConfig {
   has_api_key?: boolean;
 }
 
+export interface ActionbookConfig {
+  enabled: boolean;
+  installed: boolean;
+}
+
 export interface ConnectorConfig {
   connector_id: string;
   token: string;
@@ -350,6 +355,13 @@ export function useWebSearchConfig() {
   });
 }
 
+export function useActionbookConfig() {
+  return useQuery({
+    queryKey: ["actionbook-config"],
+    queryFn: () => apiFetch<ActionbookConfig>("/api/setup/tools/actionbook"),
+  });
+}
+
 export interface ProviderPreset {
   id: string;
   name: string;
@@ -376,5 +388,17 @@ export function useUpdateWebSearch() {
         body: JSON.stringify(data),
       }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["web-search-config"] }),
+  });
+}
+
+export function useUpdateActionbook() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { enabled: boolean }) =>
+      apiFetch<ActionbookConfig>("/api/setup/tools/actionbook", {
+        method: "PUT",
+        body: JSON.stringify(data),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["actionbook-config"] }),
   });
 }

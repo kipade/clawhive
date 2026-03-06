@@ -12,6 +12,7 @@ pub fn router() -> Router<AppState> {
         .route("/status", get(setup_status))
         .route("/restart", post(restart))
         .route("/tools/web-search", get(get_web_search).put(put_web_search))
+        .route("/tools/actionbook", get(get_actionbook).put(put_actionbook))
         .route("/provider-presets", get(get_provider_presets))
 }
 
@@ -112,6 +113,13 @@ pub struct WebSearchConfig {
     pub has_api_key: bool,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct ActionbookConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub installed: bool,
+}
+
 async fn get_web_search(
     State(state): State<AppState>,
 ) -> Result<Json<WebSearchConfig>, axum::http::StatusCode> {
@@ -167,6 +175,51 @@ async fn put_web_search(
     };
 
     Ok(Json(response))
+}
+
+async fn get_actionbook(
+    State(state): State<AppState>,
+) -> Result<Json<ActionbookConfig>, axum::http::StatusCode> {
+    let path = state.root.join("config/main.yaml");
+    let val = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_yaml::from_str::<serde_yaml::Value>(&c).ok())
+        .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+
+    let enabled = val["tools"]["actionbook"]["enabled"]
+        .as_bool()
+        .unwrap_or(false);
+    Ok(Json(ActionbookConfig {
+        enabled,
+        installed: clawhive_core::bin_exists("actionbook"),
+    }))
+}
+
+async fn put_actionbook(
+    State(state): State<AppState>,
+    Json(config): Json<ActionbookConfig>,
+) -> Result<Json<ActionbookConfig>, axum::http::StatusCode> {
+    let path = state.root.join("config/main.yaml");
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)
+        .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+
+    if !doc["tools"].is_mapping() {
+        doc["tools"] = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+
+    let mut actionbook_map = serde_yaml::Mapping::new();
+    actionbook_map.insert("enabled".into(), serde_yaml::Value::Bool(config.enabled));
+    doc["tools"]["actionbook"] = serde_yaml::Value::Mapping(actionbook_map);
+
+    let yaml =
+        serde_yaml::to_string(&doc).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    std::fs::write(&path, yaml).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(ActionbookConfig {
+        enabled: config.enabled,
+        installed: clawhive_core::bin_exists("actionbook"),
+    }))
 }
 
 fn redact_api_key_for_response(_api_key: Option<&str>) -> Option<String> {
@@ -253,5 +306,16 @@ mod tests {
         assert!(has_configured_api_key(Some("abc123")));
         assert!(!has_configured_api_key(Some("")));
         assert!(!has_configured_api_key(None));
+    }
+
+    #[test]
+    fn actionbook_default_config() {
+        let config = ActionbookConfig {
+            enabled: false,
+            installed: false,
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["enabled"], false);
+        assert_eq!(json["installed"], false);
     }
 }
