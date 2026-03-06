@@ -423,7 +423,7 @@ fn collect_env_vars(env_inherit: &[String]) -> HashMap<String, String> {
     env_vars
 }
 
-fn default_path_candidates() -> Vec<String> {
+pub fn default_path_candidates() -> Vec<String> {
     let mut candidates = vec![
         "/opt/homebrew/bin".to_string(),
         "/opt/homebrew/sbin".to_string(),
@@ -448,7 +448,7 @@ fn default_path_candidates() -> Vec<String> {
     candidates
 }
 
-fn augment_path_like_host(current_path: &str, candidates: &[String]) -> String {
+pub fn augment_path_like_host(current_path: &str, candidates: &[String]) -> String {
     let mut entries: Vec<PathBuf> = std::env::split_paths(current_path).collect();
     let mut seen: HashSet<OsString> = entries
         .iter()

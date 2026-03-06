@@ -193,13 +193,15 @@ fn collect_reference_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
 }
 
 pub fn bin_exists(name: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    use crate::shell_tool::{augment_path_like_host, default_path_candidates};
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    let full_path = augment_path_like_host(&inherited, &default_path_candidates());
+    for dir in std::env::split_paths(&full_path) {
+        if dir.join(name).is_file() {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Default)]
