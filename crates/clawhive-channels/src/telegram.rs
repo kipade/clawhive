@@ -1017,9 +1017,7 @@ async fn send_long_html(
     html: &str,
 ) -> Result<(), teloxide::RequestError> {
     if html.len() <= TELEGRAM_MAX_LEN {
-        bot.send_message(chat_id, html)
-            .parse_mode(ParseMode::Html)
-            .await?;
+        send_html_chunk_with_fallback(bot, chat_id, html).await?;
         return Ok(());
     }
 
@@ -1027,9 +1025,7 @@ async fn send_long_html(
     let mut remaining = html;
     while !remaining.is_empty() {
         if remaining.len() <= TELEGRAM_MAX_LEN {
-            bot.send_message(chat_id, remaining)
-                .parse_mode(ParseMode::Html)
-                .await?;
+            send_html_chunk_with_fallback(bot, chat_id, remaining).await?;
             break;
         }
 
@@ -1041,13 +1037,76 @@ async fn send_long_html(
         // Skip the newline itself if we split at one
         let rest = rest.strip_prefix('\n').unwrap_or(rest);
 
-        bot.send_message(chat_id, chunk)
-            .parse_mode(ParseMode::Html)
-            .await?;
+        send_html_chunk_with_fallback(bot, chat_id, chunk).await?;
         remaining = rest;
     }
 
     Ok(())
+}
+
+async fn send_html_chunk_with_fallback(
+    bot: &Bot,
+    chat_id: ChatId,
+    chunk: &str,
+) -> Result<(), teloxide::RequestError> {
+    match bot
+        .send_message(chat_id, chunk)
+        .parse_mode(ParseMode::Html)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let err_text = err.to_string();
+            if !is_telegram_parse_entities_error(&err_text) {
+                return Err(err);
+            }
+
+            let plain_text = strip_telegram_html_tags(chunk);
+            let fallback = if plain_text.trim().is_empty() {
+                chunk.to_string()
+            } else {
+                plain_text
+            };
+
+            tracing::warn!(
+                chat_id = chat_id.0,
+                chunk_len = chunk.len(),
+                fallback_len = fallback.len(),
+                error = %err_text,
+                "telegram html parse failed, retrying plain text"
+            );
+
+            bot.send_message(chat_id, fallback).await?;
+            Ok(())
+        }
+    }
+}
+
+fn is_telegram_parse_entities_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("can't parse entities")
+        || lower.contains("unsupported start tag")
+        || lower.contains("can't find end tag")
+}
+
+fn strip_telegram_html_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Parse chat ID from conversation_scope (format: "chat:123" or "chat:-100123")
@@ -1324,5 +1383,23 @@ mod tests {
     #[test]
     fn empty_outbound_fallback_is_disabled_for_group() {
         assert_eq!(empty_outbound_fallback_text(-10012345), None);
+    }
+
+    #[test]
+    fn parse_entities_error_detection_matches_expected_error() {
+        let err = "A Telegram's error: Bad Request: can't parse entities: Can't find end tag corresponding to start tag \"code\"";
+        assert!(is_telegram_parse_entities_error(err));
+    }
+
+    #[test]
+    fn parse_entities_error_detection_ignores_other_errors() {
+        let err = "A Telegram's error: Forbidden: bot was blocked by the user";
+        assert!(!is_telegram_parse_entities_error(err));
+    }
+
+    #[test]
+    fn strip_telegram_html_tags_removes_tags_and_decodes_entities() {
+        let text = "<b>hello</b> <code>x &lt; y</code> &amp; done";
+        assert_eq!(strip_telegram_html_tags(text), "hello x < y & done");
     }
 }
