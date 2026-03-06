@@ -18,6 +18,11 @@ clawhive-core = { path = "../clawhive-core" }
 clawhive-memory = { path = "../clawhive-memory" }
 clawhive-provider = { path = "../clawhive-provider" }
 clawhive-gateway = { path = "../clawhive-gateway" }
+tui-textarea = "0.7"
+pulldown-cmark = "0.12"
+syntect = "5"
+two-face = "0.4"
+diffy = "0.4"
 
 [lib]
 name = "clawhive_tui"

@@ -155,6 +155,13 @@ impl TelegramBot {
                     .unwrap_or("")
                     .to_string();
 
+                let quoted_text = msg
+                    .reply_to_message()
+                    .and_then(|quoted| quoted.text().or_else(|| quoted.caption()))
+                    .map(|s| s.to_string());
+
+                text = compose_inbound_text(&text, quoted_text.as_deref());
+
                 // Normalize Telegram-style underscore commands to space format
                 text = text
                     .replacen("/skill_analyze", "/skill analyze", 1)
@@ -173,6 +180,13 @@ impl TelegramBot {
 
                 // Group chat filtering: skip non-mention messages when require_mention is true
                 if chat_id.0 < 0 && require_mention && !is_mention {
+                    tracing::info!(
+                        chat_id = chat_id.0,
+                        user_id,
+                        message_id,
+                        require_mention,
+                        "telegram inbound skipped: group message without mention"
+                    );
                     return Ok::<(), teloxide::RequestError>(());
                 }
 
@@ -180,6 +194,7 @@ impl TelegramBot {
                 inbound.is_mention = is_mention;
                 inbound.mention_target = mention_target;
                 inbound.thread_id = msg.thread_id.map(|thread| thread.0.to_string());
+                let trace_id = inbound.trace_id;
 
                 // Download photo if present
                 if let Some(photos) = msg.photo() {
@@ -230,20 +245,71 @@ impl TelegramBot {
 
                     match result {
                         Ok(outbound) => {
-                            if outbound.text.is_empty() {
-                                tracing::warn!("outbound text is empty, skipping send");
+                            if outbound.text.trim().is_empty() {
+                                tracing::warn!(
+                                    trace_id = %trace_id,
+                                    chat_id = chat_id.0,
+                                    user_id,
+                                    message_id,
+                                    "telegram outbound text is empty"
+                                );
+
+                                if let Some(fallback_text) = empty_outbound_fallback_text(chat_id.0)
+                                {
+                                    if let Err(send_err) =
+                                        bot.send_message(chat_id, fallback_text).await
+                                    {
+                                        tracing::error!(
+                                            trace_id = %trace_id,
+                                            chat_id = chat_id.0,
+                                            user_id,
+                                            message_id,
+                                            error = %send_err,
+                                            "failed to send telegram empty-outbound fallback"
+                                        );
+                                    }
+                                } else {
+                                    tracing::info!(
+                                        trace_id = %trace_id,
+                                        chat_id = chat_id.0,
+                                        user_id,
+                                        message_id,
+                                        "telegram empty outbound suppressed for non-DM chat"
+                                    );
+                                }
                             } else {
                                 let html = md_to_telegram_html(&outbound.text);
                                 if let Err(err) = send_long_html(&bot, chat_id, &html).await {
-                                    tracing::error!("failed to send reply: {err}");
+                                    tracing::error!(
+                                        trace_id = %trace_id,
+                                        chat_id = chat_id.0,
+                                        user_id,
+                                        message_id,
+                                        error = %err,
+                                        "failed to send telegram reply"
+                                    );
                                 }
                             }
                         }
                         Err(err) => {
-                            tracing::error!("gateway error: {err}");
+                            tracing::error!(
+                                trace_id = %trace_id,
+                                chat_id = chat_id.0,
+                                user_id,
+                                message_id,
+                                error = %err,
+                                "telegram gateway error"
+                            );
                             let user_msg = format!("Error: {err}");
                             if let Err(send_err) = bot.send_message(chat_id, &user_msg).await {
-                                tracing::error!("failed to send error message: {send_err}");
+                                tracing::error!(
+                                    trace_id = %trace_id,
+                                    chat_id = chat_id.0,
+                                    user_id,
+                                    message_id,
+                                    error = %send_err,
+                                    "failed to send telegram error message"
+                                );
                             }
                         }
                     }
@@ -951,9 +1017,7 @@ async fn send_long_html(
     html: &str,
 ) -> Result<(), teloxide::RequestError> {
     if html.len() <= TELEGRAM_MAX_LEN {
-        bot.send_message(chat_id, html)
-            .parse_mode(ParseMode::Html)
-            .await?;
+        send_html_chunk_with_fallback(bot, chat_id, html).await?;
         return Ok(());
     }
 
@@ -961,9 +1025,7 @@ async fn send_long_html(
     let mut remaining = html;
     while !remaining.is_empty() {
         if remaining.len() <= TELEGRAM_MAX_LEN {
-            bot.send_message(chat_id, remaining)
-                .parse_mode(ParseMode::Html)
-                .await?;
+            send_html_chunk_with_fallback(bot, chat_id, remaining).await?;
             break;
         }
 
@@ -975,13 +1037,76 @@ async fn send_long_html(
         // Skip the newline itself if we split at one
         let rest = rest.strip_prefix('\n').unwrap_or(rest);
 
-        bot.send_message(chat_id, chunk)
-            .parse_mode(ParseMode::Html)
-            .await?;
+        send_html_chunk_with_fallback(bot, chat_id, chunk).await?;
         remaining = rest;
     }
 
     Ok(())
+}
+
+async fn send_html_chunk_with_fallback(
+    bot: &Bot,
+    chat_id: ChatId,
+    chunk: &str,
+) -> Result<(), teloxide::RequestError> {
+    match bot
+        .send_message(chat_id, chunk)
+        .parse_mode(ParseMode::Html)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let err_text = err.to_string();
+            if !is_telegram_parse_entities_error(&err_text) {
+                return Err(err);
+            }
+
+            let plain_text = strip_telegram_html_tags(chunk);
+            let fallback = if plain_text.trim().is_empty() {
+                chunk.to_string()
+            } else {
+                plain_text
+            };
+
+            tracing::warn!(
+                chat_id = chat_id.0,
+                chunk_len = chunk.len(),
+                fallback_len = fallback.len(),
+                error = %err_text,
+                "telegram html parse failed, retrying plain text"
+            );
+
+            bot.send_message(chat_id, fallback).await?;
+            Ok(())
+        }
+    }
+}
+
+fn is_telegram_parse_entities_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("can't parse entities")
+        || lower.contains("unsupported start tag")
+        || lower.contains("can't find end tag")
+}
+
+fn strip_telegram_html_tags(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_tag = false;
+
+    for ch in input.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Parse chat ID from conversation_scope (format: "chat:123" or "chat:-100123")
@@ -993,6 +1118,31 @@ fn parse_chat_id(conversation_scope: &str) -> Option<i64> {
     } else {
         None
     }
+}
+
+fn empty_outbound_fallback_text(chat_id: i64) -> Option<&'static str> {
+    if chat_id > 0 {
+        Some("Sorry, I got an empty response. Please try again.")
+    } else {
+        None
+    }
+}
+
+fn compose_inbound_text(user_text: &str, quoted_text: Option<&str>) -> String {
+    let trimmed_user = user_text.trim();
+    if trimmed_user.starts_with('/') {
+        return user_text.to_string();
+    }
+
+    let quoted = quoted_text.unwrap_or("").trim();
+    if quoted.is_empty() {
+        return user_text.to_string();
+    }
+
+    format!(
+        "[Quoted Message]\n{}\n\n[Current Message]\n{}",
+        quoted, user_text
+    )
 }
 
 fn utf16_range_to_byte_range(text: &str, offset: usize, length: usize) -> Option<(usize, usize)> {
@@ -1108,6 +1258,27 @@ mod tests {
     }
 
     #[test]
+    fn compose_inbound_text_includes_quoted_context() {
+        let text = compose_inbound_text("没下文了吗？", Some("我已经把两个修复都部署好了"));
+        assert!(text.contains("[Quoted Message]"));
+        assert!(text.contains("我已经把两个修复都部署好了"));
+        assert!(text.contains("[Current Message]"));
+        assert!(text.contains("没下文了吗？"));
+    }
+
+    #[test]
+    fn compose_inbound_text_keeps_command_plain() {
+        let text = compose_inbound_text("/status", Some("之前那条消息"));
+        assert_eq!(text, "/status");
+    }
+
+    #[test]
+    fn compose_inbound_text_without_quote_keeps_original() {
+        let text = compose_inbound_text("你好", None);
+        assert_eq!(text, "你好");
+    }
+
+    #[test]
     fn md_html_escapes_entities() {
         assert_eq!(
             md_to_telegram_html("a < b & c > d"),
@@ -1199,5 +1370,36 @@ mod tests {
         assert!(html.contains("&lt;'PY'"));
         assert!(html.contains("&lt;tag&gt;"));
         assert!(!html.contains("<'PY'"));
+    }
+
+    #[test]
+    fn empty_outbound_fallback_is_enabled_for_dm() {
+        assert_eq!(
+            empty_outbound_fallback_text(12345),
+            Some("Sorry, I got an empty response. Please try again.")
+        );
+    }
+
+    #[test]
+    fn empty_outbound_fallback_is_disabled_for_group() {
+        assert_eq!(empty_outbound_fallback_text(-10012345), None);
+    }
+
+    #[test]
+    fn parse_entities_error_detection_matches_expected_error() {
+        let err = "A Telegram's error: Bad Request: can't parse entities: Can't find end tag corresponding to start tag \"code\"";
+        assert!(is_telegram_parse_entities_error(err));
+    }
+
+    #[test]
+    fn parse_entities_error_detection_ignores_other_errors() {
+        let err = "A Telegram's error: Forbidden: bot was blocked by the user";
+        assert!(!is_telegram_parse_entities_error(err));
+    }
+
+    #[test]
+    fn strip_telegram_html_tags_removes_tags_and_decodes_entities() {
+        let text = "<b>hello</b> <code>x &lt; y</code> &amp; done";
+        assert_eq!(strip_telegram_html_tags(text), "hello x < y & done");
     }
 }
