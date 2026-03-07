@@ -32,3 +32,9 @@ deploy.sh
 
 # Playwright MCP
 .playwright-mcp/
+
+# AI IDE configs
+.agent/
+.agents/
+.claude/
+.kiro/
