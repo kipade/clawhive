@@ -844,6 +844,44 @@ fn add_channel_to_config(
 
     let content = fs::read_to_string(&main_path)?;
     let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)?;
+
+    // Ensure required top-level sections exist with defaults
+    if doc.get("app").is_none() {
+        doc["app"] = serde_yaml::to_value(serde_yaml::Mapping::from_iter([(
+            serde_yaml::Value::String("name".into()),
+            serde_yaml::Value::String("clawhive".into()),
+        )]))?;
+    }
+    if doc.get("runtime").is_none() {
+        doc["runtime"] = serde_yaml::to_value(serde_yaml::Mapping::from_iter([(
+            serde_yaml::Value::String("max_concurrent".into()),
+            serde_yaml::Value::Number(4.into()),
+        )]))?;
+    }
+    if doc.get("features").is_none() {
+        doc["features"] = serde_yaml::to_value(serde_yaml::Mapping::from_iter([
+            (
+                serde_yaml::Value::String("multi_agent".into()),
+                serde_yaml::Value::Bool(true),
+            ),
+            (
+                serde_yaml::Value::String("sub_agent".into()),
+                serde_yaml::Value::Bool(true),
+            ),
+            (
+                serde_yaml::Value::String("tui".into()),
+                serde_yaml::Value::Bool(true),
+            ),
+            (
+                serde_yaml::Value::String("cli".into()),
+                serde_yaml::Value::Bool(true),
+            ),
+        ]))?;
+    }
+    if doc.get("channels").is_none() {
+        doc["channels"] = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+
     let channels = doc
         .get_mut("channels")
         .and_then(|c| c.as_mapping_mut())

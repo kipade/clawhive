@@ -58,7 +58,7 @@ clawhive chat
 clawhive up                  # start as background daemon (alias for start -d)
 clawhive start               # start in foreground
 clawhive start --daemon      # start as background daemon (alias: -d)
-clawhive restart
+clawhive restart              # stop + start as daemon
 clawhive stop
 
 # Dashboard mode (observability TUI)
@@ -93,7 +93,7 @@ clawhive auth login openai
 | `up` | Start as background daemon (alias for `start -d`) |
 | `start [--tui] [--daemon]` | Start all configured channel bots and HTTP API server |
 | `stop` | Stop a running clawhive process |
-| `restart` | Restart clawhive (stop + start) |
+| `restart` | Restart clawhive (stop + start as daemon) |
 | `chat [--agent <id>]` | Local REPL for testing |
 | `validate` | Validate YAML configuration |
 | `consolidate` | Run memory consolidation manually |
@@ -251,8 +251,7 @@ clawhive chat
 # Service lifecycle
 clawhive start
 clawhive start --daemon  # alias: -d
-clawhive restart
-clawhive restart --daemon  # alias: -d
+clawhive restart               # stop + start as daemon
 clawhive stop
 
 # Dashboard mode (observability TUI)
@@ -301,8 +300,7 @@ cargo run -- start
 cargo run -- start --daemon  # alias: -d
 
 # Restart / stop
-cargo run -- restart
-cargo run -- restart --daemon
+cargo run -- restart              # stop + start as daemon
 cargo run -- stop
 
 # Dashboard mode (observability TUI)
