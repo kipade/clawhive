@@ -6,6 +6,14 @@ use console::style;
 use crate::{is_process_running, read_pid_file};
 
 pub fn print_status(root: &Path) {
+    print_status_ex(root, false);
+}
+
+pub fn print_status_after_start(root: &Path) {
+    print_status_ex(root, true);
+}
+
+fn print_status_ex(root: &Path, just_started: bool) {
     let pid_info = match read_pid_file(root) {
         Ok(Some(pid)) if is_process_running(pid) => Some(pid),
         Ok(Some(_)) => None,
@@ -16,11 +24,12 @@ pub fn print_status(root: &Path) {
 
     // Header
     if running {
-        println!(
-            "  clawhive is {} (pid: {})",
-            style("running").green(),
-            pid_info.unwrap()
-        );
+        let label = if just_started {
+            style("started").green()
+        } else {
+            style("running").green()
+        };
+        println!("  clawhive is {} (pid: {})", label, pid_info.unwrap());
     } else {
         println!("  clawhive is {}", style("stopped").red());
     }

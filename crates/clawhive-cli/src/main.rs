@@ -440,7 +440,6 @@ async fn main() -> Result<()> {
         } => {
             if let Some(pid) = read_pid_file(&cli.config_root)? {
                 if is_process_running(pid) {
-                    println!("clawhive is already running (pid: {pid}).");
                     commands::status::print_status(&cli.config_root);
                     return Ok(());
                 }
@@ -450,7 +449,7 @@ async fn main() -> Result<()> {
             daemonize(&cli.config_root, false, port, security_override)?;
             // Brief pause to let the daemon start and write its PID file
             tokio::time::sleep(Duration::from_millis(800)).await;
-            commands::status::print_status(&cli.config_root);
+            commands::status::print_status_after_start(&cli.config_root);
         }
         Commands::Status => {
             commands::status::print_status(&cli.config_root);
@@ -472,7 +471,7 @@ async fn main() -> Result<()> {
             let security_override = resolve_security_override(security, no_security);
             daemonize(&cli.config_root, false, port, security_override)?;
             tokio::time::sleep(Duration::from_millis(800)).await;
-            commands::status::print_status(&cli.config_root);
+            commands::status::print_status_after_start(&cli.config_root);
         }
         Commands::Code {
             port,
@@ -1849,13 +1848,11 @@ fn daemonize(
         None => {}
     }
 
-    let child = command
+    let _child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_file_err))
         .spawn()?;
-
-    println!("clawhive started in background (pid: {})", child.id());
 
     Ok(())
 }
