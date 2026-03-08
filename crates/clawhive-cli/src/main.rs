@@ -89,12 +89,8 @@ enum Commands {
     Status,
     #[command(about = "Stop a running clawhive process")]
     Stop,
-    #[command(about = "Restart clawhive (stop + start)")]
+    #[command(about = "Restart clawhive (stop + start as daemon)")]
     Restart {
-        #[arg(long, short = 'd', help = "Run as a background daemon")]
-        daemon: bool,
-        #[arg(long, help = "Run TUI dashboard in the same process")]
-        tui: bool,
         #[arg(long, default_value = "8848", help = "HTTP API server port")]
         port: u16,
         /// Override security mode (overrides agent config)
@@ -442,6 +438,13 @@ async fn main() -> Result<()> {
             security,
             no_security,
         } => {
+            if let Some(pid) = read_pid_file(&cli.config_root)? {
+                if is_process_running(pid) {
+                    println!("clawhive is already running (pid: {pid}).");
+                    commands::status::print_status(&cli.config_root);
+                    return Ok(());
+                }
+            }
             ensure_skeleton_config(&cli.config_root, port)?;
             let security_override = resolve_security_override(security, no_security);
             daemonize(&cli.config_root, false, port, security_override)?;
@@ -456,8 +459,6 @@ async fn main() -> Result<()> {
             stop_process(&cli.config_root)?;
         }
         Commands::Restart {
-            daemon,
-            tui,
             port,
             security,
             no_security,
@@ -469,11 +470,9 @@ async fn main() -> Result<()> {
             }
             ensure_skeleton_config(&cli.config_root, port)?;
             let security_override = resolve_security_override(security, no_security);
-            if daemon {
-                daemonize(&cli.config_root, tui, port, security_override)?;
-            } else {
-                start_bot(&cli.config_root, tui, port, security_override).await?;
-            }
+            daemonize(&cli.config_root, false, port, security_override)?;
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            commands::status::print_status(&cli.config_root);
         }
         Commands::Code {
             port,
@@ -2633,22 +2632,15 @@ mod tests {
     #[test]
     fn parses_restart_subcommand() {
         let cli = Cli::try_parse_from(["clawhive", "restart"]).unwrap();
-        assert!(matches!(
-            cli.command.unwrap(),
-            Commands::Restart { tui: false, .. }
-        ));
+        assert!(matches!(cli.command.unwrap(), Commands::Restart { .. }));
     }
 
     #[test]
-    fn parses_restart_with_flags() {
-        let cli = Cli::try_parse_from(["clawhive", "restart", "--tui", "--port", "8080"]).unwrap();
+    fn parses_restart_with_port() {
+        let cli = Cli::try_parse_from(["clawhive", "restart", "--port", "8080"]).unwrap();
         assert!(matches!(
             cli.command.unwrap(),
-            Commands::Restart {
-                tui: true,
-                port: 8080,
-                ..
-            }
+            Commands::Restart { port: 8080, .. }
         ));
     }
 

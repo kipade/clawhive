@@ -58,7 +58,7 @@ clawhive chat
 clawhive up                  # 后台守护进程启动（等效于 start -d）
 clawhive start               # 前台启动
 clawhive start --daemon      # 后台守护进程启动（别名：-d）
-clawhive restart
+clawhive restart              # 停止 + 后台守护进程重启
 clawhive stop
 
 # 仪表板模式（可观测性 TUI）
@@ -93,7 +93,7 @@ clawhive auth login openai
 | `up` | 后台守护进程启动（等效于 `start -d`） |
 | `start [--tui] [--daemon]` | 启动所有已配置的渠道 Bot 和 HTTP API 服务器 |
 | `stop` | 停止运行中的 clawhive 进程 |
-| `restart` | 重启 clawhive（stop + start） |
+| `restart` | 重启 clawhive（stop + 后台启动） |
 | `chat [--agent <id>]` | 本地 REPL 测试 |
 | `validate` | 验证 YAML 配置 |
 | `consolidate` | 手动运行记忆整合 |
