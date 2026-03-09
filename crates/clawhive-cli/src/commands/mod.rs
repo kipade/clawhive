@@ -3,6 +3,7 @@ pub mod allowlist;
 pub mod auth;
 pub mod config;
 pub mod logs;
+pub mod schedule;
 pub mod skill;
 pub mod status;
 pub mod update;

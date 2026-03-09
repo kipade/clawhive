@@ -32,8 +32,7 @@ use clawhive_scheduler::{SqliteStore, WaitTask, WaitTaskManager};
 use clawhive_schema::InboundMessage;
 use commands::auth::{handle_auth_command, AuthCommands};
 use runtime::bootstrap::{
-    bootstrap, build_embedding_provider, build_router_from_config, format_schedule_type,
-    resolve_security_override,
+    bootstrap, build_embedding_provider, build_router_from_config, resolve_security_override,
 };
 use runtime::pid::{
     check_and_clean_pid, is_process_running, read_pid_file, remove_pid_file, write_pid_file,
@@ -146,7 +145,7 @@ enum Commands {
     #[command(subcommand, about = "Auth management")]
     Auth(AuthCommands),
     #[command(subcommand, about = "Manage scheduled tasks")]
-    Schedule(ScheduleCommands),
+    Schedule(commands::schedule::ScheduleCommands),
     #[command(subcommand, about = "Manage wait tasks (background polling)")]
     Wait(WaitCommands),
     #[command(subcommand, about = "Manage runtime allowlist")]
@@ -196,34 +195,6 @@ enum TaskCommands {
         agent: String,
         #[arg(help = "Task description")]
         task: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum ScheduleCommands {
-    #[command(about = "List all scheduled tasks with status")]
-    List,
-    #[command(about = "Trigger a scheduled task immediately")]
-    Run {
-        #[arg(help = "Schedule ID")]
-        schedule_id: String,
-    },
-    #[command(about = "Enable a disabled schedule")]
-    Enable {
-        #[arg(help = "Schedule ID")]
-        schedule_id: String,
-    },
-    #[command(about = "Disable a schedule")]
-    Disable {
-        #[arg(help = "Schedule ID")]
-        schedule_id: String,
-    },
-    #[command(about = "Show recent run history for a schedule")]
-    History {
-        #[arg(help = "Schedule ID")]
-        schedule_id: String,
-        #[arg(long, default_value = "10")]
-        limit: usize,
     },
 }
 
@@ -477,69 +448,7 @@ async fn main() -> Result<()> {
             handle_auth_command(cmd).await?;
         }
         Commands::Schedule(cmd) => {
-            let (
-                _bus,
-                _memory,
-                _gateway,
-                _config,
-                schedule_manager,
-                _wait_manager,
-                _approval_registry,
-            ) = bootstrap(&cli.config_root, None).await?;
-            match cmd {
-                ScheduleCommands::List => {
-                    let entries = schedule_manager.list().await;
-                    println!(
-                        "{:<24} {:<8} {:<24} {:<26} {:<8}",
-                        "ID", "ENABLED", "SCHEDULE", "NEXT RUN", "ERRORS"
-                    );
-                    println!("{}", "-".repeat(96));
-                    for entry in entries {
-                        let next_run = entry
-                            .state
-                            .next_run_at_ms
-                            .and_then(|ms| chrono::Utc.timestamp_millis_opt(ms).single())
-                            .map(|dt| dt.to_rfc3339())
-                            .unwrap_or_else(|| "-".to_string());
-                        println!(
-                            "{:<24} {:<8} {:<24} {:<26} {:<8}",
-                            entry.config.schedule_id,
-                            if entry.config.enabled { "yes" } else { "no" },
-                            format_schedule_type(&entry.config.schedule),
-                            next_run,
-                            entry.state.consecutive_errors,
-                        );
-                    }
-                }
-                ScheduleCommands::Run { schedule_id } => {
-                    schedule_manager.trigger_now(&schedule_id).await?;
-                    println!("Triggered schedule '{schedule_id}'.");
-                }
-                ScheduleCommands::Enable { schedule_id } => {
-                    schedule_manager.set_enabled(&schedule_id, true).await?;
-                    println!("Enabled schedule '{schedule_id}'.");
-                }
-                ScheduleCommands::Disable { schedule_id } => {
-                    schedule_manager.set_enabled(&schedule_id, false).await?;
-                    println!("Disabled schedule '{schedule_id}'.");
-                }
-                ScheduleCommands::History { schedule_id, limit } => {
-                    let records = schedule_manager.recent_history(&schedule_id, limit).await?;
-                    if records.is_empty() {
-                        println!("No history for schedule '{schedule_id}'.");
-                    } else {
-                        for record in records {
-                            println!(
-                                "{} | {:>6}ms | {:?} | {}",
-                                record.started_at.to_rfc3339(),
-                                record.duration_ms,
-                                record.status,
-                                record.error.as_deref().unwrap_or("-"),
-                            );
-                        }
-                    }
-                }
-            }
+            commands::schedule::run(cmd, &cli.config_root).await?;
         }
         Commands::Wait(cmd) => {
             let db_path = cli.config_root.join("data/scheduler.db");
