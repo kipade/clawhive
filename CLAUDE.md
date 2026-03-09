@@ -240,3 +240,42 @@ Use `target` for audit logs: `target: "clawhive::audit::network"`.
 - Release: tag on `main` (e.g. `v0.1.0`), CI auto-builds binaries and creates GitHub Release
 - Bug fixes: fix on `main`, tag a patch release (e.g. `v0.1.1`)
 - Workspace version in root `Cargo.toml` under `[workspace.package]`
+
+## Documentation
+
+### User-Facing Docs (`docs/`)
+
+Reserved for the user-facing documentation website (Astro Starlight, i18n: English + Chinese). **Do not** place development plans, research notes, or internal design docs here — those are ephemeral and belong in GitHub Issues/PRs.
+
+### Architecture Decision Records (`adr/`)
+
+When making significant architecture decisions (e.g., choosing a database, changing the security model, adopting a new pattern), create an ADR in `adr/` at the repository root. ADRs are append-only — never delete or rewrite them; supersede with a new ADR instead.
+
+Format:
+
+```markdown
+# ADR-NNNN: Title
+
+## Status: proposed | accepted | superseded by ADR-XXXX
+
+## Context
+What problem or decision we faced.
+
+## Decision
+What we chose and why.
+
+## Consequences
+Trade-offs, what this enables, what it limits.
+```
+
+Naming: `adr/NNNN-short-slug.md` (e.g., `adr/0001-sqlite-vec-for-memory-search.md`).
+
+### What Goes Where
+
+| Content | Location |
+|---|---|
+| User guides, tutorials, API reference | `docs/` (Starlight site) |
+| Architecture decisions with rationale | `adr/` (append-only) |
+| Agent/developer onboarding, code conventions | `AGENTS.md` |
+| Development plans, proposals | GitHub Issues / PRs |
+| Research, analysis, spike notes | GitHub Issues / PRs |
