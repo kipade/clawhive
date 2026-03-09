@@ -33,7 +33,7 @@ use clawhive_schema::InboundMessage;
 use commands::auth::{handle_auth_command, AuthCommands};
 use runtime::bootstrap::{
     bootstrap, build_embedding_provider, build_router_from_config, format_schedule_type,
-    resolve_security_override, toggle_agent,
+    resolve_security_override,
 };
 use runtime::pid::{
     check_and_clean_pid, is_process_running, read_pid_file, remove_pid_file, write_pid_file,
@@ -136,7 +136,7 @@ enum Commands {
     #[command(about = "Run memory consolidation manually")]
     Consolidate,
     #[command(subcommand, about = "Agent management")]
-    Agent(AgentCommands),
+    Agent(commands::agent::AgentCommands),
     #[command(subcommand, about = "Skill management")]
     Skill(SkillCommands),
     #[command(subcommand, about = "Session management")]
@@ -219,27 +219,6 @@ enum AllowlistCommands {
     Clear {
         #[arg(long, help = "Filter by agent ID")]
         agent: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum AgentCommands {
-    #[command(about = "List all configured agents")]
-    List,
-    #[command(about = "Show agent details")]
-    Show {
-        #[arg(help = "Agent ID")]
-        agent_id: String,
-    },
-    #[command(about = "Enable an agent")]
-    Enable {
-        #[arg(help = "Agent ID")]
-        agent_id: String,
-    },
-    #[command(about = "Disable an agent")]
-    Disable {
-        #[arg(help = "Agent ID")]
-        agent_id: String,
     },
 }
 
@@ -497,68 +476,7 @@ async fn main() -> Result<()> {
             run_consolidate(&cli.config_root).await?;
         }
         Commands::Agent(cmd) => {
-            let config = load_config(&cli.config_root.join("config"))?;
-            match cmd {
-                AgentCommands::List => {
-                    println!(
-                        "{:<20} {:<10} {:<30} {:<20}",
-                        "AGENT ID", "ENABLED", "PRIMARY MODEL", "IDENTITY"
-                    );
-                    println!("{}", "-".repeat(80));
-                    for agent in &config.agents {
-                        let name = agent
-                            .identity
-                            .as_ref()
-                            .map(|i| format!("{} {}", i.emoji.as_deref().unwrap_or(""), i.name))
-                            .unwrap_or_else(|| "-".to_string());
-                        println!(
-                            "{:<20} {:<10} {:<30} {:<20}",
-                            agent.agent_id,
-                            if agent.enabled { "yes" } else { "no" },
-                            agent.model_policy.primary,
-                            name.trim(),
-                        );
-                    }
-                }
-                AgentCommands::Show { agent_id } => {
-                    let agent = config
-                        .agents
-                        .iter()
-                        .find(|a| a.agent_id == agent_id)
-                        .ok_or_else(|| anyhow::anyhow!("agent not found: {agent_id}"))?;
-                    println!("Agent: {}", agent.agent_id);
-                    println!("Enabled: {}", agent.enabled);
-                    if let Some(identity) = &agent.identity {
-                        println!("Name: {}", identity.name);
-                        if let Some(emoji) = &identity.emoji {
-                            println!("Emoji: {emoji}");
-                        }
-                    }
-                    println!("Primary model: {}", agent.model_policy.primary);
-                    if !agent.model_policy.fallbacks.is_empty() {
-                        println!("Fallbacks: {}", agent.model_policy.fallbacks.join(", "));
-                    }
-                    if let Some(tp) = &agent.tool_policy {
-                        println!("Tools: {}", tp.allow.join(", "));
-                    }
-                    if let Some(mp) = &agent.memory_policy {
-                        println!("Memory: mode={}, write_scope={}", mp.mode, mp.write_scope);
-                    }
-                    if let Some(sa) = &agent.sub_agent {
-                        println!("Sub-agent: allow_spawn={}", sa.allow_spawn);
-                    }
-                }
-                AgentCommands::Enable { agent_id } => {
-                    let config_dir = cli.config_root.join("config/agents.d");
-                    toggle_agent(&config_dir, &agent_id, true)?;
-                    println!("Agent '{agent_id}' enabled.");
-                }
-                AgentCommands::Disable { agent_id } => {
-                    let config_dir = cli.config_root.join("config/agents.d");
-                    toggle_agent(&config_dir, &agent_id, false)?;
-                    println!("Agent '{agent_id}' disabled.");
-                }
-            }
+            commands::agent::run(cmd, &cli.config_root)?;
         }
         Commands::Skill(cmd) => {
             let skill_registry = SkillRegistry::load_from_dir(&cli.config_root.join("skills"))
@@ -1891,7 +1809,7 @@ mod tests {
         let cli = Cli::try_parse_from(["clawhive", "agent", "list"]).unwrap();
         assert!(matches!(
             cli.command.unwrap(),
-            Commands::Agent(AgentCommands::List)
+            Commands::Agent(commands::agent::AgentCommands::List)
         ));
     }
 
@@ -1927,7 +1845,7 @@ mod tests {
         let cli = Cli::try_parse_from(["clawhive", "agent", "enable", "my-agent"]).unwrap();
         assert!(matches!(
             cli.command.unwrap(),
-            Commands::Agent(AgentCommands::Enable { .. })
+            Commands::Agent(commands::agent::AgentCommands::Enable { .. })
         ));
     }
 
