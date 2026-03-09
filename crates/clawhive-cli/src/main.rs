@@ -137,9 +137,9 @@ enum Commands {
     #[command(subcommand, about = "Skill management")]
     Skill(commands::skill::SkillCommands),
     #[command(subcommand, about = "Session management")]
-    Session(SessionCommands),
+    Session(commands::session::SessionCommands),
     #[command(subcommand, about = "Task management")]
-    Task(TaskCommands),
+    Task(commands::task::TaskCommands),
     #[command(subcommand, about = "Auth management")]
     Auth(AuthCommands),
     #[command(subcommand, about = "Manage scheduled tasks")]
@@ -173,26 +173,6 @@ enum Commands {
             help = "Number of lines to show before following"
         )]
         lines: usize,
-    },
-}
-
-#[derive(Subcommand)]
-enum SessionCommands {
-    #[command(about = "Reset a session by key")]
-    Reset {
-        #[arg(help = "Session key")]
-        session_key: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum TaskCommands {
-    #[command(about = "Trigger a one-off task")]
-    Trigger {
-        #[arg(help = "Agent ID")]
-        agent: String,
-        #[arg(help = "Task description")]
-        task: String,
     },
 }
 
@@ -345,62 +325,10 @@ async fn main() -> Result<()> {
             commands::skill::run(cmd, &cli.config_root).await?;
         }
         Commands::Session(cmd) => {
-            let (
-                _bus,
-                memory,
-                _gateway,
-                _config,
-                _schedule_manager,
-                _wait_manager,
-                _approval_registry,
-            ) = bootstrap(&cli.config_root, None).await?;
-            let session_mgr = SessionManager::new(memory, 1800);
-            match cmd {
-                SessionCommands::Reset { session_key } => {
-                    let key = clawhive_schema::SessionKey(session_key.clone());
-                    match session_mgr.reset(&key).await? {
-                        true => println!("Session '{session_key}' reset successfully."),
-                        false => println!("Session '{session_key}' not found."),
-                    }
-                }
-            }
+            commands::session::run(cmd, &cli.config_root).await?;
         }
         Commands::Task(cmd) => {
-            let (
-                _bus,
-                _memory,
-                gateway,
-                _config,
-                _schedule_manager,
-                _wait_manager,
-                _approval_registry,
-            ) = bootstrap(&cli.config_root, None).await?;
-            match cmd {
-                TaskCommands::Trigger {
-                    agent: _agent,
-                    task,
-                } => {
-                    let inbound = InboundMessage {
-                        trace_id: uuid::Uuid::new_v4(),
-                        channel_type: "cli".into(),
-                        connector_id: "cli".into(),
-                        conversation_scope: "task:cli".into(),
-                        user_scope: "user:cli".into(),
-                        text: task,
-                        at: chrono::Utc::now(),
-                        thread_id: None,
-                        is_mention: false,
-                        mention_target: None,
-                        message_id: None,
-                        attachments: vec![],
-                        group_context: None,
-                    };
-                    match gateway.handle_inbound(inbound).await {
-                        Ok(out) => println!("{}", out.text),
-                        Err(err) => eprintln!("Task failed: {err}"),
-                    }
-                }
-            }
+            commands::task::run(cmd, &cli.config_root).await?;
         }
         Commands::Auth(cmd) => {
             handle_auth_command(cmd).await?;
@@ -1240,7 +1168,7 @@ mod tests {
         let cli = Cli::try_parse_from(["clawhive", "session", "reset", "my-session"]).unwrap();
         assert!(matches!(
             cli.command.unwrap(),
-            Commands::Session(SessionCommands::Reset { .. })
+            Commands::Session(commands::session::SessionCommands::Reset { .. })
         ));
     }
 
@@ -1249,7 +1177,7 @@ mod tests {
         let cli = Cli::try_parse_from(["clawhive", "task", "trigger", "main", "do stuff"]).unwrap();
         assert!(matches!(
             cli.command.unwrap(),
-            Commands::Task(TaskCommands::Trigger { .. })
+            Commands::Task(commands::task::TaskCommands::Trigger { .. })
         ));
     }
 
