@@ -136,7 +136,7 @@ export default function SetupPage() {
   const [fetchedModels, setFetchedModels] = useState<ModelInfoResponse[]>([]);
 
   // Step 3: Channel
-  const [channelKind, setChannelKind] = useState<"telegram" | "discord" | "feishu" | "dingtalk" | "wecom" | null>(null);
+  const [channelKind, setChannelKind] = useState<"telegram" | "discord" | "feishu" | "dingtalk" | "wecom" | "slack" | "whatsapp" | "imessage" | null>(null);
   const [channelToken, setChannelToken] = useState("");
   const [channelConnectorId, setChannelConnectorId] = useState("");
   const [channelGroups, setChannelGroups] = useState("");
@@ -1011,8 +1011,8 @@ function StepChannel({
   botId, onBotIdChange,
   secret, onSecretChange,
 }: {
-  kind: "telegram" | "discord" | "feishu" | "dingtalk" | "wecom" | null;
-  onKindChange: (v: "telegram" | "discord" | "feishu" | "dingtalk" | "wecom") => void;
+  kind: "telegram" | "discord" | "feishu" | "dingtalk" | "wecom" | "slack" | "whatsapp" | "imessage" | null;
+  onKindChange: (v: "telegram" | "discord" | "feishu" | "dingtalk" | "wecom" | "slack" | "whatsapp" | "imessage") => void;
   token: string;
   onTokenChange: (v: string) => void;
   connectorId: string;
@@ -1053,7 +1053,7 @@ function StepChannel({
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-        {(["telegram", "discord", "feishu", "dingtalk", "wecom"] as const).map((ch) => (
+        {(["telegram", "discord", "slack", "whatsapp", "imessage", "feishu", "dingtalk", "wecom"] as const).map((ch) => (
           <button
             key={ch}
             onClick={() => { if (!isCreated) onKindChange(ch); }}
@@ -1064,9 +1064,9 @@ function StepChannel({
                 : "border-border hover:border-primary/40 hover:bg-muted/50"
             } ${isCreated ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}
           >
-            <div className="text-sm font-medium capitalize">{ch === "dingtalk" ? "DingTalk" : ch === "wecom" ? "WeCom" : ch}</div>
+            <div className="text-sm font-medium capitalize">{ch === "dingtalk" ? "DingTalk" : ch === "wecom" ? "WeCom" : ch === "imessage" ? "iMessage" : ch === "whatsapp" ? "WhatsApp" : ch}</div>
             <div className="mt-0.5 text-xs text-muted-foreground">
-              {ch === "telegram" ? "Add a Telegram bot" : ch === "discord" ? "Add a Discord bot" : ch === "feishu" ? "Add a Feishu bot" : ch === "dingtalk" ? "Add a DingTalk bot" : "Add a WeCom bot"}
+              {ch === "telegram" ? "Add a Telegram bot" : ch === "discord" ? "Add a Discord bot" : ch === "slack" ? "Add a Slack bot" : ch === "whatsapp" ? "Connect WhatsApp" : ch === "imessage" ? "Connect iMessage (macOS)" : ch === "feishu" ? "Add a Feishu bot" : ch === "dingtalk" ? "Add a DingTalk bot" : "Add a WeCom bot"}
             </div>
           </button>
         ))}
@@ -1080,7 +1080,7 @@ function StepChannel({
                 Bot Name
               </label>
               <Input
-                placeholder={kind === "telegram" ? "my_telegram_bot" : kind === "discord" ? "my_discord_bot" : `my_${kind}_bot`}
+                placeholder={kind === "telegram" ? "my_telegram_bot" : kind === "discord" ? "my_discord_bot" : kind === "slack" ? "my_slack_bot" : kind === "whatsapp" ? "my_whatsapp_bot" : kind === "imessage" ? "my_imessage_bot" : `my_${kind}_bot`}
                 value={connectorId}
                 onChange={(e) => onConnectorIdChange(e.target.value)}
                 disabled={isCreated}
@@ -1089,7 +1089,11 @@ function StepChannel({
               <p className="text-xs text-muted-foreground mt-1">A unique name to identify this bot, no spaces (e.g. support_bot)</p>
             </div>
 
-            {kind === "feishu" ? (
+            {kind === "imessage" || kind === "whatsapp" ? (
+              <p className="text-xs text-muted-foreground">
+                {kind === "imessage" ? "No credentials needed. Requires macOS with Full Disk Access." : "No credentials needed. WhatsApp will pair via QR code on first start."}
+              </p>
+            ) : kind === "feishu" ? (
               <>
                 <div>
                   <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">App ID</label>
@@ -1129,7 +1133,7 @@ function StepChannel({
                 </label>
                 <Input
                   type="password"
-                  placeholder={kind === "telegram" ? "123456:ABC-DEF..." : "Bot token from Discord Developer Portal"}
+                  placeholder={kind === "telegram" ? "123456:ABC-DEF..." : kind === "slack" ? "xoxb-..." : "Bot token from Discord Developer Portal"}
                   value={token}
                   onChange={(e) => onTokenChange(e.target.value)}
                   disabled={isCreated}
@@ -1205,14 +1209,16 @@ function StepChannel({
             )}
 
             <div className="flex items-center justify-between">
-              <a
-                href={kind === "telegram" ? "https://t.me/BotFather" : kind === "discord" ? "https://discord.com/developers/applications" : kind === "feishu" ? "https://open.feishu.cn/app" : kind === "dingtalk" ? "https://open-dev.dingtalk.com/" : "https://developer.work.weixin.qq.com/"}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-1 text-xs text-primary hover:underline"
-              >
-                Get credentials <ExternalLink className="h-3 w-3" />
-              </a>
+              {kind !== "imessage" && kind !== "whatsapp" ? (
+                <a
+                  href={kind === "telegram" ? "https://t.me/BotFather" : kind === "discord" ? "https://discord.com/developers/applications" : kind === "slack" ? "https://api.slack.com/apps" : kind === "feishu" ? "https://open.feishu.cn/app" : kind === "dingtalk" ? "https://open-dev.dingtalk.com/" : "https://developer.work.weixin.qq.com/"}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1 text-xs text-primary hover:underline"
+                >
+                  Get credentials <ExternalLink className="h-3 w-3" />
+                </a>
+              ) : <div />}
               {isCreated ? (
                 <span className="flex items-center gap-1 text-xs font-medium text-emerald-600">
                   <CheckCircle2 className="h-3.5 w-3.5" />
@@ -1223,6 +1229,7 @@ function StepChannel({
                   size="sm"
                   onClick={onSubmit}
                   disabled={isCreating || !connectorId || (() => {
+                    if (kind === "imessage" || kind === "whatsapp") return false;
                     if (kind === "feishu") return !appId || !appSecret;
                     if (kind === "dingtalk") return !clientId || !clientSecret;
                     if (kind === "wecom") return !botId || !secret;

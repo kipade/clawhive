@@ -254,15 +254,13 @@ async fn add_connector(
     let mut main = load_main_config(&state)?;
     let connectors = connectors_mut(&mut main, &kind)?;
 
-    let exists = connectors.iter().any(|item| {
+    // Remove existing connector with same ID (upsert behavior)
+    connectors.retain(|item| {
         item["connector_id"]
             .as_str()
-            .map(|id| id == body.connector_id)
-            .unwrap_or(false)
+            .map(|id| id != body.connector_id)
+            .unwrap_or(true)
     });
-    if exists {
-        return Err(axum::http::StatusCode::CONFLICT);
-    }
 
     let mut connector = serde_yaml::Mapping::new();
     connector.insert(
@@ -317,8 +315,11 @@ async fn add_connector(
                 serde_yaml::Value::String(secret.to_string()),
             );
         }
+        "imessage" | "whatsapp" => {
+            // No credentials needed — iMessage uses AppleScript, WhatsApp pairs via QR
+        }
         _ => {
-            // Telegram, Discord, and other token-based channels
+            // Telegram, Discord, Slack, and other token-based channels
             let token = body.token.as_deref().unwrap_or_default();
             if token.is_empty() {
                 return Err(axum::http::StatusCode::BAD_REQUEST);

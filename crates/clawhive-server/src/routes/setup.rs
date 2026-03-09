@@ -58,17 +58,20 @@ async fn setup_status(State(state): State<AppState>) -> Json<SetupStatus> {
         .and_then(|content| serde_yaml::from_str::<serde_yaml::Value>(&content).ok())
         .map(|val| {
             let channels = &val["channels"];
-            let tg_enabled = channels["telegram"]["enabled"].as_bool().unwrap_or(false);
-            let dc_enabled = channels["discord"]["enabled"].as_bool().unwrap_or(false);
-            let tg_has_connectors = channels["telegram"]["connectors"]
-                .as_sequence()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
-            let dc_has_connectors = channels["discord"]["connectors"]
-                .as_sequence()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
-            (tg_enabled && tg_has_connectors) || (dc_enabled && dc_has_connectors)
+            // Dynamically check all channel types — any enabled channel with
+            // non-empty connectors means the user has configured at least one.
+            channels
+                .as_mapping()
+                .map(|map| {
+                    map.values().any(|ch| {
+                        ch["enabled"].as_bool().unwrap_or(false)
+                            && ch["connectors"]
+                                .as_sequence()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
         })
         .unwrap_or(false);
 
