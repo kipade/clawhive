@@ -905,7 +905,7 @@ function StepAgent({
                   : "border-border hover:border-primary/40"
               } ${isCreated ? "cursor-not-allowed" : "cursor-pointer"}`}
             >
-              Custom\u2026
+              Custom…
             </button>
           </div>
           {customModel && (
