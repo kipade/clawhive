@@ -29,7 +29,9 @@ pub(crate) fn remove_pid_file(root: &Path) {
 }
 
 pub(crate) fn is_process_running(pid: u32) -> bool {
-    // kill(pid, 0) checks if process exists without sending a signal
+    // SAFETY: kill(pid, 0) sends no signal; it only checks whether the process
+    // exists. `pid as i32` is always a valid i32 since pid_t is i32 on
+    // Linux/macOS. No memory is read or written.
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
