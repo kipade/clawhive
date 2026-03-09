@@ -35,7 +35,7 @@ Configure providers, agents, and channels using either method:
 
 ```bash
 clawhive start
-# Open http://localhost:3000/setup in your browser
+# Open http://localhost:8848/setup in your browser
 ```
 
 **Option B: CLI Setup Wizard** — Run the interactive terminal wizard:
@@ -55,10 +55,9 @@ clawhive validate
 clawhive chat
 
 # Service lifecycle
-clawhive up                  # start as background daemon (alias for start -d)
 clawhive start               # start in foreground
-clawhive start --daemon      # start as background daemon (alias: -d)
-clawhive restart              # stop + start as daemon
+clawhive up                  # start if not already running (always daemon)
+clawhive restart
 clawhive stop
 
 # Dashboard mode (observability TUI)
@@ -119,7 +118,7 @@ clawhive auth login openai
 - Three-layer memory system: Session JSONL → Daily files → MEMORY.md (long-term)
 - Hybrid search: sqlite-vec vector similarity + FTS5 BM25 over memory chunks
 - Hippocampus consolidation: periodic LLM-driven synthesis into long-term memory
-- Channel adapters: Telegram, Discord, Slack, WhatsApp, iMessage (multi-bot, multi-connector)
+- Channel adapters: Telegram, Discord, Slack, WhatsApp, iMessage, Feishu, DingTalk, WeCom (multi-bot, multi-connector)
 - ReAct reasoning loop with repeat guard and sub-agent spawning
 - Skill system (SKILL.md with frontmatter + permission declarations)
 - Token-bucket rate limiting per user
@@ -250,8 +249,8 @@ clawhive chat
 
 # Service lifecycle
 clawhive start
-clawhive start --daemon  # alias: -d
-clawhive restart               # stop + start as daemon
+clawhive up                 # start if not already running (always daemon)
+clawhive restart
 clawhive stop
 
 # Dashboard mode (observability TUI)
@@ -296,11 +295,11 @@ cargo run -- chat
 # Start all configured channel bots
 cargo run -- start
 
-# Start as background daemon
-cargo run -- start --daemon  # alias: -d
+# Start if not already running (always daemon)
+cargo run -- up
 
 # Restart / stop
-cargo run -- restart              # stop + start as daemon
+cargo run -- restart
 cargo run -- stop
 
 # Dashboard mode (observability TUI)
@@ -350,7 +349,7 @@ Configuration is managed through `clawhive setup`, which interactively generates
 - `providers.d/<provider>.yaml` — provider type, API base URL, authentication
 - `routing.yaml` — default agent ID, channel-to-agent routing bindings
 
-Supported providers: Anthropic, OpenAI, Gemini, DeepSeek, Groq, Ollama, OpenRouter, Together, Fireworks, and any OpenAI-compatible endpoint.
+Supported providers: Anthropic, OpenAI, Gemini, DeepSeek, Qwen, Moonshot, Zhipu GLM, MiniMax, Volcengine, Qianfan, Groq, Ollama, OpenRouter, Together, Fireworks, and any OpenAI-compatible endpoint.
 
 </details>
 
@@ -398,8 +397,8 @@ just release v0.1.0-alpha.15
 | Component | Technology |
 |-----------|-----------|
 | Language | Rust (2021 edition) |
-| LLM Providers | Anthropic, OpenAI, Gemini, DeepSeek, Groq, Ollama, OpenRouter, Together, Fireworks |
-| Channels | Telegram, Discord, Slack, WhatsApp, iMessage, CLI |
+| LLM Providers | Anthropic, OpenAI, Gemini, DeepSeek, Qwen, Moonshot, Zhipu GLM, MiniMax, Volcengine, Qianfan, Groq, Ollama, OpenRouter, Together, Fireworks |
+| Channels | Telegram, Discord, Slack, WhatsApp, iMessage, Feishu, DingTalk, WeCom, CLI |
 | Database | SQLite (rusqlite, bundled) |
 | Vector Search | sqlite-vec |
 | Full-Text Search | FTS5 |

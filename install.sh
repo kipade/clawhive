@@ -104,5 +104,6 @@ fi
 echo "Get started:"
 echo "  clawhive setup    Configure providers, agents, and channels"
 echo "  clawhive start    Start the server"
+
 echo ""
 echo "Docs: https://github.com/longzhi/clawhive"

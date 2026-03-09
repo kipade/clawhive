@@ -123,7 +123,7 @@ Three tiers: (1) Session JSONL for working memory, (2) Daily Markdown for short-
 
 ### Channel Adapters
 
-Feature-gated in `clawhive-channels`: `telegram` and `discord` enabled by default; `slack` and `whatsapp` are optional features. Each implements the `ChannelBot` trait.
+Feature-gated in `clawhive-channels`: `telegram`, `discord`, `feishu`, `dingtalk`, and `wecom` enabled by default; `slack`, `whatsapp`, and `imessage` are optional features. Each implements the `ChannelBot` trait.
 
 ## Security Architecture
 
@@ -234,6 +234,9 @@ Use `target` for audit logs: `target: "clawhive::audit::network"`.
 
 ## Git Workflow
 
-- `dev` branch for all development
-- `main` for releases — merge dev → main, then tag on main
+- `main` is the only long-lived branch — no develop/release branches
+- Small changes: commit and push directly to `main`
+- Large changes: create a `feature/*` branch, then merge to `main`
+- Release: tag on `main` (e.g. `v0.1.0`), CI auto-builds binaries and creates GitHub Release
+- Bug fixes: fix on `main`, tag a patch release (e.g. `v0.1.1`)
 - Workspace version in root `Cargo.toml` under `[workspace.package]`

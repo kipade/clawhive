@@ -234,6 +234,9 @@ Use `target` for audit logs: `target: "clawhive::audit::network"`.
 
 ## Git Workflow
 
-- `dev` branch for all development
-- `main` for releases — merge dev → main, then tag on main
+- `main` is the only long-lived branch — no develop/release branches
+- Small changes: commit and push directly to `main`
+- Large changes: create a `feature/*` branch, then merge to `main`
+- Release: tag on `main` (e.g. `v0.1.0`), CI auto-builds binaries and creates GitHub Release
+- Bug fixes: fix on `main`, tag a patch release (e.g. `v0.1.1`)
 - Workspace version in root `Cargo.toml` under `[workspace.package]`
