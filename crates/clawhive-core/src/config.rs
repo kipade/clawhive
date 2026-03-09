@@ -99,9 +99,66 @@ pub struct DiscordChannelConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuConnectorConfig {
+    pub connector_id: String,
+    /// Feishu app ID (from Developer Console)
+    pub app_id: String,
+    /// Feishu app secret
+    pub app_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub connectors: Vec<FeishuConnectorConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DingTalkConnectorConfig {
+    pub connector_id: String,
+    /// DingTalk OAuth ClientID (AppKey)
+    pub client_id: String,
+    /// DingTalk OAuth ClientSecret (AppSecret)
+    pub client_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DingTalkChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub connectors: Vec<DingTalkConnectorConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeComConnectorConfig {
+    pub connector_id: String,
+    /// WeCom AI Bot ID (from admin console)
+    pub bot_id: String,
+    /// WeCom AI Bot secret
+    pub secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeComChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub connectors: Vec<WeComConnectorConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelsConfig {
     pub telegram: Option<TelegramChannelConfig>,
     pub discord: Option<DiscordChannelConfig>,
+    #[serde(default)]
+    pub feishu: Option<FeishuChannelConfig>,
+    #[serde(default)]
+    pub dingtalk: Option<DingTalkChannelConfig>,
+    #[serde(default)]
+    pub wecom: Option<WeComChannelConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -158,6 +215,9 @@ impl Default for MainConfig {
             channels: ChannelsConfig {
                 telegram: None,
                 discord: None,
+                feishu: None,
+                dingtalk: None,
+                wecom: None,
             },
             embedding: EmbeddingConfig::default(),
             tools: ToolsConfig::default(),
@@ -809,6 +869,9 @@ mod tests {
                 channels: ChannelsConfig {
                     telegram: None,
                     discord: None,
+                    feishu: None,
+                    dingtalk: None,
+                    wecom: None,
                 },
                 embedding: EmbeddingConfig::default(),
                 tools: ToolsConfig::default(),
