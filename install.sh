@@ -49,20 +49,31 @@ fi
 # Cleanup
 rm -rf "$TMPDIR" "/tmp/${TARBALL}"
 
-# Add to PATH if not already present
+# Create ~/.clawhive/env for shell activation
+ENV_FILE="$HOME/.clawhive/env"
+cat > "$ENV_FILE" << 'EOF'
+#!/bin/sh
+case ":${PATH}:" in
+    *:"$HOME/.clawhive/bin":*) ;;
+    *) export PATH="$HOME/.clawhive/bin:$PATH" ;;
+esac
+EOF
+
+# Append `. ~/.clawhive/env` to rc file if not already present
 add_to_path() {
     local rc_file="$1"
-    if [ -f "$rc_file" ] && grep -q '\.clawhive/bin' "$rc_file" 2>/dev/null; then
+    if [ -f "$rc_file" ] && grep -q '\.clawhive/env' "$rc_file" 2>/dev/null; then
         return
     fi
     if [ -f "$rc_file" ] || [ "$rc_file" = "$HOME/.profile" ]; then
         echo '' >> "$rc_file"
         echo '# clawhive' >> "$rc_file"
-        echo 'export PATH="$HOME/.clawhive/bin:$PATH"' >> "$rc_file"
+        echo '. "$HOME/.clawhive/env"' >> "$rc_file"
         echo "Added to PATH in $rc_file"
     fi
 }
 
+PATH_MODIFIED=0
 if ! echo "$PATH" | grep -q '\.clawhive/bin'; then
     SHELL_NAME=$(basename "$SHELL")
     case "$SHELL_NAME" in
@@ -77,17 +88,20 @@ if ! echo "$PATH" | grep -q '\.clawhive/bin'; then
         *)    add_to_path "$HOME/.profile" ;;
     esac
     export PATH="$INSTALL_DIR:$PATH"
+    PATH_MODIFIED=1
 fi
 
 echo ""
 echo "clawhive ${VERSION} installed successfully!"
 "$INSTALL_DIR/clawhive" --version 2>/dev/null || true
 echo ""
-echo "Restart your terminal, or run:"
-echo ""
-echo "  exec \$SHELL"
-echo ""
-echo "Then get started:"
+if [ "$PATH_MODIFIED" = "1" ]; then
+    echo "Run the following to start using clawhive:"
+    echo ""
+    echo "  source ~/.clawhive/env"
+    echo ""
+fi
+echo "Get started:"
 echo "  clawhive setup    Configure providers, agents, and channels"
 echo "  clawhive start    Start the server"
 echo ""
