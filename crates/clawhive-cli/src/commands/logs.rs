@@ -30,7 +30,9 @@ pub(crate) fn run(root: &Path, lines: usize) -> Result<()> {
     // Daily rolling files are named "clawhive.log.YYYY-MM-DD",
     // so lexicographic sort gives us the latest file last.
     log_files.sort();
-    let latest = log_files.last().unwrap();
+    let Some(latest) = log_files.last() else {
+        anyhow::bail!("No log files found in {}", log_dir.display());
+    };
 
     eprintln!("Following: {}", latest.display());
 
