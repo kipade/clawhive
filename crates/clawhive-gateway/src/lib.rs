@@ -542,23 +542,21 @@ async fn handle_scheduled_task(
             timeout_seconds,
             light_context: _,
         } => {
+            // AgentTurn always uses an isolated session so the agent starts
+            // with a clean context and cannot be influenced by prior chat history.
+            let isolated_scope = format!("schedule:{}:{}", schedule_id, Uuid::new_v4());
             let (channel_type, connector_id, conversation_scope): (String, String, String) = match (
                 &delivery.source_channel_type,
                 &delivery.source_connector_id,
-                &delivery.source_conversation_scope,
             ) {
-                (Some(ct), Some(ci), Some(cs)) => (ct.clone(), ci.clone(), cs.clone()),
+                (Some(ct), Some(ci)) => (ct.clone(), ci.clone(), isolated_scope),
                 _ => {
                     tracing::warn!(
                         schedule_id = %schedule_id,
                         "AgentTurn schedule {} has no source channel configured — approval requests will not be routable",
                         schedule_id
                     );
-                    (
-                        "scheduler".into(),
-                        schedule_id.clone(),
-                        format!("schedule:{}:{}", schedule_id, Uuid::new_v4()),
-                    )
+                    ("scheduler".into(), schedule_id.clone(), isolated_scope)
                 }
             };
 

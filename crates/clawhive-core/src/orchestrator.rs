@@ -1533,19 +1533,29 @@ impl Orchestrator {
                         agent_id = %agent_id,
                         iteration = iteration_no,
                         response_len = resp.text.len(),
-                        "tool_use_loop: scheduled task response claims actions without tool calls, injecting retry"
+                        "tool_use_loop: scheduled task response has no tool calls — likely fabrication or lazy ack, injecting retry"
                     );
+                    let retry_prompt = if response_claims_actions(&resp.text) {
+                        concat!(
+                            "Your response claims to have performed actions (writing files, ",
+                            "executing commands, fetching data, etc.) but you did not make any ",
+                            "tool calls. This is a scheduled task \u{2014} you must actually execute ",
+                            "each step using the available tools. Do not generate fictional ",
+                            "results. Complete the task now using tool calls.",
+                        )
+                    } else {
+                        concat!(
+                            "You only acknowledged the task but did not execute it. ",
+                            "This is an automated scheduled task \u{2014} do not just confirm or promise. ",
+                            "Start executing NOW: read the required files, run the commands, ",
+                            "write the output. Use tool calls to perform each step.",
+                        )
+                    };
                     messages.push(LlmMessage {
                         role: "assistant".into(),
                         content: resp.content.clone(),
                     });
-                    messages.push(LlmMessage::user(concat!(
-                        "Your response claims to have performed actions (writing files, ",
-                        "executing commands, fetching data, etc.) but you did not make any ",
-                        "tool calls. This is a scheduled task \u{2014} you must actually execute ",
-                        "each step using the available tools. Do not generate fictional ",
-                        "results. Complete the task now using tool calls.",
-                    )));
+                    messages.push(LlmMessage::user(retry_prompt));
                     continue;
                 }
 
@@ -2283,6 +2293,43 @@ fn response_claims_actions(text: &str) -> bool {
         || en_indicators.iter().any(|ind| text_lower.contains(ind))
 }
 
+/// Detect a "lazy ack" response — the agent merely acknowledges the task
+/// instructions or promises to do it later, without actually performing anything.
+/// This catches responses like "已收到", "我会按规则执行", "好的我来做", etc.
+fn response_is_lazy_ack(text: &str) -> bool {
+    let text_lower = text.to_ascii_lowercase();
+    let char_count = text.chars().count();
+    // Short response (under 200 chars) that doesn't contain tool output markers
+    if char_count > 200 {
+        return false;
+    }
+    let ack_cn = [
+        "已收到",
+        "我会",
+        "好的",
+        "收到",
+        "我来",
+        "按规则",
+        "按要求",
+        "按这份",
+        "按你",
+        "后续就按",
+        "对齐",
+        "明白",
+    ];
+    let ack_en = [
+        "got it",
+        "understood",
+        "i will",
+        "i'll",
+        "acknowledged",
+        "noted",
+        "will do",
+        "on it",
+    ];
+    ack_cn.iter().any(|ind| text.contains(ind)) || ack_en.iter().any(|ind| text_lower.contains(ind))
+}
+
 fn should_retry_fabricated_scheduled_response(
     is_scheduled_task: bool,
     already_retried: bool,
@@ -2292,7 +2339,7 @@ fn should_retry_fabricated_scheduled_response(
     is_scheduled_task
         && !already_retried
         && tool_use_count == 0
-        && response_claims_actions(response_text)
+        && (response_claims_actions(response_text) || response_is_lazy_ack(response_text))
 }
 
 fn collect_recent_messages(messages: &[LlmMessage], limit: usize) -> Vec<ConversationMessage> {
