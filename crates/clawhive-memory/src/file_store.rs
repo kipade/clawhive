@@ -48,11 +48,19 @@ impl MemoryFileStore {
         self.ensure_daily_dir().await?;
         let path = self.daily_path(date);
 
-        if fs::metadata(&path).await.is_err() {
-            fs::write(&path, format!("# {}\n\n", date.format("%Y-%m-%d"))).await?;
+        let is_new = fs::metadata(&path).await.is_err();
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await?;
+
+        if is_new {
+            file.write_all(format!("# {}\n\n", date.format("%Y-%m-%d")).as_bytes())
+                .await?;
         }
 
-        let mut file = fs::OpenOptions::new().append(true).open(path).await?;
         file.write_all(format!("\n{content}\n").as_bytes()).await?;
         Ok(())
     }
