@@ -1411,6 +1411,7 @@ impl Orchestrator {
         let mut web_search_called = false;
         let loop_started = std::time::Instant::now();
         let mut scheduled_task_retries: u32 = 0;
+        let mut total_tool_calls: usize = 0;
 
         for iteration in 0..max_iterations {
             let iteration_no = iteration + 1;
@@ -1525,6 +1526,7 @@ impl Orchestrator {
                 if should_retry_fabricated_scheduled_response(
                     is_scheduled_task,
                     scheduled_task_retries,
+                    total_tool_calls,
                     tool_uses.len(),
                 ) {
                     scheduled_task_retries += 1;
@@ -1562,6 +1564,7 @@ impl Orchestrator {
                 return Ok((resp, messages));
             }
 
+            total_tool_calls += tool_uses.len();
             let tool_names: Vec<String> =
                 tool_uses.iter().map(|(_, name, _)| name.clone()).collect();
             if tool_names.iter().any(|name| name == "web_search") {
@@ -2246,13 +2249,18 @@ fn should_inject_web_search_reminder(
 fn should_retry_fabricated_scheduled_response(
     is_scheduled_task: bool,
     retry_count: u32,
-    tool_use_count: usize,
+    total_tool_calls: usize,
+    current_tool_calls: usize,
 ) -> bool {
-    // For scheduled tasks, if the agent returned with zero tool calls,
-    // it almost certainly did not actually execute the multi-step task.
-    // Allow up to 2 retries with increasingly forceful continuation prompts.
+    // Only retry when the agent has made ZERO tool calls across the entire
+    // session. If tools were already called in prior iterations (e.g. the agent
+    // ran a pipeline and is now composing a text summary), the current zero-tool
+    // iteration is legitimate — not hallucination.
     const MAX_RETRIES: u32 = 2;
-    is_scheduled_task && retry_count < MAX_RETRIES && tool_use_count == 0
+    is_scheduled_task
+        && retry_count < MAX_RETRIES
+        && total_tool_calls == 0
+        && current_tool_calls == 0
 }
 
 fn collect_recent_messages(messages: &[LlmMessage], limit: usize) -> Vec<ConversationMessage> {
