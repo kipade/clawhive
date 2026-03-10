@@ -46,6 +46,7 @@ impl TelegramAdapter {
             message_id: message_id.map(|id| id.to_string()),
             attachments: vec![],
             group_context: None,
+            message_source: None,
         }
     }
 

@@ -202,6 +202,7 @@ impl FeishuAdapter {
             message_id: Some(event.event.message.message_id.clone()),
             attachments: vec![],
             group_context: None,
+            message_source: None,
         }
     }
 }

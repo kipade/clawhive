@@ -316,6 +316,7 @@ async fn start_bot(
                     message_id: None,
                     attachments: vec![],
                     group_context: None,
+                    message_source: None,
                 };
 
                 tracing::debug!("Sending heartbeat to agent {}", agent_id);

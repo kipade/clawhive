@@ -454,6 +454,7 @@ async fn handle_scheduled_task(
                 message_id: None,
                 attachments: vec![],
                 group_context: None,
+                message_source: None,
             };
 
             match gateway.handle_inbound_for_agent(inbound, &agent_id).await {
@@ -580,6 +581,7 @@ async fn handle_scheduled_task(
                 message_id: None,
                 attachments: vec![],
                 group_context: None,
+                message_source: Some("scheduled_task".into()),
             };
 
             let effective_timeout = timeout_seconds.clamp(30, 3600);
@@ -1163,6 +1165,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         let out = gw.handle_inbound(inbound).await.unwrap();
         assert!(out.text.contains("stub:anthropic:claude-sonnet-4-5"));
@@ -1185,6 +1188,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-main");
     }
@@ -1215,6 +1219,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-builder");
     }
@@ -1278,6 +1283,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-dm");
     }
@@ -1308,6 +1314,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-main");
     }
@@ -1338,6 +1345,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-group");
     }
@@ -1363,6 +1371,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let first = gw.handle_inbound(make_inbound()).await;
@@ -1390,6 +1399,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let expected_trace = inbound.trace_id;
@@ -1453,6 +1463,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let out = gw.handle_inbound(inbound).await.unwrap();
@@ -1480,6 +1491,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let out = gw.handle_inbound(inbound).await.unwrap();
@@ -1519,6 +1531,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-main");
     }

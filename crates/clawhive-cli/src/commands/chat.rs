@@ -56,6 +56,7 @@ async fn run_repl(
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         match gateway.handle_inbound(inbound).await {

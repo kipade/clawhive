@@ -521,6 +521,7 @@ pub(crate) async fn run(
                 message_id: None,
                 attachments: vec![],
                 group_context: None,
+                message_source: None,
             };
             if let Err(err) = gateway_bg.handle_inbound(inbound).await {
                 tracing::error!("code inbound failed: {err}");

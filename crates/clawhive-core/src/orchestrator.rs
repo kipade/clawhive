@@ -1017,6 +1017,17 @@ impl Orchestrator {
             );
         }
 
+        let is_scheduled_task = inbound.message_source.as_deref() == Some("scheduled_task");
+        if is_scheduled_task {
+            system_prompt.push_str(
+                "\n\n## Scheduled Task Execution\n\
+                 This is an automated scheduled task. You are executing real actions, not generating example output.\n\
+                 - Steps that involve reading data, writing files, or running commands MUST be performed through tool calls.\n\
+                 - Only report actions you have actually performed through tool calls. Never fabricate results.\n\
+                 - If the task only requires generating text (e.g. a reminder or greeting), respond directly without tools.",
+            );
+        }
+
         let allowed = Self::forced_allowed_tools(
             forced_skills.as_deref(),
             agent.tool_policy.as_ref().map(|tp| tp.allow.clone()),
@@ -1046,6 +1057,7 @@ impl Orchestrator {
                 private_network_overrides,
                 source_info,
                 must_use_web_search,
+                is_scheduled_task,
                 agent.model_policy.thinking_level,
             )
             .await?;
@@ -1287,6 +1299,7 @@ impl Orchestrator {
                 private_network_overrides_stream,
                 source_info_stream,
                 must_use_web_search,
+                false, // is_scheduled_task
                 agent.model_policy.thinking_level,
             )
             .await?;
@@ -1380,6 +1393,7 @@ impl Orchestrator {
         private_network_overrides: Vec<String>,
         source_info: Option<(String, String, String, String)>, // (channel_type, connector_id, conversation_scope, user_scope)
         must_use_web_search: bool,
+        is_scheduled_task: bool,
         thinking_level: Option<clawhive_provider::ThinkingLevel>,
     ) -> Result<(clawhive_provider::LlmResponse, Vec<LlmMessage>)> {
         let mut messages = initial_messages;
@@ -1396,6 +1410,7 @@ impl Orchestrator {
         let mut web_search_reminder_injected = false;
         let mut web_search_called = false;
         let loop_started = std::time::Instant::now();
+        let mut scheduled_task_retry_injected = false;
 
         for iteration in 0..max_iterations {
             let iteration_no = iteration + 1;
@@ -1502,6 +1517,35 @@ impl Orchestrator {
                     messages.push(LlmMessage::user(
                         "You must call the web_search tool now and then provide the answer based on the tool result.",
                     ));
+                    continue;
+                }
+
+                // Layer 2: Detect scheduled task hallucination — agent claims
+                // to have performed actions but made zero tool calls.
+                if should_retry_fabricated_scheduled_response(
+                    is_scheduled_task,
+                    scheduled_task_retry_injected,
+                    tool_uses.len(),
+                    &resp.text,
+                ) {
+                    scheduled_task_retry_injected = true;
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        iteration = iteration_no,
+                        response_len = resp.text.len(),
+                        "tool_use_loop: scheduled task response claims actions without tool calls, injecting retry"
+                    );
+                    messages.push(LlmMessage {
+                        role: "assistant".into(),
+                        content: resp.content.clone(),
+                    });
+                    messages.push(LlmMessage::user(concat!(
+                        "Your response claims to have performed actions (writing files, ",
+                        "executing commands, fetching data, etc.) but you did not make any ",
+                        "tool calls. This is a scheduled task \u{2014} you must actually execute ",
+                        "each step using the available tools. Do not generate fictional ",
+                        "results. Complete the task now using tool calls.",
+                    )));
                     continue;
                 }
 
@@ -1729,7 +1773,8 @@ impl Orchestrator {
                     .map(|s| s.dangerous_allow_private.clone())
                     .unwrap_or_default(),
                 source_info,
-                false,
+                false, // must_use_web_search
+                false, // is_scheduled_task
                 agent.model_policy.thinking_level,
             )
             .await?;
@@ -2194,6 +2239,60 @@ fn should_inject_web_search_reminder(
         && !web_search_reminder_injected
         && !web_search_called
         && tool_use_count == 0
+}
+
+/// Detect if a scheduled task response likely fabricated action claims without
+/// actually calling tools. Checks for action-indicating phrases in both Chinese
+/// and English that suggest the agent claimed to have performed operations.
+fn response_claims_actions(text: &str) -> bool {
+    let text_lower = text.to_ascii_lowercase();
+    // Chinese action claims
+    let cn_indicators = [
+        "已完成",
+        "已写入",
+        "已执行",
+        "已抓取",
+        "已生成",
+        "已发布",
+        "已提交",
+        "已推送",
+        "已构建",
+        "已部署",
+        "已更新",
+        "写入：",
+        "写入:",
+        "执行了",
+        "抓取了",
+        "生成了",
+    ];
+    // English action claims
+    let en_indicators = [
+        "wrote to",
+        "written to",
+        "pushed to",
+        "committed",
+        "executed",
+        "fetched",
+        "generated",
+        "deployed",
+        "hugo build",
+        "git push",
+        "git commit",
+    ];
+    cn_indicators.iter().any(|ind| text.contains(ind))
+        || en_indicators.iter().any(|ind| text_lower.contains(ind))
+}
+
+fn should_retry_fabricated_scheduled_response(
+    is_scheduled_task: bool,
+    already_retried: bool,
+    tool_use_count: usize,
+    response_text: &str,
+) -> bool {
+    is_scheduled_task
+        && !already_retried
+        && tool_use_count == 0
+        && response_claims_actions(response_text)
 }
 
 fn collect_recent_messages(messages: &[LlmMessage], limit: usize) -> Vec<ConversationMessage> {

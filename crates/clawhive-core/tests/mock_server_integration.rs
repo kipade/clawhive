@@ -37,6 +37,7 @@ fn test_inbound(text: &str) -> InboundMessage {
         message_id: None,
         attachments: vec![],
         group_context: None,
+        message_source: None,
     }
 }
 
