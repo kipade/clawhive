@@ -1,7 +1,14 @@
+mod cooldown;
+mod failover;
+
+pub use cooldown::{CooldownStore, ProviderCooldownStats};
+pub use failover::{
+    classify_failover_reason, get_cooldown_duration, is_failover_error, FailoverReason,
+};
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use clawhive_provider::{LlmMessage, LlmRequest, LlmResponse, ProviderRegistry, StreamChunk};
@@ -10,194 +17,6 @@ use tokio::time;
 
 const MAX_RETRIES: usize = 2;
 const BASE_BACKOFF_MS: u64 = 1000;
-const DEFAULT_COOLDOWN_SECS: u64 = 60;
-const BILLING_COOLDOWN_SECS: u64 = 300; // 5 minutes for billing errors
-
-/// Tracks cooldown state for providers (similar to OpenClaw's auth profile stats)
-#[derive(Debug, Clone, Default)]
-pub struct ProviderCooldownStats {
-    pub cooldown_until: Option<Instant>,
-    pub failure_count: u32,
-    pub last_failure_reason: Option<String>,
-}
-
-impl ProviderCooldownStats {
-    pub fn is_in_cooldown(&self) -> bool {
-        self.cooldown_until
-            .map(|until| Instant::now() < until)
-            .unwrap_or(false)
-    }
-
-    pub fn remaining_cooldown(&self) -> Option<Duration> {
-        self.cooldown_until.and_then(|until| {
-            let now = Instant::now();
-            if now < until {
-                Some(until - now)
-            } else {
-                None
-            }
-        })
-    }
-
-    pub fn set_cooldown(&mut self, duration: Duration, reason: &str) {
-        self.cooldown_until = Some(Instant::now() + duration);
-        self.failure_count += 1;
-        self.last_failure_reason = Some(reason.to_string());
-    }
-
-    pub fn clear_cooldown(&mut self) {
-        self.cooldown_until = None;
-    }
-}
-
-/// Cooldown store for all providers
-#[derive(Debug, Clone, Default)]
-pub struct CooldownStore {
-    stats: HashMap<String, ProviderCooldownStats>,
-}
-
-impl CooldownStore {
-    pub fn new() -> Self {
-        Self {
-            stats: HashMap::new(),
-        }
-    }
-
-    pub fn get_stats(&self, provider_id: &str) -> ProviderCooldownStats {
-        self.stats.get(provider_id).cloned().unwrap_or_default()
-    }
-
-    pub fn set_cooldown(&mut self, provider_id: &str, duration: Duration, reason: &str) {
-        let stats = self.stats.entry(provider_id.to_string()).or_default();
-        stats.set_cooldown(duration, reason);
-    }
-
-    pub fn clear_cooldown(&mut self, provider_id: &str) {
-        if let Some(stats) = self.stats.get_mut(provider_id) {
-            stats.clear_cooldown();
-        }
-    }
-
-    pub fn clear_expired_cooldowns(&mut self) {
-        let now = Instant::now();
-        for stats in self.stats.values_mut() {
-            if let Some(until) = stats.cooldown_until {
-                if now >= until {
-                    stats.cooldown_until = None;
-                }
-            }
-        }
-    }
-}
-
-/// Error classification for failover decisions (following OpenClaw patterns)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailoverReason {
-    RateLimit,       // 429
-    Billing,         // insufficient credits / billing error
-    Timeout,         // request timed out
-    ServerError,     // 5xx
-    ContextOverflow, // context too long
-    AuthError,       // 401/403
-    Unknown,         // other errors
-}
-
-impl FailoverReason {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::RateLimit => "rate_limit",
-            Self::Billing => "billing",
-            Self::Timeout => "timeout",
-            Self::ServerError => "server_error",
-            Self::ContextOverflow => "context_overflow",
-            Self::AuthError => "auth_error",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-/// Classify an error to determine if/how to failover
-fn classify_failover_reason(err_str: &str) -> Option<FailoverReason> {
-    let lower = err_str.to_lowercase();
-
-    // Rate limit (429)
-    if lower.contains("429") || lower.contains("rate limit") || lower.contains("rate_limit") {
-        return Some(FailoverReason::RateLimit);
-    }
-
-    // Billing errors
-    if lower.contains("insufficient")
-        || lower.contains("billing")
-        || lower.contains("credits")
-        || lower.contains("quota")
-        || lower.contains("payment")
-    {
-        return Some(FailoverReason::Billing);
-    }
-
-    // Timeout
-    if lower.contains("timeout") || lower.contains("timed out") || lower.contains("deadline") {
-        return Some(FailoverReason::Timeout);
-    }
-
-    // Server errors (5xx)
-    if lower.contains("500")
-        || lower.contains("502")
-        || lower.contains("503")
-        || lower.contains("504")
-        || lower.contains("internal server error")
-        || lower.contains("service unavailable")
-        || lower.contains("bad gateway")
-    {
-        return Some(FailoverReason::ServerError);
-    }
-
-    // Context overflow
-    if lower.contains("context")
-        && (lower.contains("overflow")
-            || lower.contains("too long")
-            || lower.contains("too large")
-            || lower.contains("exceed"))
-    {
-        return Some(FailoverReason::ContextOverflow);
-    }
-
-    // Auth errors (401/403)
-    if lower.contains("401")
-        || lower.contains("403")
-        || lower.contains("unauthorized")
-        || lower.contains("forbidden")
-        || lower.contains("authentication")
-    {
-        return Some(FailoverReason::AuthError);
-    }
-
-    // Check for [retryable] marker - if present but not caught above, it's still failover-eligible
-    if lower.contains("[retryable]") {
-        return Some(FailoverReason::Unknown);
-    }
-
-    None
-}
-
-/// Check if an error should trigger failover
-#[allow(dead_code)]
-fn is_failover_error(err_str: &str) -> bool {
-    classify_failover_reason(err_str).is_some()
-}
-
-/// Get cooldown duration based on error type
-fn get_cooldown_duration(reason: FailoverReason) -> Duration {
-    match reason {
-        FailoverReason::Billing => Duration::from_secs(BILLING_COOLDOWN_SECS),
-        FailoverReason::RateLimit => Duration::from_secs(DEFAULT_COOLDOWN_SECS),
-        FailoverReason::Timeout => Duration::from_secs(30),
-        FailoverReason::ServerError => Duration::from_secs(30),
-        FailoverReason::ContextOverflow => Duration::from_secs(0), // no cooldown, just skip
-        FailoverReason::AuthError => Duration::from_secs(3600),    // 1 hour for auth issues
-        FailoverReason::Unknown => Duration::from_secs(DEFAULT_COOLDOWN_SECS),
-    }
-}
 
 pub struct LlmRouter {
     registry: ProviderRegistry,
