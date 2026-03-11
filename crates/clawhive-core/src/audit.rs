@@ -197,7 +197,8 @@ pub fn summarize_input(input: &serde_json::Value, max_len: usize) -> String {
                             "[REDACTED]".to_string()
                         }
                         serde_json::Value::String(s) if s.len() > 50 => {
-                            format!("\"{}...\"", &s[..47])
+                            let end = s.floor_char_boundary(47);
+                            format!("\"{}...\"", &s[..end])
                         }
                         _ => v.to_string(),
                     };
@@ -233,7 +234,8 @@ fn truncate_string(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+        let end = s.floor_char_boundary(max_len.saturating_sub(3));
+        format!("{}...", &s[..end])
     }
 }
 

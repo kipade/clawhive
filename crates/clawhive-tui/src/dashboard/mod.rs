@@ -922,6 +922,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         app.handle_bus_message(BusMessage::HandleIncomingMessage {

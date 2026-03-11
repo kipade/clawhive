@@ -1017,6 +1017,17 @@ impl Orchestrator {
             );
         }
 
+        let is_scheduled_task = inbound.message_source.as_deref() == Some("scheduled_task");
+        if is_scheduled_task {
+            system_prompt.push_str(
+                "\n\n## Scheduled Task Execution\n\
+                 This is an automated scheduled task. You are executing real actions, not generating example output.\n\
+                 - Steps that involve reading data, writing files, or running commands MUST be performed through tool calls.\n\
+                 - Only report actions you have actually performed through tool calls. Never fabricate results.\n\
+                 - If the task only requires generating text (e.g. a reminder or greeting), respond directly without tools.",
+            );
+        }
+
         let allowed = Self::forced_allowed_tools(
             forced_skills.as_deref(),
             agent.tool_policy.as_ref().map(|tp| tp.allow.clone()),
@@ -1046,6 +1057,7 @@ impl Orchestrator {
                 private_network_overrides,
                 source_info,
                 must_use_web_search,
+                is_scheduled_task,
                 agent.model_policy.thinking_level,
             )
             .await?;
@@ -1076,6 +1088,16 @@ impl Orchestrator {
             reply_to: None,
             attachments: vec![],
         };
+
+        if !outbound.text.is_empty() {
+            let preview_end = outbound.text.floor_char_boundary(200);
+            tracing::info!(
+                agent_id = %agent_id,
+                reply_len = outbound.text.len(),
+                reply_preview = &outbound.text[..preview_end],
+                "agent reply"
+            );
+        }
 
         // Record session messages (JSONL)
         if let Err(e) = self
@@ -1287,6 +1309,7 @@ impl Orchestrator {
                 private_network_overrides_stream,
                 source_info_stream,
                 must_use_web_search,
+                false, // is_scheduled_task
                 agent.model_policy.thinking_level,
             )
             .await?;
@@ -1380,6 +1403,7 @@ impl Orchestrator {
         private_network_overrides: Vec<String>,
         source_info: Option<(String, String, String, String)>, // (channel_type, connector_id, conversation_scope, user_scope)
         must_use_web_search: bool,
+        is_scheduled_task: bool,
         thinking_level: Option<clawhive_provider::ThinkingLevel>,
     ) -> Result<(clawhive_provider::LlmResponse, Vec<LlmMessage>)> {
         let mut messages = initial_messages;
@@ -1396,6 +1420,8 @@ impl Orchestrator {
         let mut web_search_reminder_injected = false;
         let mut web_search_called = false;
         let loop_started = std::time::Instant::now();
+        let mut scheduled_task_retries: u32 = 0;
+        let mut total_tool_calls: usize = 0;
 
         for iteration in 0..max_iterations {
             let iteration_no = iteration + 1;
@@ -1470,6 +1496,14 @@ impl Orchestrator {
                 "tool_use_loop: LLM response"
             );
 
+            let text_preview_end = resp.text.floor_char_boundary(300);
+            tracing::debug!(
+                agent_id = %agent_id,
+                iteration = iteration_no,
+                text_preview = &resp.text[..text_preview_end],
+                "tool_use_loop: LLM response text"
+            );
+
             let tool_uses: Vec<_> = resp
                 .content
                 .iter()
@@ -1505,6 +1539,38 @@ impl Orchestrator {
                     continue;
                 }
 
+                // Layer 2: Detect scheduled task hallucination — agent claims
+                // to have performed actions but made zero tool calls.
+                if should_retry_fabricated_scheduled_response(
+                    is_scheduled_task,
+                    scheduled_task_retries,
+                    total_tool_calls,
+                    tool_uses.len(),
+                ) {
+                    scheduled_task_retries += 1;
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        iteration = iteration_no,
+                        retry_count = scheduled_task_retries,
+                        response_len = resp.text.len(),
+                        "tool_use_loop: scheduled task response has no tool calls, injecting retry {}/2",
+                        scheduled_task_retries
+                    );
+                    messages.push(LlmMessage {
+                        role: "assistant".into(),
+                        content: resp.content.clone(),
+                    });
+                    messages.push(LlmMessage::user(concat!(
+                        "[SYSTEM] You responded without making any tool calls. ",
+                        "This is UNACCEPTABLE for a scheduled task. ",
+                        "You MUST use tools to execute the task. ",
+                        "Start with step 1 RIGHT NOW: call execute_command or read_file ",
+                        "to begin the work. Do NOT reply with text \u{2014} your next message ",
+                        "MUST contain tool_use blocks.",
+                    )));
+                    continue;
+                }
+
                 tracing::debug!(
                     agent_id = %agent_id,
                     iteration = iteration_no,
@@ -1516,6 +1582,7 @@ impl Orchestrator {
                 return Ok((resp, messages));
             }
 
+            total_tool_calls += tool_uses.len();
             let tool_names: Vec<String> =
                 tool_uses.iter().map(|(_, name, _)| name.clone()).collect();
             if tool_names.iter().any(|name| name == "web_search") {
@@ -1566,7 +1633,15 @@ impl Orchestrator {
                     let agent_id = agent_id.to_string();
                     let tool_name = name.clone();
                     async move {
-                        let input_bytes = input.to_string().len();
+                        let input_str = input.to_string();
+                        let input_preview_end = input_str.floor_char_boundary(300);
+                        tracing::debug!(
+                            agent_id = %agent_id,
+                            tool_name = %tool_name,
+                            input_preview = &input_str[..input_preview_end],
+                            "tool_use_loop: tool input"
+                        );
+                        let input_bytes = input_str.len();
                         let tool_started = std::time::Instant::now();
                         match self
                             .execute_tool_for_agent(&agent_id, &name, input, &ctx)
@@ -1574,23 +1649,21 @@ impl Orchestrator {
                         {
                             Ok(output) => {
                                 let duration_ms = tool_started.elapsed().as_millis() as u64;
+                                let output_preview_end = output.content.floor_char_boundary(200);
+                                tracing::info!(
+                                    agent_id = %agent_id,
+                                    tool_name = %tool_name,
+                                    duration_ms,
+                                    is_error = output.is_error,
+                                    output_preview = &output.content[..output_preview_end],
+                                    "tool executed"
+                                );
                                 if is_slow_latency_ms(duration_ms, SLOW_TOOL_EXEC_WARN_MS) {
                                     tracing::warn!(
                                         agent_id = %agent_id,
                                         tool_name = %tool_name,
                                         duration_ms,
-                                        input_bytes,
-                                        is_error = output.is_error,
-                                        "tool_use_loop: slow tool execution"
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        agent_id = %agent_id,
-                                        tool_name = %tool_name,
-                                        duration_ms,
-                                        input_bytes,
-                                        is_error = output.is_error,
-                                        "tool_use_loop: tool execution completed"
+                                        "tool execution slow"
                                     );
                                 }
                                 ContentBlock::ToolResult {
@@ -1729,7 +1802,8 @@ impl Orchestrator {
                     .map(|s| s.dangerous_allow_private.clone())
                     .unwrap_or_default(),
                 source_info,
-                false,
+                false, // must_use_web_search
+                false, // is_scheduled_task
                 agent.model_policy.thinking_level,
             )
             .await?;
@@ -1763,6 +1837,16 @@ impl Orchestrator {
             reply_to: None,
             attachments: vec![],
         };
+
+        if !outbound.text.is_empty() {
+            let preview_end = outbound.text.floor_char_boundary(200);
+            tracing::info!(
+                agent_id = %agent_id,
+                reply_len = outbound.text.len(),
+                reply_preview = &outbound.text[..preview_end],
+                "agent reply"
+            );
+        }
 
         let _ = self
             .bus
@@ -2194,6 +2278,23 @@ fn should_inject_web_search_reminder(
         && !web_search_reminder_injected
         && !web_search_called
         && tool_use_count == 0
+}
+
+fn should_retry_fabricated_scheduled_response(
+    is_scheduled_task: bool,
+    retry_count: u32,
+    total_tool_calls: usize,
+    current_tool_calls: usize,
+) -> bool {
+    // Only retry when the agent has made ZERO tool calls across the entire
+    // session. If tools were already called in prior iterations (e.g. the agent
+    // ran a pipeline and is now composing a text summary), the current zero-tool
+    // iteration is legitimate — not hallucination.
+    const MAX_RETRIES: u32 = 2;
+    is_scheduled_task
+        && retry_count < MAX_RETRIES
+        && total_tool_calls == 0
+        && current_tool_calls == 0
 }
 
 fn collect_recent_messages(messages: &[LlmMessage], limit: usize) -> Vec<ConversationMessage> {

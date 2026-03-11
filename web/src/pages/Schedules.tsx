@@ -270,16 +270,106 @@ function EditScheduleDialog({
               </Select>
             </div>
 
-            {/* Task */}
-            <div className="space-y-1.5">
-              <Label htmlFor="sched-task">Task</Label>
-              <textarea
-                id="sched-task"
-                className="flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-                value={form.task}
-                onChange={(e) => updateForm({ task: e.target.value })}
-                placeholder="Task description / prompt"
-              />
+            {/* Payload */}
+            <div className="space-y-3">
+              <Label>Payload</Label>
+              <div className="rounded-md border p-3 space-y-3">
+                {/* Kind selector */}
+                <div className="space-y-1.5">
+                  <Label className="text-xs text-muted-foreground">Type</Label>
+                  <Select
+                    value={form.payload?.kind ?? "agent_turn"}
+                    onValueChange={(kind) => {
+                      const k = kind as "system_event" | "agent_turn" | "direct_deliver";
+                      if (k === "agent_turn") {
+                        updateForm({ payload: { kind: k, message: form.payload?.message ?? form.payload?.text ?? "", timeout_seconds: form.payload?.timeout_seconds ?? 300, light_context: form.payload?.light_context ?? false } });
+                      } else {
+                        updateForm({ payload: { kind: k, text: form.payload?.text ?? form.payload?.message ?? "" } });
+                      }
+                    }}
+                  >
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="agent_turn">Agent Turn</SelectItem>
+                      <SelectItem value="system_event">System Event</SelectItem>
+                      <SelectItem value="direct_deliver">Direct Deliver</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                {/* Agent Turn fields */}
+                {(form.payload?.kind ?? "agent_turn") === "agent_turn" && (
+                  <>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="sched-message" className="text-xs text-muted-foreground">Message</Label>
+                      <textarea
+                        id="sched-message"
+                        className="flex min-h-[100px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                        value={form.payload?.message ?? ""}
+                        onChange={(e) => updateForm({ payload: { ...form.payload!, message: e.target.value } })}
+                        placeholder="Task instructions for the agent..."
+                      />
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-1.5">
+                        <Label htmlFor="sched-model" className="text-xs text-muted-foreground">Model (optional)</Label>
+                        <Input
+                          id="sched-model"
+                          value={form.payload?.model ?? ""}
+                          onChange={(e) => updateForm({ payload: { ...form.payload!, model: e.target.value || null } })}
+                          placeholder="Use agent default"
+                          className="text-sm"
+                        />
+                      </div>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="sched-thinking" className="text-xs text-muted-foreground">Thinking (optional)</Label>
+                        <Input
+                          id="sched-thinking"
+                          value={form.payload?.thinking ?? ""}
+                          onChange={(e) => updateForm({ payload: { ...form.payload!, thinking: e.target.value || null } })}
+                          placeholder="e.g. medium"
+                          className="text-sm"
+                        />
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3 items-end">
+                      <div className="space-y-1.5">
+                        <Label htmlFor="sched-payload-timeout" className="text-xs text-muted-foreground">Payload Timeout (s)</Label>
+                        <Input
+                          id="sched-payload-timeout"
+                          type="number"
+                          value={form.payload?.timeout_seconds ?? 300}
+                          onChange={(e) => updateForm({ payload: { ...form.payload!, timeout_seconds: parseInt(e.target.value) || 300 } })}
+                        />
+                      </div>
+                      <div className="flex items-center gap-2 pb-1">
+                        <Switch
+                          id="sched-light-ctx"
+                          checked={form.payload?.light_context ?? false}
+                          onCheckedChange={(checked) => updateForm({ payload: { ...form.payload!, light_context: checked } })}
+                        />
+                        <Label htmlFor="sched-light-ctx" className="text-xs text-muted-foreground cursor-pointer">Light Context</Label>
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {/* System Event / Direct Deliver fields */}
+                {(form.payload?.kind === "system_event" || form.payload?.kind === "direct_deliver") && (
+                  <div className="space-y-1.5">
+                    <Label htmlFor="sched-text" className="text-xs text-muted-foreground">Text</Label>
+                    <textarea
+                      id="sched-text"
+                      className="flex min-h-[100px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                      value={form.payload?.text ?? ""}
+                      onChange={(e) => updateForm({ payload: { ...form.payload!, text: e.target.value } })}
+                      placeholder={form.payload?.kind === "direct_deliver" ? "Message to deliver directly..." : "System event text..."}
+                    />
+                  </div>
+                )}
+              </div>
             </div>
 
             {/* Timeout */}

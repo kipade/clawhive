@@ -140,8 +140,11 @@ pub fn prune_tool_results(
         for block in msg.content.iter_mut() {
             if let clawhive_provider::ContentBlock::ToolResult { content, .. } = block {
                 if content.len() > max_tool_result_chars {
-                    let head = &content[..max_tool_result_chars / 2];
-                    let tail = &content[content.len() - max_tool_result_chars / 2..];
+                    let half = max_tool_result_chars / 2;
+                    let head_end = content.floor_char_boundary(half);
+                    let tail_start = content.ceil_char_boundary(content.len() - half);
+                    let head = &content[..head_end];
+                    let tail = &content[tail_start..];
                     *content = format!(
                         "{}...[truncated {} chars]...{}",
                         head,

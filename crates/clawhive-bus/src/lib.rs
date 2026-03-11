@@ -250,6 +250,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let cases: Vec<(BusMessage, Topic)> = vec![

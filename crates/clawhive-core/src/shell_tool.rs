@@ -829,7 +829,7 @@ impl ToolExecutor for ExecuteCommandTool {
 
         // Log command execution details
         let command_preview = if command.len() > 200 {
-            format!("{}...", &command[..200])
+            format!("{}...", &command[..command.floor_char_boundary(200)])
         } else {
             command.to_string()
         };

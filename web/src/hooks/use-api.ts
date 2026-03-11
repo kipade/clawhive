@@ -408,13 +408,12 @@ export interface ScheduleDetail {
   };
   agent_id: string;
   session_mode: "main" | "isolated";
-  task: string;
   payload: {
-    kind: string;
+    kind: "system_event" | "agent_turn" | "direct_deliver";
     text?: string;
     message?: string;
-    model?: string;
-    thinking?: string;
+    model?: string | null;
+    thinking?: string | null;
     timeout_seconds?: number;
     light_context?: boolean;
   } | null;

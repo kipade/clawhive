@@ -28,6 +28,9 @@ pub struct InboundMessage {
     /// Group/channel context (members, metadata)
     #[serde(default)]
     pub group_context: Option<GroupContext>,
+    /// Message origin: "interactive" (default), "scheduled_task", "system_event"
+    #[serde(default)]
+    pub message_source: Option<String>,
 }
 
 /// Context about the group/channel where the message was sent.
@@ -364,6 +367,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let key = SessionKey::from_inbound(&inbound);
@@ -399,6 +403,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let msg1 = BusMessage::HandleIncomingMessage {
@@ -480,6 +485,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         let event = Event::Inbound(inbound);
         let json = serde_json::to_string(&event).unwrap();
@@ -640,6 +646,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         let key = SessionKey::from_inbound(&inbound);
         assert_eq!(key.0, "telegram:tg:special/id:group:chat:-100123:user:0");

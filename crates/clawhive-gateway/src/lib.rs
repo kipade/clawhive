@@ -291,8 +291,119 @@ pub fn spawn_scheduled_task_listener(
                 continue;
             };
 
-            match payload {
-                ScheduledTaskPayload::DirectDeliver { text } => {
+            // Spawn each scheduled task in its own tokio task so that a panic
+            // in one task does not kill the entire listener loop.
+            let gw = Arc::clone(&gateway);
+            let task_bus = Arc::clone(&bus);
+            let sid = schedule_id.clone();
+            let handle = tokio::spawn(async move {
+                handle_scheduled_task(
+                    gw,
+                    task_bus,
+                    schedule_id,
+                    agent_id,
+                    payload,
+                    delivery,
+                    triggered_at,
+                )
+                .await;
+            });
+
+            // If the spawned task panicked, publish a completion event so the
+            // scheduler clears the running_at_ms marker instead of waiting for
+            // the 2-hour stuck timeout.
+            if let Err(join_err) = handle.await {
+                tracing::error!(
+                    schedule_id = %sid,
+                    error = %join_err,
+                    "Scheduled task panicked — publishing error completion"
+                );
+                let _ = bus
+                    .publish(BusMessage::ScheduledTaskCompleted {
+                        schedule_id: sid,
+                        status: ScheduledRunStatus::Error,
+                        error: Some(format!("task panicked: {join_err}")),
+                        started_at: triggered_at,
+                        ended_at: chrono::Utc::now(),
+                        delivery_status: ScheduledDeliveryStatus::NotDelivered,
+                        delivery_error: Some("task panicked before delivery".to_string()),
+                        response: None,
+                    })
+                    .await;
+            }
+        }
+    })
+}
+
+/// Process a single scheduled task. Extracted so it can be spawned in its own
+/// tokio task, isolating panics from the listener loop.
+async fn handle_scheduled_task(
+    gateway: Arc<Gateway>,
+    bus: Arc<EventBus>,
+    schedule_id: String,
+    agent_id: String,
+    payload: ScheduledTaskPayload,
+    delivery: ScheduledDeliveryInfo,
+    triggered_at: chrono::DateTime<chrono::Utc>,
+) {
+    match payload {
+        ScheduledTaskPayload::DirectDeliver { text } => {
+            let ended_at = chrono::Utc::now();
+            let delivery_outcome = deliver_if_needed(
+                &bus,
+                &delivery,
+                &DeliveryAttempt {
+                    schedule_id: &schedule_id,
+                    status: ScheduledRunStatus::Ok,
+                    response: Some(format!("⏰ {}", text)),
+                    error: None,
+                    started_at: triggered_at,
+                    ended_at,
+                },
+            )
+            .await;
+
+            let mut status = ScheduledRunStatus::Ok;
+            let mut error = None;
+            if matches!(
+                delivery_outcome.status,
+                ScheduledDeliveryStatus::NotDelivered
+            ) && !delivery.best_effort
+            {
+                status = ScheduledRunStatus::Error;
+                error = Some(
+                    delivery_outcome
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "delivery failed".to_string()),
+                );
+            }
+
+            let _ = bus
+                .publish(BusMessage::ScheduledTaskCompleted {
+                    schedule_id,
+                    status,
+                    error,
+                    started_at: triggered_at,
+                    ended_at,
+                    delivery_status: delivery_outcome.status,
+                    delivery_error: delivery_outcome.error,
+                    response: Some(text),
+                })
+                .await;
+        }
+        ScheduledTaskPayload::SystemEvent { text } => {
+            let (ch_type, conn_id, conv_scope): (String, String, String) = match (
+                &delivery.source_channel_type,
+                &delivery.source_connector_id,
+                &delivery.source_conversation_scope,
+            ) {
+                (Some(ct), Some(ci), Some(cs)) => (ct.clone(), ci.clone(), cs.clone()),
+                _ => {
+                    tracing::warn!(
+                        schedule_id = %schedule_id,
+                        "SystemEvent missing source scope, falling back to DirectDeliver"
+                    );
                     let ended_at = chrono::Utc::now();
                     let delivery_outcome = deliver_if_needed(
                         &bus,
@@ -301,6 +412,61 @@ pub fn spawn_scheduled_task_listener(
                             schedule_id: &schedule_id,
                             status: ScheduledRunStatus::Ok,
                             response: Some(format!("⏰ {}", text)),
+                            error: None,
+                            started_at: triggered_at,
+                            ended_at,
+                        },
+                    )
+                    .await;
+
+                    let _ = bus
+                        .publish(BusMessage::ScheduledTaskCompleted {
+                            schedule_id,
+                            status: ScheduledRunStatus::Ok,
+                            error: None,
+                            started_at: triggered_at,
+                            ended_at,
+                            delivery_status: delivery_outcome.status,
+                            delivery_error: delivery_outcome.error,
+                            response: Some(text),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            let user_scope = delivery
+                .source_user_scope
+                .clone()
+                .unwrap_or_else(|| "user:scheduler".into());
+
+            let inbound = InboundMessage {
+                trace_id: Uuid::new_v4(),
+                channel_type: ch_type,
+                connector_id: conn_id,
+                conversation_scope: conv_scope,
+                user_scope,
+                text: format!("[Scheduled Reminder]\n{}", text),
+                at: triggered_at,
+                thread_id: None,
+                is_mention: false,
+                mention_target: None,
+                message_id: None,
+                attachments: vec![],
+                group_context: None,
+                message_source: None,
+            };
+
+            match gateway.handle_inbound_for_agent(inbound, &agent_id).await {
+                Ok(outbound) => {
+                    let ended_at = chrono::Utc::now();
+                    let delivery_outcome = deliver_if_needed(
+                        &bus,
+                        &delivery,
+                        &DeliveryAttempt {
+                            schedule_id: &schedule_id,
+                            status: ScheduledRunStatus::Ok,
+                            response: Some(outbound.text.clone()),
                             error: None,
                             started_at: triggered_at,
                             ended_at,
@@ -333,319 +499,205 @@ pub fn spawn_scheduled_task_listener(
                             ended_at,
                             delivery_status: delivery_outcome.status,
                             delivery_error: delivery_outcome.error,
-                            response: Some(text),
+                            response: Some(outbound.text),
                         })
                         .await;
                 }
-                ScheduledTaskPayload::SystemEvent { text } => {
-                    let (ch_type, conn_id, conv_scope) = match (
-                        &delivery.source_channel_type,
-                        &delivery.source_connector_id,
-                        &delivery.source_conversation_scope,
-                    ) {
-                        (Some(ct), Some(ci), Some(cs)) => (ct.clone(), ci.clone(), cs.clone()),
-                        _ => {
-                            tracing::warn!(
-                                schedule_id = %schedule_id,
-                                "SystemEvent missing source scope, falling back to DirectDeliver"
-                            );
-                            let ended_at = chrono::Utc::now();
-                            let delivery_outcome = deliver_if_needed(
-                                &bus,
-                                &delivery,
-                                &DeliveryAttempt {
-                                    schedule_id: &schedule_id,
-                                    status: ScheduledRunStatus::Ok,
-                                    response: Some(format!("⏰ {}", text)),
-                                    error: None,
-                                    started_at: triggered_at,
-                                    ended_at,
-                                },
-                            )
-                            .await;
-
-                            let _ = bus
-                                .publish(BusMessage::ScheduledTaskCompleted {
-                                    schedule_id,
-                                    status: ScheduledRunStatus::Ok,
-                                    error: None,
-                                    started_at: triggered_at,
-                                    ended_at,
-                                    delivery_status: delivery_outcome.status,
-                                    delivery_error: delivery_outcome.error,
-                                    response: Some(text),
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-
-                    let user_scope = delivery
-                        .source_user_scope
-                        .clone()
-                        .unwrap_or_else(|| "user:scheduler".into());
-
-                    let inbound = InboundMessage {
-                        trace_id: Uuid::new_v4(),
-                        channel_type: ch_type,
-                        connector_id: conn_id,
-                        conversation_scope: conv_scope,
-                        user_scope,
-                        text: format!("[Scheduled Reminder]\n{}", text),
-                        at: triggered_at,
-                        thread_id: None,
-                        is_mention: false,
-                        mention_target: None,
-                        message_id: None,
-                        attachments: vec![],
-                        group_context: None,
-                    };
-
-                    match gateway.handle_inbound_for_agent(inbound, &agent_id).await {
-                        Ok(outbound) => {
-                            let ended_at = chrono::Utc::now();
-                            let delivery_outcome = deliver_if_needed(
-                                &bus,
-                                &delivery,
-                                &DeliveryAttempt {
-                                    schedule_id: &schedule_id,
-                                    status: ScheduledRunStatus::Ok,
-                                    response: Some(outbound.text.clone()),
-                                    error: None,
-                                    started_at: triggered_at,
-                                    ended_at,
-                                },
-                            )
-                            .await;
-
-                            let mut status = ScheduledRunStatus::Ok;
-                            let mut error = None;
-                            if matches!(
-                                delivery_outcome.status,
-                                ScheduledDeliveryStatus::NotDelivered
-                            ) && !delivery.best_effort
-                            {
-                                status = ScheduledRunStatus::Error;
-                                error = Some(
-                                    delivery_outcome
-                                        .error
-                                        .clone()
-                                        .unwrap_or_else(|| "delivery failed".to_string()),
-                                );
-                            }
-
-                            let _ = bus
-                                .publish(BusMessage::ScheduledTaskCompleted {
-                                    schedule_id,
-                                    status,
-                                    error,
-                                    started_at: triggered_at,
-                                    ended_at,
-                                    delivery_status: delivery_outcome.status,
-                                    delivery_error: delivery_outcome.error,
-                                    response: Some(outbound.text),
-                                })
-                                .await;
-                        }
-                        Err(e) => {
-                            let ended_at = chrono::Utc::now();
-                            let exec_error = e.to_string();
-                            let delivery_outcome = deliver_if_needed(
-                                &bus,
-                                &delivery,
-                                &DeliveryAttempt {
-                                    schedule_id: &schedule_id,
-                                    status: ScheduledRunStatus::Error,
-                                    response: None,
-                                    error: Some(exec_error.clone()),
-                                    started_at: triggered_at,
-                                    ended_at,
-                                },
-                            )
-                            .await;
-
-                            let _ = bus
-                                .publish(BusMessage::ScheduledTaskCompleted {
-                                    schedule_id,
-                                    status: ScheduledRunStatus::Error,
-                                    error: Some(exec_error),
-                                    started_at: triggered_at,
-                                    ended_at,
-                                    delivery_status: delivery_outcome.status,
-                                    delivery_error: delivery_outcome.error,
-                                    response: None,
-                                })
-                                .await;
-                        }
-                    }
-                }
-                ScheduledTaskPayload::AgentTurn {
-                    message,
-                    model: _,
-                    thinking: _,
-                    timeout_seconds,
-                    light_context: _,
-                } => {
-                    let (channel_type, connector_id, conversation_scope) = match (
-                        &delivery.source_channel_type,
-                        &delivery.source_connector_id,
-                        &delivery.source_conversation_scope,
-                    ) {
-                        (Some(ct), Some(ci), Some(cs)) => (ct.clone(), ci.clone(), cs.clone()),
-                        _ => {
-                            tracing::warn!(
-                                schedule_id = %schedule_id,
-                                "AgentTurn schedule {} has no source channel configured — approval requests will not be routable",
-                                schedule_id
-                            );
-                            (
-                                "scheduler".into(),
-                                schedule_id.clone(),
-                                format!("schedule:{}:{}", schedule_id, Uuid::new_v4()),
-                            )
-                        }
-                    };
-
-                    let user_scope = delivery
-                        .source_user_scope
-                        .clone()
-                        .unwrap_or_else(|| "user:scheduler".into());
-
-                    let inbound = InboundMessage {
-                        trace_id: Uuid::new_v4(),
-                        channel_type,
-                        connector_id,
-                        conversation_scope,
-                        user_scope,
-                        text: message,
-                        at: triggered_at,
-                        thread_id: None,
-                        is_mention: false,
-                        mention_target: None,
-                        message_id: None,
-                        attachments: vec![],
-                        group_context: None,
-                    };
-
-                    let effective_timeout = timeout_seconds.clamp(30, 3600);
-                    let result = tokio::time::timeout(
-                        std::time::Duration::from_secs(effective_timeout),
-                        gateway.handle_inbound_for_agent(inbound, &agent_id),
+                Err(e) => {
+                    let ended_at = chrono::Utc::now();
+                    let exec_error = e.to_string();
+                    let delivery_outcome = deliver_if_needed(
+                        &bus,
+                        &delivery,
+                        &DeliveryAttempt {
+                            schedule_id: &schedule_id,
+                            status: ScheduledRunStatus::Error,
+                            response: None,
+                            error: Some(exec_error.clone()),
+                            started_at: triggered_at,
+                            ended_at,
+                        },
                     )
                     .await;
 
-                    match result {
-                        Ok(Ok(outbound)) => {
-                            let ended_at = chrono::Utc::now();
-                            let delivery_outcome = deliver_if_needed(
-                                &bus,
-                                &delivery,
-                                &DeliveryAttempt {
-                                    schedule_id: &schedule_id,
-                                    status: ScheduledRunStatus::Ok,
-                                    response: Some(outbound.text.clone()),
-                                    error: None,
-                                    started_at: triggered_at,
-                                    ended_at,
-                                },
-                            )
-                            .await;
-
-                            let mut status = ScheduledRunStatus::Ok;
-                            let mut error = None;
-                            if matches!(
-                                delivery_outcome.status,
-                                ScheduledDeliveryStatus::NotDelivered
-                            ) && !delivery.best_effort
-                            {
-                                status = ScheduledRunStatus::Error;
-                                error = Some(
-                                    delivery_outcome
-                                        .error
-                                        .clone()
-                                        .unwrap_or_else(|| "delivery failed".to_string()),
-                                );
-                            }
-
-                            let _ = bus
-                                .publish(BusMessage::ScheduledTaskCompleted {
-                                    schedule_id,
-                                    status,
-                                    error,
-                                    started_at: triggered_at,
-                                    ended_at,
-                                    delivery_status: delivery_outcome.status,
-                                    delivery_error: delivery_outcome.error,
-                                    response: Some(outbound.text),
-                                })
-                                .await;
-                        }
-                        Ok(Err(e)) => {
-                            let ended_at = chrono::Utc::now();
-                            let exec_error = e.to_string();
-                            let delivery_outcome = deliver_if_needed(
-                                &bus,
-                                &delivery,
-                                &DeliveryAttempt {
-                                    schedule_id: &schedule_id,
-                                    status: ScheduledRunStatus::Error,
-                                    response: None,
-                                    error: Some(exec_error.clone()),
-                                    started_at: triggered_at,
-                                    ended_at,
-                                },
-                            )
-                            .await;
-
-                            let _ = bus
-                                .publish(BusMessage::ScheduledTaskCompleted {
-                                    schedule_id,
-                                    status: ScheduledRunStatus::Error,
-                                    error: Some(exec_error),
-                                    started_at: triggered_at,
-                                    ended_at,
-                                    delivery_status: delivery_outcome.status,
-                                    delivery_error: delivery_outcome.error,
-                                    response: None,
-                                })
-                                .await;
-                        }
-                        Err(_) => {
-                            let ended_at = chrono::Utc::now();
-                            let timeout_error =
-                                format!("execution timed out after {}s", effective_timeout);
-                            let delivery_outcome = deliver_if_needed(
-                                &bus,
-                                &delivery,
-                                &DeliveryAttempt {
-                                    schedule_id: &schedule_id,
-                                    status: ScheduledRunStatus::Error,
-                                    response: None,
-                                    error: Some(timeout_error.clone()),
-                                    started_at: triggered_at,
-                                    ended_at,
-                                },
-                            )
-                            .await;
-
-                            let _ = bus
-                                .publish(BusMessage::ScheduledTaskCompleted {
-                                    schedule_id,
-                                    status: ScheduledRunStatus::Error,
-                                    error: Some(timeout_error),
-                                    started_at: triggered_at,
-                                    ended_at,
-                                    delivery_status: delivery_outcome.status,
-                                    delivery_error: delivery_outcome.error,
-                                    response: None,
-                                })
-                                .await;
-                        }
-                    }
+                    let _ = bus
+                        .publish(BusMessage::ScheduledTaskCompleted {
+                            schedule_id,
+                            status: ScheduledRunStatus::Error,
+                            error: Some(exec_error),
+                            started_at: triggered_at,
+                            ended_at,
+                            delivery_status: delivery_outcome.status,
+                            delivery_error: delivery_outcome.error,
+                            response: None,
+                        })
+                        .await;
                 }
             }
         }
-    })
+        ScheduledTaskPayload::AgentTurn {
+            message,
+            model: _,
+            thinking: _,
+            timeout_seconds,
+            light_context: _,
+        } => {
+            // AgentTurn always uses an isolated session so the agent starts
+            // with a clean context and cannot be influenced by prior chat history.
+            let isolated_scope = format!("schedule:{}:{}", schedule_id, Uuid::new_v4());
+            let (channel_type, connector_id, conversation_scope): (String, String, String) = match (
+                &delivery.source_channel_type,
+                &delivery.source_connector_id,
+            ) {
+                (Some(ct), Some(ci)) => (ct.clone(), ci.clone(), isolated_scope),
+                _ => {
+                    tracing::warn!(
+                        schedule_id = %schedule_id,
+                        "AgentTurn schedule {} has no source channel configured — approval requests will not be routable",
+                        schedule_id
+                    );
+                    ("scheduler".into(), schedule_id.clone(), isolated_scope)
+                }
+            };
+
+            let user_scope = delivery
+                .source_user_scope
+                .clone()
+                .unwrap_or_else(|| "user:scheduler".into());
+
+            let inbound = InboundMessage {
+                trace_id: Uuid::new_v4(),
+                channel_type,
+                connector_id,
+                conversation_scope,
+                user_scope,
+                text: message,
+                at: triggered_at,
+                thread_id: None,
+                is_mention: false,
+                mention_target: None,
+                message_id: None,
+                attachments: vec![],
+                group_context: None,
+                message_source: Some("scheduled_task".into()),
+            };
+
+            let effective_timeout = timeout_seconds.clamp(30, 3600);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(effective_timeout),
+                gateway.handle_inbound_for_agent(inbound, &agent_id),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(outbound)) => {
+                    let ended_at = chrono::Utc::now();
+                    let delivery_outcome = deliver_if_needed(
+                        &bus,
+                        &delivery,
+                        &DeliveryAttempt {
+                            schedule_id: &schedule_id,
+                            status: ScheduledRunStatus::Ok,
+                            response: Some(outbound.text.clone()),
+                            error: None,
+                            started_at: triggered_at,
+                            ended_at,
+                        },
+                    )
+                    .await;
+
+                    let mut status = ScheduledRunStatus::Ok;
+                    let mut error = None;
+                    if matches!(
+                        delivery_outcome.status,
+                        ScheduledDeliveryStatus::NotDelivered
+                    ) && !delivery.best_effort
+                    {
+                        status = ScheduledRunStatus::Error;
+                        error = Some(
+                            delivery_outcome
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "delivery failed".to_string()),
+                        );
+                    }
+
+                    let _ = bus
+                        .publish(BusMessage::ScheduledTaskCompleted {
+                            schedule_id,
+                            status,
+                            error,
+                            started_at: triggered_at,
+                            ended_at,
+                            delivery_status: delivery_outcome.status,
+                            delivery_error: delivery_outcome.error,
+                            response: Some(outbound.text),
+                        })
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    let ended_at = chrono::Utc::now();
+                    let exec_error = e.to_string();
+                    let delivery_outcome = deliver_if_needed(
+                        &bus,
+                        &delivery,
+                        &DeliveryAttempt {
+                            schedule_id: &schedule_id,
+                            status: ScheduledRunStatus::Error,
+                            response: None,
+                            error: Some(exec_error.clone()),
+                            started_at: triggered_at,
+                            ended_at,
+                        },
+                    )
+                    .await;
+
+                    let _ = bus
+                        .publish(BusMessage::ScheduledTaskCompleted {
+                            schedule_id,
+                            status: ScheduledRunStatus::Error,
+                            error: Some(exec_error),
+                            started_at: triggered_at,
+                            ended_at,
+                            delivery_status: delivery_outcome.status,
+                            delivery_error: delivery_outcome.error,
+                            response: None,
+                        })
+                        .await;
+                }
+                Err(_) => {
+                    let ended_at = chrono::Utc::now();
+                    let timeout_error = format!("execution timed out after {}s", effective_timeout);
+                    let delivery_outcome = deliver_if_needed(
+                        &bus,
+                        &delivery,
+                        &DeliveryAttempt {
+                            schedule_id: &schedule_id,
+                            status: ScheduledRunStatus::Error,
+                            response: None,
+                            error: Some(timeout_error.clone()),
+                            started_at: triggered_at,
+                            ended_at,
+                        },
+                    )
+                    .await;
+
+                    let _ = bus
+                        .publish(BusMessage::ScheduledTaskCompleted {
+                            schedule_id,
+                            status: ScheduledRunStatus::Error,
+                            error: Some(timeout_error),
+                            started_at: triggered_at,
+                            ended_at,
+                            delivery_status: delivery_outcome.status,
+                            delivery_error: delivery_outcome.error,
+                            response: None,
+                        })
+                        .await;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1111,6 +1163,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         let out = gw.handle_inbound(inbound).await.unwrap();
         assert!(out.text.contains("stub:anthropic:claude-sonnet-4-5"));
@@ -1133,6 +1186,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-main");
     }
@@ -1163,6 +1217,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-builder");
     }
@@ -1226,6 +1281,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-dm");
     }
@@ -1256,6 +1312,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-main");
     }
@@ -1286,6 +1343,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-group");
     }
@@ -1311,6 +1369,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let first = gw.handle_inbound(make_inbound()).await;
@@ -1338,6 +1397,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let expected_trace = inbound.trace_id;
@@ -1401,6 +1461,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let out = gw.handle_inbound(inbound).await.unwrap();
@@ -1428,6 +1489,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
 
         let out = gw.handle_inbound(inbound).await.unwrap();
@@ -1467,6 +1529,7 @@ mod tests {
             message_id: None,
             attachments: vec![],
             group_context: None,
+            message_source: None,
         };
         assert_eq!(gw.resolve_agent(&inbound), "clawhive-main");
     }
