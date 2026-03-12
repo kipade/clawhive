@@ -187,7 +187,7 @@ impl Gateway {
         self.routing.default_agent_id.clone()
     }
 
-    async fn handle_inbound_for_agent(
+    pub async fn handle_inbound_for_agent(
         &self,
         inbound: InboundMessage,
         agent_id: &str,
@@ -1171,6 +1171,7 @@ mod tests {
                 pattern: Some("@mybot".into()),
             },
             agent_id: "clawhive-builder".into(),
+            delivery: None,
         });
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
@@ -1235,6 +1236,7 @@ mod tests {
                 pattern: None,
             },
             agent_id: "clawhive-dm".into(),
+            delivery: None,
         });
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
@@ -1266,6 +1268,7 @@ mod tests {
                 pattern: None,
             },
             agent_id: "clawhive-dm".into(),
+            delivery: None,
         });
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
@@ -1297,6 +1300,7 @@ mod tests {
                 pattern: None,
             },
             agent_id: "clawhive-group".into(),
+            delivery: None,
         });
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
@@ -1483,6 +1487,7 @@ mod tests {
                 pattern: None,
             },
             agent_id: "clawhive-other".into(),
+            delivery: None,
         });
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),

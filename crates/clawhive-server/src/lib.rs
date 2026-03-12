@@ -1,6 +1,7 @@
 pub mod frontend;
 pub mod routes;
 pub mod state;
+pub mod webhook_auth;
 
 use anyhow::Result;
 use axum::{
@@ -29,6 +30,7 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .nest("/api", routes::api_router())
+        .nest("/hook", routes::webhook::webhook_router())
         .fallback(frontend::frontend_handler)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -40,6 +42,10 @@ pub fn create_router(state: AppState) -> Router {
 }
 
 fn is_exempt_path(path: &str, state: &AppState) -> bool {
+    if path.starts_with("/hook/") {
+        return true;
+    }
+
     // Setup status and auth endpoints are always exempt
     if path.starts_with("/api/setup")
         || path == "/api/auth/status"
@@ -241,6 +247,8 @@ mod tests {
                 enable_openai_oauth_callback_listener: true,
                 daemon_mode: false,
                 port: 3000,
+                webhook_config: Arc::new(std::sync::RwLock::new(None)),
+                routing_config: Arc::new(std::sync::RwLock::new(None)),
             },
             tmp,
         )
