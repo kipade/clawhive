@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use arc_swap::ArcSwap;
 use clawhive_bus::BusPublisher;
 use clawhive_memory::embedding::EmbeddingProvider;
 use clawhive_memory::file_store::MemoryFileStore;
@@ -48,7 +49,7 @@ pub struct Orchestrator {
     session_locks: super::session_lock::SessionLockManager,
     context_manager: super::context::ContextManager,
     hook_registry: super::hooks::HookRegistry,
-    skill_registry: SkillRegistry,
+    skill_registry: ArcSwap<SkillRegistry>,
     skills_root: std::path::PathBuf,
     #[allow(dead_code)]
     memory: Arc<MemoryStore>,
@@ -287,6 +288,8 @@ impl Orchestrator {
         };
         let workspaces = AgentWorkspaceManager::new(agent_workspace_map, default_state);
 
+        let skills_root = workspace_root.join("skills");
+        let skill_registry = ArcSwap::from_pointee(skill_registry);
         let tool_registry = register_default_tools(
             workspaces.file_store("__default__"),
             workspaces.search_index("__default__"),
@@ -313,7 +316,7 @@ impl Orchestrator {
                 super::context::ContextConfig::default(),
             ),
             hook_registry: super::hooks::HookRegistry::new(),
-            skills_root: workspace_root.join("skills"),
+            skills_root,
             skill_registry,
             memory,
             bus,
@@ -499,6 +502,7 @@ impl Orchestrator {
             &report,
             true,
         )?;
+        self.reload_skills();
 
         let text = format!(
             "Installed skill '{}' to {} (findings: {}, high-risk: {}).",
@@ -528,14 +532,27 @@ impl Orchestrator {
         self.workspaces.access_gate(agent_id)
     }
 
-    fn active_skill_registry(&self) -> SkillRegistry {
-        SkillRegistry::load_from_dir(&self.skills_root).unwrap_or_else(|e| {
-            tracing::warn!(
-                "Failed to reload skills from {}: {e}",
-                self.skills_root.display()
-            );
-            self.skill_registry.clone()
-        })
+    fn active_skill_registry(&self) -> Arc<SkillRegistry> {
+        self.skill_registry.load_full()
+    }
+
+    pub fn reload_skills(&self) {
+        match SkillRegistry::load_from_dir(&self.skills_root) {
+            Ok(registry) => {
+                self.skill_registry.store(Arc::new(registry));
+                tracing::info!(
+                    skills_root = %self.skills_root.display(),
+                    "skill registry reloaded"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    skills_root = %self.skills_root.display(),
+                    error = %e,
+                    "failed to reload skill registry, keeping cached version"
+                );
+            }
+        }
     }
 
     fn forced_skill_names(input: &str) -> Option<Vec<String>> {
@@ -1611,6 +1628,7 @@ impl Orchestrator {
                 ),
             }
             .with_recent_messages(recent_messages);
+            let ctx = ctx.with_skill_registry(self.active_skill_registry());
             let ctx = if let Some((ref ch, ref co, ref cv, ref us)) = source_info {
                 ctx.with_source(ch.clone(), co.clone(), cv.clone())
                     .with_source_user_scope(us.clone())
@@ -2008,9 +2026,7 @@ fn register_default_tools(
     registry.register(Box::new(WebFetchTool::new()));
     registry.register(Box::new(ImageTool::new()));
     registry.register(Box::new(ScheduleTool::new(schedule_manager)));
-    registry.register(Box::new(crate::skill_tool::SkillTool::new(
-        workspace_root.join("skills"),
-    )));
+    registry.register(Box::new(crate::skill_tool::SkillTool::new()));
     registry.register(Box::new(crate::message_tool::MessageTool::new(bus.clone())));
     if let Some(api_key) = brave_api_key {
         if !api_key.is_empty() {
