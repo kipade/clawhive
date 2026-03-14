@@ -1,10 +1,12 @@
-use clawhive_auth::oauth::{OpenAiOAuthConfig, OPENAI_OAUTH_CLIENT_ID};
-use clawhive_core::config::{RoutingConfig, WebhookChannelConfig};
-use clawhive_gateway::Gateway;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+
+use clawhive_auth::oauth::{OpenAiOAuthConfig, OPENAI_OAUTH_CLIENT_ID};
+use clawhive_core::config::{RoutingConfig, WebhookChannelConfig};
+use clawhive_gateway::Gateway;
+use clawhive_scheduler::ScheduleManager;
 
 #[derive(Debug, Clone)]
 pub struct PendingOpenAiOAuth {
@@ -43,6 +45,8 @@ pub struct AppState {
     pub webhook_config: Arc<RwLock<Option<WebhookChannelConfig>>>,
     /// Cached routing config (loaded at startup).
     pub routing_config: Arc<RwLock<Option<RoutingConfig>>>,
+    /// Shared schedule manager for schedule API routes.
+    pub schedule_manager: Option<Arc<ScheduleManager>>,
 }
 
 impl AppState {

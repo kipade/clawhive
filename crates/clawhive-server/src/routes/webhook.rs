@@ -222,6 +222,7 @@ bindings: []
             port: 8848,
             webhook_config: Arc::new(RwLock::new(None)),
             routing_config: Arc::new(RwLock::new(None)),
+            schedule_manager: None,
         };
         state.load_webhook_config_from_disk();
         state.load_routing_config_from_disk();

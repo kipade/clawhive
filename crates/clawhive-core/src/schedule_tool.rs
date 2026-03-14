@@ -555,27 +555,27 @@ mod tests {
     use super::ScheduleTool;
     use crate::tool::{ConversationMessage, ToolContext, ToolExecutor};
 
-    fn setup() -> (
+    async fn setup() -> (
         Arc<clawhive_scheduler::ScheduleManager>,
         Arc<EventBus>,
         TempDir,
     ) {
         let tmp = TempDir::new().unwrap();
-        let config_dir = tmp.path().join("config/schedules.d");
-        let data_dir = tmp.path().join("data/schedules");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = tmp.path().join("data/scheduler.db");
 
         let bus = Arc::new(EventBus::new(16));
+        let store = clawhive_scheduler::SqliteStore::open(&db_path).unwrap();
         let manager = Arc::new(
-            clawhive_scheduler::ScheduleManager::new(&config_dir, &data_dir, bus.clone()).unwrap(),
+            clawhive_scheduler::ScheduleManager::new(store, bus.clone())
+                .await
+                .unwrap(),
         );
         (manager, bus, tmp)
     }
 
     #[tokio::test]
     async fn add_action_supports_context_injection() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         let tool = ScheduleTool::new(manager.clone());
         let ctx = ToolContext::builtin().with_recent_messages(vec![
             ConversationMessage {
@@ -622,7 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_action_returns_payload_and_delivery_details() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         let tool = ScheduleTool::new(manager.clone());
         let ctx = ToolContext::builtin();
 
@@ -676,7 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_action_with_payload_direct_deliver() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         let tool = ScheduleTool::new(manager.clone());
         let ctx = ToolContext::builtin();
 
@@ -705,7 +705,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_action_with_payload_agent_turn() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         let tool = ScheduleTool::new(manager.clone());
         let ctx = ToolContext::builtin();
 
@@ -735,7 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_action_requires_payload() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         let tool = ScheduleTool::new(manager.clone());
         let ctx = ToolContext::builtin();
 
@@ -759,7 +759,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_action_returns_json_summary() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         manager
             .add_schedule(clawhive_scheduler::ScheduleConfig {
                 schedule_id: "daily-report".to_string(),
@@ -804,7 +804,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_action_exposes_payload_hints_without_full_payload_by_default() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         manager
             .add_schedule(clawhive_scheduler::ScheduleConfig {
                 schedule_id: "daily-digest".to_string(),
@@ -847,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_action_can_include_payload_preview_when_requested() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         manager
             .add_schedule(clawhive_scheduler::ScheduleConfig {
                 schedule_id: "payload-preview".to_string(),
@@ -891,7 +891,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_action_publishes_trigger_event() {
-        let (manager, bus, _tmp) = setup();
+        let (manager, bus, _tmp) = setup().await;
         let tool = ScheduleTool::new(manager.clone());
         let ctx = ToolContext::builtin();
 
@@ -936,7 +936,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_action_deletes_schedule() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         let tool = ScheduleTool::new(manager.clone());
         let ctx = ToolContext::builtin();
 
@@ -977,7 +977,7 @@ mod tests {
 
     #[tokio::test]
     async fn at_schedule_converts_relative_to_absolute_and_defaults_delete_after_run() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         let tool = ScheduleTool::new(manager.clone());
         let ctx = ToolContext::builtin();
 
@@ -1030,7 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_action_captures_source_user_scope() {
-        let (manager, _bus, _tmp) = setup();
+        let (manager, _bus, _tmp) = setup().await;
         let tool = ScheduleTool::new(manager.clone());
         let ctx = ToolContext::builtin()
             .with_source(

@@ -287,6 +287,7 @@ mod tests {
                 port: 3000,
                 webhook_config: Arc::new(std::sync::RwLock::new(None)),
                 routing_config: Arc::new(std::sync::RwLock::new(None)),
+                schedule_manager: None,
             },
             tmp,
         )
@@ -549,17 +550,33 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_run_allows_internal_cli_token_without_cookie() {
-        let (state, tmp) = setup_state(Some(hash_password("correct")));
+        let (mut state, tmp) = setup_state(Some(hash_password("correct")));
 
-        std::fs::create_dir_all(tmp.path().join("config/schedules.d")).unwrap();
-        std::fs::create_dir_all(tmp.path().join("data/schedules")).unwrap();
         std::fs::create_dir_all(tmp.path().join("data")).unwrap();
-        std::fs::write(
-            tmp.path().join("config/schedules.d/daily.yaml"),
-            "schedule_id: daily\nenabled: true\nname: Daily\nschedule:\n  kind: every\n  interval_ms: 60000\nagent_id: clawhive-main\nsession_mode: isolated\npayload:\n  kind: direct_deliver\n  text: test\n",
-        )
-        .unwrap();
-        std::fs::write(tmp.path().join("data/schedules/state.json"), "{}").unwrap();
+
+        let store =
+            clawhive_scheduler::SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap();
+        let config = clawhive_scheduler::ScheduleConfig {
+            schedule_id: "daily".to_string(),
+            enabled: true,
+            name: "Daily".to_string(),
+            schedule: clawhive_scheduler::ScheduleType::Every {
+                interval_ms: 60_000,
+                anchor_ms: None,
+            },
+            agent_id: "clawhive-main".to_string(),
+            payload: Some(clawhive_scheduler::TaskPayload::DirectDeliver {
+                text: "test".to_string(),
+            }),
+            ..Default::default()
+        };
+        store.save_schedule_config(&config).await.unwrap();
+        let manager = Arc::new(
+            clawhive_scheduler::ScheduleManager::new(store, Arc::clone(&state.bus))
+                .await
+                .unwrap(),
+        );
+        state.schedule_manager = Some(manager);
 
         let token = "test-internal-token";
         std::fs::write(tmp.path().join("data/cli_internal_token"), token).unwrap();

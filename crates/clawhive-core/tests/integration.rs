@@ -14,7 +14,7 @@ use clawhive_provider::{
     ProviderRegistry,
 };
 use clawhive_runtime::NativeExecutor;
-use clawhive_scheduler::ScheduleManager;
+use clawhive_scheduler::{ScheduleManager, SqliteStore};
 use clawhive_schema::{BusMessage, InboundMessage, SessionKey};
 use uuid::Uuid;
 
@@ -141,7 +141,7 @@ fn test_full_agent(agent_id: &str, primary: &str, fallbacks: Vec<&str>) -> FullA
     }
 }
 
-fn make_orchestrator(
+async fn make_orchestrator(
     registry: ProviderRegistry,
     aliases: HashMap<String, String>,
     agents: Vec<FullAgentConfig>,
@@ -153,10 +153,10 @@ fn make_orchestrator(
     let publisher = bus.publisher();
     let schedule_manager = Arc::new(
         ScheduleManager::new(
-            &tmp.path().join("config/schedules.d"),
-            &tmp.path().join("data/schedules"),
+            SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
             Arc::new(EventBus::new(16)),
         )
+        .await
         .unwrap(),
     );
     (
@@ -194,10 +194,10 @@ async fn orchestrator_uses_search_index_for_memory_context() {
     let search_index = SearchIndex::new(memory.db());
     let schedule_manager = Arc::new(
         ScheduleManager::new(
-            &tmp.path().join("config/schedules.d"),
-            &tmp.path().join("data/schedules"),
+            SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
             Arc::new(EventBus::new(16)),
         )
+        .await
         .unwrap(),
     );
     let memory_text = "# Plans\n\ncobalt migration architecture details";
@@ -298,7 +298,7 @@ async fn orchestrator_handles_inbound_to_outbound() {
         "anthropic/claude-sonnet-4-5".to_string(),
     )]);
     let agents = vec![test_full_agent("clawhive-main", "sonnet", vec![])];
-    let (orch, _tmp) = make_orchestrator(registry, aliases, agents);
+    let (orch, _tmp) = make_orchestrator(registry, aliases, agents).await;
 
     let out = orch
         .handle_inbound(test_inbound("hello"), "clawhive-main")
@@ -314,7 +314,7 @@ async fn tool_use_loop_returns_directly_without_tool_calls() {
 
     let aliases = HashMap::from([("echo".to_string(), "echo/model".to_string())]);
     let agents = vec![test_full_agent("clawhive-main", "echo", vec![])];
-    let (orch, _tmp) = make_orchestrator(registry, aliases, agents);
+    let (orch, _tmp) = make_orchestrator(registry, aliases, agents).await;
 
     let out = orch
         .handle_inbound(test_inbound("loop"), "clawhive-main")
@@ -332,7 +332,7 @@ async fn orchestrator_new_with_full_deps() {
         "anthropic/claude-sonnet-4-5".to_string(),
     )]);
     let agents = vec![test_full_agent("clawhive-main", "sonnet", vec![])];
-    let (orch, _tmp) = make_orchestrator(registry, aliases, agents);
+    let (orch, _tmp) = make_orchestrator(registry, aliases, agents).await;
 
     let out = orch
         .handle_inbound(test_inbound("hello"), "clawhive-main")
@@ -356,10 +356,10 @@ async fn orchestrator_creates_session() {
     let tmp = tempfile::TempDir::new().unwrap();
     let schedule_manager = Arc::new(
         ScheduleManager::new(
-            &tmp.path().join("config/schedules.d"),
-            &tmp.path().join("data/schedules"),
+            SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
             Arc::new(EventBus::new(16)),
         )
+        .await
         .unwrap(),
     );
     let orch = OrchestratorBuilder::new(
@@ -402,7 +402,7 @@ async fn orchestrator_unknown_agent_returns_error() {
         "anthropic/claude-sonnet-4-5".to_string(),
     )]);
     let agents = vec![test_full_agent("clawhive-main", "sonnet", vec![])];
-    let (orch, _tmp) = make_orchestrator(registry, aliases, agents);
+    let (orch, _tmp) = make_orchestrator(registry, aliases, agents).await;
 
     let err = orch
         .handle_inbound(test_inbound("hello"), "nonexistent-agent")
@@ -421,7 +421,7 @@ async fn orchestrator_disabled_agent_still_reachable() {
     )]);
     let mut agent = test_full_agent("clawhive-main", "sonnet", vec![]);
     agent.enabled = false;
-    let (orch, _tmp) = make_orchestrator(registry, aliases, vec![agent]);
+    let (orch, _tmp) = make_orchestrator(registry, aliases, vec![agent]).await;
 
     let out = orch
         .handle_inbound(test_inbound("hello"), "clawhive-main")
@@ -446,10 +446,10 @@ async fn orchestrator_publishes_reply_ready() {
     let tmp = tempfile::TempDir::new().unwrap();
     let schedule_manager = Arc::new(
         ScheduleManager::new(
-            &tmp.path().join("config/schedules.d"),
-            &tmp.path().join("data/schedules"),
+            SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
             Arc::new(EventBus::new(16)),
         )
+        .await
         .unwrap(),
     );
     let orch = OrchestratorBuilder::new(
@@ -484,7 +484,7 @@ async fn handle_inbound_stream_yields_chunks() {
     registry.register("stub", Arc::new(StubProvider));
     let aliases = HashMap::from([("stub".to_string(), "stub/model".to_string())]);
     let agents = vec![test_full_agent("clawhive-main", "stub", vec![])];
-    let (orch, _tmp) = make_orchestrator(registry, aliases, agents);
+    let (orch, _tmp) = make_orchestrator(registry, aliases, agents).await;
 
     let inbound = test_inbound("hello stream");
     let mut stream = orch

@@ -9,7 +9,7 @@ use clawhive_core::{
 use clawhive_memory::MemoryStore;
 use clawhive_provider::ProviderRegistry;
 use clawhive_runtime::NativeExecutor;
-use clawhive_scheduler::ScheduleManager;
+use clawhive_scheduler::{ScheduleManager, SqliteStore};
 use clawhive_schema::InboundMessage;
 use uuid::Uuid;
 
@@ -53,16 +53,16 @@ fn test_full_agent() -> FullAgentConfig {
     }
 }
 
-fn make_orchestrator() -> (Orchestrator, tempfile::TempDir) {
+async fn make_orchestrator() -> (Orchestrator, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().unwrap();
     let router = LlmRouter::new(ProviderRegistry::new(), HashMap::new(), vec![]);
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let schedule_manager = Arc::new(
         ScheduleManager::new(
-            &tmp.path().join("config/schedules.d"),
-            &tmp.path().join("data/schedules"),
+            SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
             Arc::new(EventBus::new(16)),
         )
+        .await
         .unwrap(),
     );
 
@@ -112,7 +112,7 @@ fn detects_english_install_this_skill_with_url() {
 
 #[tokio::test]
 async fn no_source_returns_usage_hint_without_side_effects() {
-    let (orchestrator, tmp) = make_orchestrator();
+    let (orchestrator, tmp) = make_orchestrator().await;
     let out = orchestrator
         .handle_inbound(test_inbound("install skill"), "clawhive-main")
         .await
@@ -133,7 +133,7 @@ fn normal_messages_are_not_detected() {
 
 #[tokio::test]
 async fn detected_nl_install_routes_to_analyze_flow() {
-    let (orchestrator, tmp) = make_orchestrator();
+    let (orchestrator, tmp) = make_orchestrator().await;
     let source = create_skill(tmp.path(), "nl-bridge-skill");
     let msg = format!("install skill from {}", source.display());
 

@@ -10,7 +10,7 @@ use clawhive_core::{
 use clawhive_memory::MemoryStore;
 use clawhive_provider::ProviderRegistry;
 use clawhive_runtime::NativeExecutor;
-use clawhive_scheduler::ScheduleManager;
+use clawhive_scheduler::{ScheduleManager, SqliteStore};
 use clawhive_schema::{ApprovalDecision, BusMessage, InboundMessage};
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -55,7 +55,7 @@ fn test_full_agent() -> FullAgentConfig {
     }
 }
 
-fn make_orchestrator(
+async fn make_orchestrator(
     approval_registry: Option<Arc<ApprovalRegistry>>,
 ) -> (Arc<Orchestrator>, tempfile::TempDir, Arc<EventBus>) {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -64,10 +64,10 @@ fn make_orchestrator(
     let bus = Arc::new(EventBus::new(16));
     let schedule_manager = Arc::new(
         ScheduleManager::new(
-            &tmp.path().join("config/schedules.d"),
-            &tmp.path().join("data/schedules"),
+            SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
             Arc::new(EventBus::new(16)),
         )
+        .await
         .unwrap(),
     );
     let mut builder = OrchestratorBuilder::new(
@@ -128,7 +128,7 @@ async fn request_install_token(orch: &Orchestrator, source: &std::path::Path) ->
 
 #[tokio::test]
 async fn default_policy_allows_any_user_scope_to_install() {
-    let (orch, tmp, _bus) = make_orchestrator(None);
+    let (orch, tmp, _bus) = make_orchestrator(None).await;
     let skill_source = create_skill(tmp.path(), "default-policy-skill", false);
     let token = request_install_token(&orch, &skill_source).await;
 
@@ -147,7 +147,7 @@ async fn default_policy_allows_any_user_scope_to_install() {
 #[tokio::test]
 async fn high_risk_confirm_registers_pending_and_waits_for_human_decision() {
     let approval = Arc::new(ApprovalRegistry::new());
-    let (orch, tmp, bus) = make_orchestrator(Some(approval.clone()));
+    let (orch, tmp, bus) = make_orchestrator(Some(approval.clone())).await;
     let mut approval_rx = bus.subscribe(Topic::NeedHumanApproval).await;
     let skill_source = create_skill(tmp.path(), "high-risk-skill-pending", true);
     let token = request_install_token(&orch, &skill_source).await;
@@ -201,7 +201,7 @@ async fn high_risk_confirm_registers_pending_and_waits_for_human_decision() {
 #[tokio::test]
 async fn denied_human_approval_blocks_high_risk_install() {
     let approval = Arc::new(ApprovalRegistry::new());
-    let (orch, tmp, bus) = make_orchestrator(Some(approval.clone()));
+    let (orch, tmp, bus) = make_orchestrator(Some(approval.clone())).await;
     let mut approval_rx = bus.subscribe(Topic::NeedHumanApproval).await;
     let skill_source = create_skill(tmp.path(), "high-risk-skill-deny", true);
     let token = request_install_token(&orch, &skill_source).await;
@@ -237,7 +237,7 @@ async fn denied_human_approval_blocks_high_risk_install() {
 #[tokio::test]
 async fn allow_once_human_approval_allows_high_risk_install() {
     let approval = Arc::new(ApprovalRegistry::new());
-    let (orch, tmp, bus) = make_orchestrator(Some(approval.clone()));
+    let (orch, tmp, bus) = make_orchestrator(Some(approval.clone())).await;
     let mut approval_rx = bus.subscribe(Topic::NeedHumanApproval).await;
     let skill_source = create_skill(tmp.path(), "high-risk-skill-allow", true);
     let token = request_install_token(&orch, &skill_source).await;

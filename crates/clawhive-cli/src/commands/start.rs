@@ -390,6 +390,7 @@ async fn start_bot(
         port,
         webhook_config: Arc::new(RwLock::new(None)),
         routing_config: Arc::new(RwLock::new(None)),
+        schedule_manager: Some(Arc::clone(&schedule_manager)),
     };
     http_state.load_webhook_config_from_disk();
     http_state.load_routing_config_from_disk();

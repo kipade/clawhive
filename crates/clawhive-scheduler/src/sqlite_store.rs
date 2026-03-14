@@ -3,11 +3,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex;
 
-use crate::{RunRecord, RunStatus, ScheduleState, WaitTask, WaitTaskStatus};
+use crate::{
+    DeliveryConfig, RunRecord, RunStatus, ScheduleConfig, ScheduleState, ScheduleType, SessionMode,
+    TaskPayload, WaitTask, WaitTaskStatus,
+};
 
 /// SQLite store for scheduler persistence
 pub struct SqliteStore {
@@ -108,6 +111,124 @@ impl SqliteStore {
             [schedule_id],
         )?;
         Ok(())
+    }
+
+    pub async fn save_schedule_config(&self, config: &ScheduleConfig) -> Result<()> {
+        let conn = self.conn.lock().await;
+        let (schedule_kind, schedule_expr, schedule_tz) =
+            serialize_schedule_type(&config.schedule)?;
+        let payload_json = config
+            .payload
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let delivery_json = serde_json::to_string(&config.delivery)?;
+
+        conn.execute(
+            r#"INSERT OR REPLACE INTO schedule_configs
+               (schedule_id, enabled, name, description, schedule_kind, schedule_expr,
+                schedule_tz, agent_id, session_mode, payload_json, timeout_seconds,
+                delete_after_run, delivery_json, created_at, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                       COALESCE((SELECT created_at FROM schedule_configs WHERE schedule_id = ?1), datetime('now')),
+                       datetime('now'))"#,
+            params![
+                config.schedule_id,
+                config.enabled as i64,
+                config.name,
+                config.description,
+                schedule_kind,
+                schedule_expr,
+                schedule_tz,
+                config.agent_id,
+                format_session_mode(&config.session_mode),
+                payload_json,
+                config.timeout_seconds as i64,
+                config.delete_after_run as i64,
+                delivery_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub async fn load_schedule_configs(&self) -> Result<Vec<ScheduleConfig>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            r#"SELECT schedule_id, enabled, name, description, schedule_kind, schedule_expr,
+                      schedule_tz, agent_id, session_mode, payload_json, timeout_seconds,
+                      delete_after_run, delivery_json
+               FROM schedule_configs
+               ORDER BY schedule_id"#,
+        )?;
+
+        let rows = stmt.query_map([], Self::row_to_schedule_config)?;
+        let mut configs = Vec::new();
+        for row in rows {
+            configs.push(row?);
+        }
+        Ok(configs)
+    }
+
+    pub async fn get_schedule_config(&self, schedule_id: &str) -> Result<Option<ScheduleConfig>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            r#"SELECT schedule_id, enabled, name, description, schedule_kind, schedule_expr,
+                      schedule_tz, agent_id, session_mode, payload_json, timeout_seconds,
+                      delete_after_run, delivery_json
+               FROM schedule_configs
+               WHERE schedule_id = ?1"#,
+        )?;
+
+        let config = stmt
+            .query_row([schedule_id], Self::row_to_schedule_config)
+            .optional()?;
+        Ok(config)
+    }
+
+    pub async fn delete_schedule_config(&self, schedule_id: &str) -> Result<()> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM schedule_configs WHERE schedule_id = ?1",
+            [schedule_id],
+        )?;
+        Ok(())
+    }
+
+    fn row_to_schedule_config(row: &rusqlite::Row) -> rusqlite::Result<ScheduleConfig> {
+        let schedule_kind: String = row.get(4)?;
+        let schedule_expr: String = row.get(5)?;
+        let schedule_tz: String = row.get(6)?;
+        let session_mode: String = row.get(8)?;
+        let payload_json: Option<String> = row.get(9)?;
+        let delivery_json: Option<String> = row.get(12)?;
+
+        let schedule = deserialize_schedule_type(&schedule_kind, &schedule_expr, &schedule_tz)
+            .map_err(to_from_sql_error)?;
+        let payload = payload_json
+            .as_deref()
+            .map(serde_json::from_str::<TaskPayload>)
+            .transpose()
+            .map_err(to_from_sql_error)?;
+        let delivery = delivery_json
+            .as_deref()
+            .map(serde_json::from_str::<DeliveryConfig>)
+            .transpose()
+            .map_err(to_from_sql_error)?
+            .unwrap_or_default();
+
+        Ok(ScheduleConfig {
+            schedule_id: row.get(0)?,
+            enabled: row.get::<_, i64>(1)? != 0,
+            name: row.get(2)?,
+            description: row.get(3)?,
+            schedule,
+            agent_id: row.get(7)?,
+            session_mode: parse_session_mode(&session_mode),
+            payload,
+            timeout_seconds: row.get::<_, i64>(10)? as u64,
+            delete_after_run: row.get::<_, i64>(11)? != 0,
+            delivery,
+        })
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -409,6 +530,28 @@ fn run_migrations(conn: &mut Connection) -> Result<()> {
             ALTER TABLE run_history ADD COLUMN session_key TEXT;
             "#,
         ),
+        (
+            5,
+            r#"
+            CREATE TABLE IF NOT EXISTS schedule_configs (
+                schedule_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                name TEXT NOT NULL,
+                description TEXT,
+                schedule_kind TEXT NOT NULL,
+                schedule_expr TEXT NOT NULL,
+                schedule_tz TEXT NOT NULL DEFAULT 'UTC',
+                agent_id TEXT NOT NULL,
+                session_mode TEXT NOT NULL DEFAULT 'isolated',
+                payload_json TEXT,
+                timeout_seconds INTEGER NOT NULL DEFAULT 300,
+                delete_after_run INTEGER NOT NULL DEFAULT 0,
+                delivery_json TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            "#,
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -487,11 +630,129 @@ fn parse_delivery_status(s: &str) -> crate::DeliveryStatus {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EveryScheduleExpr {
+    interval_ms: u64,
+    anchor_ms: u64,
+}
+
+fn serialize_schedule_type(schedule: &ScheduleType) -> Result<(String, String, String)> {
+    match schedule {
+        ScheduleType::Cron { expr, tz } => Ok(("cron".into(), expr.clone(), tz.clone())),
+        ScheduleType::At { at } => Ok(("at".into(), at.clone(), "UTC".into())),
+        ScheduleType::Every {
+            interval_ms,
+            anchor_ms,
+        } => {
+            let expr = match anchor_ms {
+                Some(anchor_ms) => serde_json::to_string(&EveryScheduleExpr {
+                    interval_ms: *interval_ms,
+                    anchor_ms: *anchor_ms,
+                })?,
+                None => interval_ms.to_string(),
+            };
+            Ok(("every".into(), expr, "UTC".into()))
+        }
+    }
+}
+
+fn deserialize_schedule_type(kind: &str, expr: &str, tz: &str) -> Result<ScheduleType> {
+    match kind {
+        "cron" => Ok(ScheduleType::Cron {
+            expr: expr.to_string(),
+            tz: tz.to_string(),
+        }),
+        "at" => Ok(ScheduleType::At {
+            at: expr.to_string(),
+        }),
+        "every" => {
+            if expr.trim_start().starts_with('{') {
+                let payload: EveryScheduleExpr = serde_json::from_str(expr)?;
+                Ok(ScheduleType::Every {
+                    interval_ms: payload.interval_ms,
+                    anchor_ms: Some(payload.anchor_ms),
+                })
+            } else {
+                Ok(ScheduleType::Every {
+                    interval_ms: expr.parse()?,
+                    anchor_ms: None,
+                })
+            }
+        }
+        other => Err(anyhow!("unknown schedule kind: {other}")),
+    }
+}
+
+fn format_session_mode(mode: &SessionMode) -> &'static str {
+    match mode {
+        SessionMode::Isolated => "isolated",
+        SessionMode::Main => "main",
+    }
+}
+
+fn parse_session_mode(value: &str) -> SessionMode {
+    match value {
+        "main" => SessionMode::Main,
+        _ => SessionMode::Isolated,
+    }
+}
+
+fn to_from_sql_error<E>(error: E) -> rusqlite::Error
+where
+    E: std::fmt::Display,
+{
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::other(error.to_string())),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DeliveryStatus;
+    use crate::{
+        DeliveryConfig, DeliveryMode, DeliveryStatus, FailureDestination, ScheduleConfig,
+        ScheduleType, SessionMode, TaskPayload,
+    };
     use tempfile::TempDir;
+
+    fn sample_config(schedule: ScheduleType) -> ScheduleConfig {
+        ScheduleConfig {
+            schedule_id: "schedule-1".into(),
+            enabled: true,
+            name: "Daily summary".into(),
+            description: Some("Send daily summary".into()),
+            schedule,
+            agent_id: "clawhive-main".into(),
+            session_mode: SessionMode::Main,
+            payload: Some(TaskPayload::AgentTurn {
+                message: "Summarize status".into(),
+                model: Some("openai/gpt-5".into()),
+                thinking: Some("low".into()),
+                timeout_seconds: 45,
+                light_context: true,
+            }),
+            timeout_seconds: 120,
+            delete_after_run: false,
+            delivery: DeliveryConfig {
+                mode: DeliveryMode::Webhook,
+                channel: Some("discord".into()),
+                connector_id: Some("discord-main".into()),
+                source_channel_type: Some("discord".into()),
+                source_connector_id: Some("discord-main".into()),
+                source_conversation_scope: Some("guild:1:channel:2".into()),
+                source_user_scope: Some("user:3".into()),
+                webhook_url: Some("https://example.com/hook".into()),
+                failure_destination: Some(FailureDestination {
+                    channel: Some("telegram".into()),
+                    connector_id: Some("telegram-main".into()),
+                    conversation_scope: Some("chat:42".into()),
+                }),
+                best_effort: true,
+            },
+        }
+    }
 
     #[tokio::test]
     async fn test_wait_task_crud() {
@@ -542,5 +803,136 @@ mod tests {
             loaded[0].last_delivery_status,
             Some(DeliveryStatus::Delivered)
         );
+    }
+
+    #[tokio::test]
+    async fn migration_creates_schedule_configs_table() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.db");
+        let _store = SqliteStore::open(&db_path).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+
+        let exists = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                ["schedule_configs"],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+
+        assert_eq!(exists, 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_config_crud() {
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteStore::open(&tmp.path().join("test.db")).unwrap();
+
+        let mut config = sample_config(ScheduleType::Cron {
+            expr: "0 9 * * *".into(),
+            tz: "Asia/Shanghai".into(),
+        });
+
+        store.save_schedule_config(&config).await.unwrap();
+
+        let loaded = store.load_schedule_configs().await.unwrap();
+        assert_eq!(loaded, vec![config.clone()]);
+
+        config.enabled = false;
+        config.name = "Updated daily summary".into();
+        config.description = None;
+        config.session_mode = SessionMode::Isolated;
+        config.payload = Some(TaskPayload::DirectDeliver {
+            text: "Updated reminder".into(),
+        });
+        config.timeout_seconds = 300;
+        config.delete_after_run = true;
+        config.delivery = DeliveryConfig::default();
+
+        store.save_schedule_config(&config).await.unwrap();
+
+        let updated = store
+            .get_schedule_config(&config.schedule_id)
+            .await
+            .unwrap();
+        assert_eq!(updated, Some(config.clone()));
+
+        store
+            .delete_schedule_config(&config.schedule_id)
+            .await
+            .unwrap();
+        assert!(store
+            .get_schedule_config(&config.schedule_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.load_schedule_configs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_config_get_by_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteStore::open(&tmp.path().join("test.db")).unwrap();
+        let config = sample_config(ScheduleType::At {
+            at: "2026-01-01T00:00:00Z".into(),
+        });
+
+        store.save_schedule_config(&config).await.unwrap();
+
+        let found = store.get_schedule_config("schedule-1").await.unwrap();
+        assert_eq!(found, Some(config));
+
+        let missing = store.get_schedule_config("missing").await.unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_config_roundtrip_all_schedule_types() {
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteStore::open(&tmp.path().join("test.db")).unwrap();
+        let configs = vec![
+            sample_config(ScheduleType::Cron {
+                expr: "*/15 * * * *".into(),
+                tz: "Europe/Berlin".into(),
+            }),
+            ScheduleConfig {
+                schedule_id: "schedule-2".into(),
+                schedule: ScheduleType::At {
+                    at: "2026-02-03T04:05:06Z".into(),
+                },
+                payload: Some(TaskPayload::SystemEvent {
+                    text: "Wake up".into(),
+                }),
+                ..sample_config(ScheduleType::At {
+                    at: "2026-01-01T00:00:00Z".into(),
+                })
+            },
+            ScheduleConfig {
+                schedule_id: "schedule-3".into(),
+                schedule: ScheduleType::Every {
+                    interval_ms: 5_000,
+                    anchor_ms: Some(1_000),
+                },
+                payload: Some(TaskPayload::DirectDeliver {
+                    text: "Ping".into(),
+                }),
+                ..sample_config(ScheduleType::Every {
+                    interval_ms: 1_000,
+                    anchor_ms: None,
+                })
+            },
+        ];
+
+        for config in &configs {
+            store.save_schedule_config(config).await.unwrap();
+        }
+
+        let mut loaded = store.load_schedule_configs().await.unwrap();
+        loaded.sort_by(|left, right| left.schedule_id.cmp(&right.schedule_id));
+
+        let mut expected = configs;
+        expected.sort_by(|left, right| left.schedule_id.cmp(&right.schedule_id));
+
+        assert_eq!(loaded, expected);
     }
 }

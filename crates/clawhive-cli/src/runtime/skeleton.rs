@@ -15,7 +15,6 @@ pub(crate) fn ensure_skeleton_config(root: &Path, port: u16) -> Result<()> {
     // Create directory structure
     std::fs::create_dir_all(config_dir.join("agents.d"))?;
     std::fs::create_dir_all(config_dir.join("providers.d"))?;
-    std::fs::create_dir_all(config_dir.join("schedules.d"))?;
 
     // config/main.yaml — channels disabled
     std::fs::write(

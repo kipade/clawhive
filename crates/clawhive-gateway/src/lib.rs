@@ -1019,7 +1019,7 @@ mod tests {
 
     use super::*;
 
-    fn make_gateway() -> (Gateway, tempfile::TempDir) {
+    async fn make_gateway() -> (Gateway, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut registry = ProviderRegistry::new();
         register_builtin_providers(&mut registry);
@@ -1031,13 +1031,12 @@ mod tests {
         let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
         let bus = EventBus::new(16);
         let publisher = bus.publisher();
+        let store =
+            clawhive_scheduler::SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap();
         let schedule_manager = Arc::new(
-            ScheduleManager::new(
-                &tmp.path().join("config/schedules.d"),
-                &tmp.path().join("data/schedules"),
-                Arc::new(EventBus::new(16)),
-            )
-            .unwrap(),
+            ScheduleManager::new(store, Arc::new(EventBus::new(16)))
+                .await
+                .unwrap(),
         );
         let agents = vec![FullAgentConfig {
             agent_id: "clawhive-main".into(),
@@ -1102,10 +1101,11 @@ mod tests {
         let publisher = bus.publisher();
         let schedule_manager = Arc::new(
             ScheduleManager::new(
-                &tmp.path().join("config/schedules.d"),
-                &tmp.path().join("data/schedules"),
+                clawhive_scheduler::SqliteStore::open(&tmp.path().join("data/scheduler.db"))
+                    .unwrap(),
                 Arc::new(EventBus::new(16)),
             )
+            .await
             .unwrap(),
         );
         let agents = vec![FullAgentConfig {
@@ -1154,7 +1154,7 @@ mod tests {
 
     #[tokio::test]
     async fn gateway_e2e_inbound_to_outbound() {
-        let (gw, _tmp) = make_gateway();
+        let (gw, _tmp) = make_gateway().await;
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
             channel_type: "telegram".into(),
@@ -1176,7 +1176,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_agent_default() {
-        let (gw, _tmp) = make_gateway();
+        let (gw, _tmp) = make_gateway().await;
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
             channel_type: "telegram".into(),
@@ -1197,7 +1197,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_agent_mention_binding() {
-        let (mut gw, _tmp) = make_gateway();
+        let (mut gw, _tmp) = make_gateway().await;
         gw.routing.bindings.push(RoutingBinding {
             channel_type: "telegram".into(),
             connector_id: "tg_main".into(),
@@ -1261,7 +1261,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_agent_dm_binding() {
-        let (mut gw, _tmp) = make_gateway();
+        let (mut gw, _tmp) = make_gateway().await;
         gw.routing.bindings.push(RoutingBinding {
             channel_type: "telegram".into(),
             connector_id: "tg_main".into(),
@@ -1292,7 +1292,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_agent_dm_binding_skips_group() {
-        let (mut gw, _tmp) = make_gateway();
+        let (mut gw, _tmp) = make_gateway().await;
         gw.routing.bindings.push(RoutingBinding {
             channel_type: "telegram".into(),
             connector_id: "tg_main".into(),
@@ -1323,7 +1323,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_agent_group_binding() {
-        let (mut gw, _tmp) = make_gateway();
+        let (mut gw, _tmp) = make_gateway().await;
         gw.routing.bindings.push(RoutingBinding {
             channel_type: "telegram".into(),
             connector_id: "tg_main".into(),
@@ -1354,7 +1354,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_inbound_rejects_when_rate_limited() {
-        let (mut gw, _tmp) = make_gateway();
+        let (mut gw, _tmp) = make_gateway().await;
         gw.rate_limiter = RateLimiter::new(RateLimitConfig {
             requests_per_minute: 60,
             burst: 1,
@@ -1439,7 +1439,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_command_resolves_pending_by_short_id() {
-        let (mut gw, _tmp) = make_gateway();
+        let (mut gw, _tmp) = make_gateway().await;
         let approval_registry = Arc::new(ApprovalRegistry::new());
         gw.approval_registry = Some(approval_registry.clone());
 
@@ -1473,7 +1473,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_command_with_invalid_args_returns_usage() {
-        let (mut gw, _tmp) = make_gateway();
+        let (mut gw, _tmp) = make_gateway().await;
         gw.approval_registry = Some(Arc::new(ApprovalRegistry::new()));
 
         let inbound = InboundMessage {
@@ -1505,7 +1505,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_agent_mismatched_connector_uses_default() {
-        let (mut gw, _tmp) = make_gateway();
+        let (mut gw, _tmp) = make_gateway().await;
         gw.routing.bindings.push(RoutingBinding {
             channel_type: "telegram".into(),
             connector_id: "tg_other".into(),
@@ -1536,7 +1536,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_turn_uses_delivery_source_for_approval() {
-        let (gw, _tmp) = make_gateway();
+        let (gw, _tmp) = make_gateway().await;
         let sched_bus = Arc::new(EventBus::new(16));
         let mut completed_rx = sched_bus.subscribe(Topic::ScheduledTaskCompleted).await;
 
@@ -1595,7 +1595,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_turn_main_mode_reuses_source_conversation_scope() {
-        let (gw, _tmp) = make_gateway();
+        let (gw, _tmp) = make_gateway().await;
         let sched_bus = Arc::new(EventBus::new(16));
         let mut completed_rx = sched_bus.subscribe(Topic::ScheduledTaskCompleted).await;
 
@@ -1659,7 +1659,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_turn_fallback_when_no_delivery_source() {
-        let (gw, _tmp) = make_gateway();
+        let (gw, _tmp) = make_gateway().await;
         let sched_bus = Arc::new(EventBus::new(16));
         let mut completed_rx = sched_bus.subscribe(Topic::ScheduledTaskCompleted).await;
 
@@ -1722,7 +1722,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_turn_main_mode_without_source_uses_stable_schedule_scope() {
-        let (gw, _tmp) = make_gateway();
+        let (gw, _tmp) = make_gateway().await;
         let sched_bus = Arc::new(EventBus::new(16));
         let mut completed_rx = sched_bus.subscribe(Topic::ScheduledTaskCompleted).await;
 
@@ -1780,7 +1780,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_turn_main_mode_without_scope_keeps_real_channel_identity() {
-        let (gw, _tmp) = make_gateway();
+        let (gw, _tmp) = make_gateway().await;
         let sched_bus = Arc::new(EventBus::new(16));
         let mut completed_rx = sched_bus.subscribe(Topic::ScheduledTaskCompleted).await;
 

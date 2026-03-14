@@ -26,7 +26,9 @@ use clawhive_provider::{
     OpenAiChatGptProvider, OpenAiProvider, ProviderRegistry, StreamChunk,
 };
 use clawhive_runtime::NativeExecutor;
-use clawhive_scheduler::{ScheduleManager, ScheduleType, SqliteStore, WaitTaskManager};
+use clawhive_scheduler::{
+    migrate_yaml_to_sqlite, ScheduleManager, ScheduleType, SqliteStore, WaitTaskManager,
+};
 use futures_core::Stream;
 
 pub(crate) fn toggle_agent(
@@ -406,15 +408,23 @@ pub(crate) async fn bootstrap(
         }
     }
     let approval_registry = Arc::new(ApprovalRegistry::with_persistence(new_path));
-    let schedule_manager = Arc::new(ScheduleManager::new(
-        &root.join("config/schedules.d"),
-        &root.join("data/schedules"),
-        Arc::clone(&bus),
-    )?);
-
-    // Initialize SQLite store for wait tasks
     let scheduler_db_path = root.join("data/scheduler.db");
     let sqlite_store = Arc::new(SqliteStore::open(&scheduler_db_path)?);
+    let yaml_schedules_dir = root.join("config/schedules.d");
+    let state_json = root.join("data/schedules/state.json");
+    let history_dir = root.join("data/schedules/runs");
+    migrate_yaml_to_sqlite(
+        &yaml_schedules_dir,
+        &state_json,
+        &history_dir,
+        &sqlite_store,
+    )
+    .await?;
+    let schedule_manager = Arc::new(
+        ScheduleManager::new(SqliteStore::open(&scheduler_db_path)?, Arc::clone(&bus)).await?,
+    );
+
+    // Initialize SQLite store for wait tasks
     let wait_task_manager = Arc::new(WaitTaskManager::new(
         Arc::clone(&sqlite_store),
         Arc::clone(&bus),

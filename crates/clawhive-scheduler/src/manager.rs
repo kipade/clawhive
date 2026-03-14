@@ -1,9 +1,7 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use chrono::{TimeZone, Utc};
 use clawhive_bus::EventBus;
 use clawhive_schema::{
@@ -14,8 +12,8 @@ use tokio::sync::RwLock;
 use tokio::time::Duration;
 
 use crate::{
-    compute_next_run_at_ms, error_backoff_ms, DeliveryMode, DeliveryStatus, HistoryStore,
-    RunRecord, RunStatus, ScheduleConfig, ScheduleState, ScheduleType, SessionMode, StateStore,
+    compute_next_run_at_ms, error_backoff_ms, DeliveryMode, DeliveryStatus, RunRecord, RunStatus,
+    ScheduleConfig, ScheduleState, ScheduleType, SessionMode, SqliteStore,
 };
 
 const MAX_SLEEP_MS: u64 = 60_000;
@@ -28,9 +26,7 @@ pub struct ScheduleEntry {
 pub struct ScheduleManager {
     entries: Arc<RwLock<HashMap<String, ScheduleEntry>>>,
     bus: Arc<EventBus>,
-    config_dir: PathBuf,
-    state_store: StateStore,
-    history_store: HistoryStore,
+    store: SqliteStore,
 }
 
 #[derive(Debug, Clone)]
@@ -175,9 +171,14 @@ pub fn apply_job_result(entry: &mut ScheduleEntry, result: &CompletedResult) -> 
 }
 
 impl ScheduleManager {
-    pub fn new(config_dir: &Path, data_dir: &Path, bus: Arc<EventBus>) -> Result<Self> {
-        let configs: Vec<ScheduleConfig> = read_yaml_dir(config_dir)?;
-        let persisted_states = StateStore::new(data_dir).load()?;
+    pub async fn new(store: SqliteStore, bus: Arc<EventBus>) -> Result<Self> {
+        let configs = store.load_schedule_configs().await?;
+        let persisted_states = store
+            .load_schedule_states()
+            .await?
+            .into_iter()
+            .map(|state| (state.schedule_id.clone(), state))
+            .collect::<HashMap<_, _>>();
 
         let mut entries = HashMap::new();
         let now_ms = Utc::now().timestamp_millis();
@@ -187,11 +188,21 @@ impl ScheduleManager {
                 .get(&config.schedule_id)
                 .cloned()
                 .unwrap_or_else(|| ScheduleState::new(&config.schedule_id));
-            state.next_run_at_ms = if config.enabled {
-                compute_next_run_at_ms(&config.schedule, now_ms)?
+
+            if !config.enabled {
+                state.next_run_at_ms = None;
             } else {
-                None
-            };
+                // Only recalculate next_run if there's no persisted value or it's in the past.
+                // Preserves backoff timing, relative schedules, and manually adjusted values.
+                let needs_recalc = match state.next_run_at_ms {
+                    None => true,
+                    Some(next_ms) => next_ms <= now_ms,
+                };
+                if needs_recalc {
+                    state.next_run_at_ms = compute_next_run_at_ms(&config.schedule, now_ms)?;
+                }
+            }
+
             entries.insert(config.schedule_id.clone(), ScheduleEntry { config, state });
         }
 
@@ -208,9 +219,7 @@ impl ScheduleManager {
         Ok(Self {
             entries: Arc::new(RwLock::new(entries)),
             bus,
-            config_dir: config_dir.to_path_buf(),
-            state_store: StateStore::new(data_dir),
-            history_store: HistoryStore::new(data_dir),
+            store,
         })
     }
 
@@ -259,6 +268,14 @@ impl ScheduleManager {
             .collect()
     }
 
+    pub async fn get_schedule(&self, schedule_id: &str) -> Option<ScheduleStateView> {
+        let entries = self.entries.read().await;
+        entries.get(schedule_id).map(|entry| ScheduleStateView {
+            config: entry.config.clone(),
+            state: entry.state.clone(),
+        })
+    }
+
     pub async fn get_next_run(&self, schedule_id: &str) -> Option<i64> {
         let entries = self.entries.read().await;
         entries
@@ -276,17 +293,11 @@ impl ScheduleManager {
         let mut state = ScheduleState::new(&config.schedule_id);
         state.next_run_at_ms = next;
 
-        let yaml = serde_yaml::to_string(&config)?;
-        tokio::fs::create_dir_all(&self.config_dir).await?;
-        let path = self
-            .config_dir
-            .join(format!("{}.yaml", &config.schedule_id));
-        tokio::fs::write(&path, yaml).await?;
+        self.store.save_schedule_config(&config).await?;
+        self.store.save_schedule_state(&state).await?;
 
         let mut entries = self.entries.write().await;
         entries.insert(config.schedule_id.clone(), ScheduleEntry { config, state });
-
-        self.state_store.persist(&entries).await?;
         Ok(())
     }
 
@@ -295,32 +306,40 @@ impl ScheduleManager {
         schedule_id: &str,
         patch: &serde_json::Value,
     ) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(schedule_id)
-            .ok_or_else(|| anyhow!("schedule not found: {schedule_id}"))?;
+        let (updated, state_changed, state_to_save) = {
+            let mut entries = self.entries.write().await;
+            let entry = entries
+                .get_mut(schedule_id)
+                .ok_or_else(|| anyhow!("schedule not found: {schedule_id}"))?;
 
-        let mut value = serde_json::to_value(&entry.config)?;
-        merge_json_value(&mut value, patch);
-        let mut updated: ScheduleConfig = serde_json::from_value(value)?;
-        if updated.schedule_id != schedule_id {
-            updated.schedule_id = schedule_id.to_string();
+            let previous_state = entry.state.clone();
+            let mut value = serde_json::to_value(&entry.config)?;
+            merge_json_value(&mut value, patch);
+            let mut updated: ScheduleConfig = serde_json::from_value(value)?;
+            if updated.schedule_id != schedule_id {
+                updated.schedule_id = schedule_id.to_string();
+            }
+
+            let schedule_changed = updated.schedule != entry.config.schedule;
+            let enabled_changed = updated.enabled != entry.config.enabled;
+            if schedule_changed || enabled_changed {
+                if updated.enabled {
+                    let now_ms = Utc::now().timestamp_millis();
+                    entry.state.next_run_at_ms = compute_next_run_at_ms(&updated.schedule, now_ms)?;
+                } else {
+                    entry.state.next_run_at_ms = None;
+                }
+            }
+            entry.config = updated.clone();
+
+            let state_changed = entry.state != previous_state;
+            (updated, state_changed, entry.state.clone())
+        };
+
+        self.store.save_schedule_config(&updated).await?;
+        if state_changed {
+            self.store.save_schedule_state(&state_to_save).await?;
         }
-
-        if updated.enabled {
-            let now_ms = Utc::now().timestamp_millis();
-            entry.state.next_run_at_ms = compute_next_run_at_ms(&updated.schedule, now_ms)?;
-        } else {
-            entry.state.next_run_at_ms = None;
-        }
-        entry.config = updated.clone();
-
-        let yaml = serde_yaml::to_string(&updated)?;
-        tokio::fs::create_dir_all(&self.config_dir).await?;
-        let path = self.config_dir.join(format!("{}.yaml", schedule_id));
-        tokio::fs::write(path, yaml).await?;
-
-        self.state_store.persist(&entries).await?;
         Ok(())
     }
 
@@ -330,37 +349,51 @@ impl ScheduleManager {
     }
 
     pub async fn trigger_now(&self, schedule_id: &str) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(schedule_id)
-            .ok_or_else(|| anyhow!("schedule not found: {schedule_id}"))?;
-        let now_ms = Utc::now().timestamp_millis();
+        let msg = {
+            let entries = self.entries.read().await;
+            let entry = entries
+                .get(schedule_id)
+                .ok_or_else(|| anyhow!("schedule not found: {schedule_id}"))?;
 
-        if entry.state.running_at_ms.is_some() {
-            return Err(anyhow!("schedule already running: {schedule_id}"));
-        }
+            if entry.state.running_at_ms.is_some() {
+                return Err(anyhow!("schedule already running: {schedule_id}"));
+            }
 
-        let msg = build_trigger_message(&entry.config);
+            build_trigger_message(&entry.config)
+        };
+
         self.bus.publish(msg).await?;
-        entry.state.running_at_ms = Some(now_ms);
-        self.state_store.persist(&entries).await?;
+
+        let state_to_save = {
+            let mut entries = self.entries.write().await;
+            let entry = entries
+                .get_mut(schedule_id)
+                .ok_or_else(|| anyhow!("schedule not found: {schedule_id}"))?;
+
+            if entry.state.running_at_ms.is_some() {
+                return Err(anyhow!("schedule already running: {schedule_id}"));
+            }
+
+            entry.state.running_at_ms = Some(Utc::now().timestamp_millis());
+            entry.state.clone()
+        };
+
+        self.store.save_schedule_state(&state_to_save).await?;
         Ok(())
     }
 
     pub async fn recent_history(&self, schedule_id: &str, limit: usize) -> Result<Vec<RunRecord>> {
-        self.history_store.recent(schedule_id, limit).await
+        self.store.recent_runs(schedule_id, limit).await
     }
 
     pub async fn remove_schedule(&self, schedule_id: &str) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        entries.remove(schedule_id);
-
-        let path = self.config_dir.join(format!("{}.yaml", schedule_id));
-        if path.exists() {
-            tokio::fs::remove_file(&path).await?;
+        {
+            let mut entries = self.entries.write().await;
+            entries.remove(schedule_id);
         }
 
-        self.state_store.persist(&entries).await?;
+        self.store.delete_schedule_config(schedule_id).await?;
+        self.store.delete_schedule_state(schedule_id).await?;
         Ok(())
     }
 
@@ -382,6 +415,7 @@ impl ScheduleManager {
     async fn check_and_trigger(&self) {
         let now_ms = Utc::now().timestamp_millis();
         let mut entries = self.entries.write().await;
+        let mut states_to_save = HashMap::new();
 
         for entry in entries.values_mut() {
             const STUCK_RUN_MS: i64 = 10 * 60 * 1000; // 10 minutes
@@ -393,6 +427,7 @@ impl ScheduleManager {
                         "Clearing stuck running marker"
                     );
                     entry.state.running_at_ms = None;
+                    states_to_save.insert(entry.config.schedule_id.clone(), entry.state.clone());
                 }
             }
 
@@ -411,6 +446,8 @@ impl ScheduleManager {
                 match self.bus.publish(msg).await {
                     Ok(()) => {
                         entry.state.running_at_ms = Some(now_ms);
+                        states_to_save
+                            .insert(entry.config.schedule_id.clone(), entry.state.clone());
                     }
                     Err(e) => {
                         let error = format!("failed to publish schedule trigger: {e}");
@@ -430,20 +467,21 @@ impl ScheduleManager {
                                 duration_ms: 0,
                             },
                         );
+                        states_to_save
+                            .insert(entry.config.schedule_id.clone(), entry.state.clone());
                     }
                 }
             }
         }
 
-        let _ = self.state_store.persist(&entries).await;
+        drop(entries);
+
+        for state in states_to_save.into_values() {
+            let _ = self.store.save_schedule_state(&state).await;
+        }
     }
 
     async fn apply_completion(&self, schedule_id: &str, completion: CompletionEvent) {
-        let mut entries = self.entries.write().await;
-        let Some(entry) = entries.get_mut(schedule_id) else {
-            return;
-        };
-
         let run_status = match completion.status {
             ScheduledRunStatus::Ok => RunStatus::Ok,
             ScheduledRunStatus::Error => RunStatus::Error,
@@ -451,52 +489,82 @@ impl ScheduleManager {
         };
         let duration_ms = (completion.ended_at_ms - completion.started_at_ms).max(0) as u64;
 
-        let should_delete = apply_job_result(
-            entry,
-            &CompletedResult {
-                status: run_status.clone(),
-                error: completion.error,
-                started_at_ms: completion.started_at_ms,
-                ended_at_ms: completion.ended_at_ms,
-                duration_ms,
-            },
-        );
-
-        entry.state.last_delivery_status = Some(match completion.delivery_status {
-            ScheduledDeliveryStatus::Delivered => DeliveryStatus::Delivered,
-            ScheduledDeliveryStatus::NotDelivered => DeliveryStatus::NotDelivered,
-            ScheduledDeliveryStatus::NotRequested => DeliveryStatus::NotRequested,
-        });
-        entry.state.last_delivery_error = completion.delivery_error;
-
-        if let (Some(started_at), Some(ended_at)) = (
+        let pending_run_record = match (
             Utc.timestamp_millis_opt(completion.started_at_ms).single(),
             Utc.timestamp_millis_opt(completion.ended_at_ms).single(),
         ) {
-            let _ = self
-                .history_store
-                .append(&RunRecord {
-                    schedule_id: schedule_id.to_string(),
-                    started_at,
-                    ended_at,
+            (Some(started_at), Some(ended_at)) => Some(RunRecord {
+                schedule_id: schedule_id.to_string(),
+                started_at,
+                ended_at,
+                status: run_status.clone(),
+                error: None,
+                duration_ms,
+                response: completion.response.clone(),
+                session_key: completion.session_key.clone(),
+            }),
+            _ => None,
+        };
+
+        let (state_to_save, config_to_save, should_delete, run_record) = {
+            let mut entries = self.entries.write().await;
+            let Some(entry) = entries.get_mut(schedule_id) else {
+                return;
+            };
+            let previous_config = entry.config.clone();
+
+            let should_delete = apply_job_result(
+                entry,
+                &CompletedResult {
                     status: run_status,
-                    error: entry.state.last_error.clone(),
+                    error: completion.error,
+                    started_at_ms: completion.started_at_ms,
+                    ended_at_ms: completion.ended_at_ms,
                     duration_ms,
-                    response: completion.response,
-                    session_key: completion.session_key,
-                })
-                .await;
+                },
+            );
+
+            entry.state.last_delivery_status = Some(match completion.delivery_status {
+                ScheduledDeliveryStatus::Delivered => DeliveryStatus::Delivered,
+                ScheduledDeliveryStatus::NotDelivered => DeliveryStatus::NotDelivered,
+                ScheduledDeliveryStatus::NotRequested => DeliveryStatus::NotRequested,
+            });
+            entry.state.last_delivery_error = completion.delivery_error;
+
+            let run_record = pending_run_record.map(|mut record| {
+                record.error = entry.state.last_error.clone();
+                record
+            });
+
+            if should_delete {
+                entries.remove(schedule_id);
+                (None, None, true, run_record)
+            } else {
+                (
+                    Some(entry.state.clone()),
+                    (entry.config != previous_config).then(|| entry.config.clone()),
+                    false,
+                    run_record,
+                )
+            }
+        };
+
+        if let Some(record) = run_record.as_ref() {
+            let _ = self.store.append_run_record(record).await;
         }
 
         if should_delete {
-            entries.remove(schedule_id);
-            let path = self.config_dir.join(format!("{}.yaml", schedule_id));
-            if path.exists() {
-                let _ = tokio::fs::remove_file(path).await;
-            }
+            let _ = self.store.delete_schedule_config(schedule_id).await;
+            let _ = self.store.delete_schedule_state(schedule_id).await;
+            return;
         }
 
-        let _ = self.state_store.persist(&entries).await;
+        if let Some(config) = config_to_save.as_ref() {
+            let _ = self.store.save_schedule_config(config).await;
+        }
+        if let Some(state) = state_to_save.as_ref() {
+            let _ = self.store.save_schedule_state(state).await;
+        }
     }
 }
 
@@ -504,35 +572,6 @@ impl ScheduleManager {
 pub struct ScheduleStateView {
     pub config: ScheduleConfig,
     pub state: ScheduleState,
-}
-
-fn read_yaml_dir<T>(dir: &Path) -> Result<Vec<T>>
-where
-    T: for<'de> serde::Deserialize<'de>,
-{
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
-        let entry = entry.with_context(|| format!("failed to read {}", dir.display()))?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("yaml") {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-
-    let mut items = Vec::with_capacity(paths.len());
-    for path in paths {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let item = serde_yaml::from_str(&content)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        items.push(item);
-    }
-    Ok(items)
 }
 
 fn merge_json_value(target: &mut serde_json::Value, patch: &serde_json::Value) {
@@ -560,34 +599,30 @@ mod tests {
 
     use chrono::Utc;
     use clawhive_schema::{ScheduledDeliveryStatus, ScheduledRunStatus};
-    use uuid::Uuid;
+    use tempfile::TempDir;
 
     use super::{CompletionEvent, ScheduleEntry, ScheduleManager};
     use crate::{
-        DeliveryConfig, HistoryStore, ScheduleConfig, ScheduleState, ScheduleType, SessionMode,
-        StateStore,
+        DeliveryConfig, ScheduleConfig, ScheduleState, ScheduleType, SessionMode, SqliteStore,
     };
 
-    fn test_dirs() -> (std::path::PathBuf, std::path::PathBuf) {
-        let base = std::env::temp_dir().join(format!("clawhive-scheduler-{}", Uuid::new_v4()));
-        let config_dir = base.join("config");
-        let data_dir = base.join("data");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::create_dir_all(&data_dir).unwrap();
-        (config_dir, data_dir)
+    fn test_store() -> (TempDir, SqliteStore) {
+        let tmp = TempDir::new().unwrap();
+        let store = SqliteStore::open(&tmp.path().join("scheduler.db")).unwrap();
+        (tmp, store)
     }
 
-    fn make_manager(entry: ScheduleEntry) -> ScheduleManager {
-        let (config_dir, data_dir) = test_dirs();
+    async fn make_manager(entry: ScheduleEntry) -> ScheduleManager {
+        let (_tmp, store) = test_store();
+        store.save_schedule_config(&entry.config).await.unwrap();
+        store.save_schedule_state(&entry.state).await.unwrap();
         let mut entries = HashMap::new();
         entries.insert(entry.config.schedule_id.clone(), entry);
 
         ScheduleManager {
             entries: Arc::new(tokio::sync::RwLock::new(entries)),
             bus: Arc::new(clawhive_bus::EventBus::new(16)),
-            config_dir,
-            state_store: StateStore::new(&data_dir),
-            history_store: HistoryStore::new(&data_dir),
+            store,
         }
     }
 
@@ -642,7 +677,7 @@ mod tests {
             true,
             Some(Utc::now().timestamp_millis() + 10_000),
         );
-        let manager = make_manager(entry);
+        let manager = make_manager(entry).await;
         let started = Utc::now().timestamp_millis() - 2_000;
         let ended = Utc::now().timestamp_millis();
 
@@ -678,7 +713,7 @@ mod tests {
             false,
             Some(ended + 1_000),
         );
-        let manager = make_manager(entry);
+        let manager = make_manager(entry).await;
         let started = ended - 1_500;
 
         manager
@@ -719,7 +754,7 @@ mod tests {
             Some(Utc::now().timestamp_millis() + 1_000),
         );
         entry.state.consecutive_errors = 2;
-        let manager = make_manager(entry);
+        let manager = make_manager(entry).await;
         let started = Utc::now().timestamp_millis() - 1_000;
         let ended = Utc::now().timestamp_millis();
 
@@ -752,7 +787,7 @@ mod tests {
 
     #[tokio::test]
     async fn stuck_running_marker_is_cleared_on_startup() {
-        let (config_dir, data_dir) = test_dirs();
+        let (_tmp, store) = test_store();
         let bus = Arc::new(clawhive_bus::EventBus::new(16));
 
         let config = ScheduleConfig {
@@ -777,16 +812,9 @@ mod tests {
             delete_after_run: false,
             delivery: DeliveryConfig::default(),
         };
-        std::fs::write(
-            config_dir.join("stuck-job.yaml"),
-            serde_yaml::to_string(&config).unwrap(),
-        )
-        .unwrap();
-
-        let mut states = HashMap::new();
-        states.insert(
-            "stuck-job".to_string(),
-            ScheduleState {
+        store.save_schedule_config(&config).await.unwrap();
+        store
+            .save_schedule_state(&ScheduleState {
                 schedule_id: "stuck-job".to_string(),
                 next_run_at_ms: Some(Utc::now().timestamp_millis() + 60_000),
                 running_at_ms: Some(Utc::now().timestamp_millis() - 10_000),
@@ -797,18 +825,39 @@ mod tests {
                 consecutive_errors: 0,
                 last_delivery_status: None,
                 last_delivery_error: None,
-            },
-        );
-        let state_json = serde_json::to_string_pretty(&states).unwrap();
-        std::fs::create_dir_all(&data_dir).unwrap();
-        std::fs::write(data_dir.join("state.json"), state_json).unwrap();
+            })
+            .await
+            .unwrap();
 
-        let manager = ScheduleManager::new(&config_dir, &data_dir, bus).unwrap();
+        let manager = ScheduleManager::new(store, bus).await.unwrap();
         let list = manager.list().await;
         assert_eq!(list.len(), 1);
         assert!(
             list[0].state.running_at_ms.is_none(),
             "running_at_ms should be cleared on startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_schedule_returns_matching_entry() {
+        let entry = make_entry(
+            "lookup-job",
+            ScheduleType::Every {
+                interval_ms: 60_000,
+                anchor_ms: None,
+            },
+            false,
+            Some(Utc::now().timestamp_millis() + 60_000),
+        );
+        let manager = make_manager(entry).await;
+
+        let schedule = manager.get_schedule("lookup-job").await;
+
+        assert!(schedule.is_some());
+        assert_eq!(
+            schedule.unwrap().config.schedule_id,
+            "lookup-job",
+            "get_schedule should return the requested schedule"
         );
     }
 }

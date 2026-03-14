@@ -7,7 +7,7 @@ use clawhive_memory::MemoryStore;
 use clawhive_memory::SessionReader;
 use clawhive_provider::{AnthropicProvider, LlmMessage, LlmProvider, LlmRequest, ProviderRegistry};
 use clawhive_runtime::NativeExecutor;
-use clawhive_scheduler::ScheduleManager;
+use clawhive_scheduler::{ScheduleManager, SqliteStore};
 use clawhive_schema::{BusMessage, InboundMessage, SessionKey};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -60,7 +60,7 @@ fn mock_anthropic_error(status: u16, message: &str) -> ResponseTemplate {
     }))
 }
 
-fn make_orchestrator_with_provider(
+async fn make_orchestrator_with_provider(
     provider: Arc<dyn LlmProvider>,
     memory: Arc<MemoryStore>,
     bus: &EventBus,
@@ -94,10 +94,10 @@ fn make_orchestrator_with_provider(
     }];
     let schedule_manager = Arc::new(
         ScheduleManager::new(
-            &tmp.path().join("config/schedules.d"),
-            &tmp.path().join("data/schedules"),
+            SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
             Arc::new(EventBus::new(16)),
         )
+        .await
         .unwrap(),
     );
     (
@@ -146,7 +146,7 @@ async fn mock_server_e2e_chat() {
     ));
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = EventBus::new(16);
-    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory, &bus);
+    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory, &bus).await;
 
     let out = orch
         .handle_inbound(test_inbound("hi"), "clawhive-main")
@@ -168,7 +168,7 @@ async fn mock_server_records_sessions() {
     ));
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = EventBus::new(16);
-    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory.clone(), &bus);
+    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory.clone(), &bus).await;
 
     let inbound = test_inbound("session input");
     let _key = SessionKey::from_inbound(&inbound);
@@ -190,7 +190,7 @@ async fn mock_server_creates_session() {
     ));
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = EventBus::new(16);
-    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory.clone(), &bus);
+    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory.clone(), &bus).await;
 
     let inbound = test_inbound("session input");
     let key = SessionKey::from_inbound(&inbound);
@@ -215,7 +215,7 @@ async fn mock_server_publishes_bus_events() {
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = EventBus::new(16);
     let mut rx = bus.subscribe(Topic::ReplyReady).await;
-    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory, &bus);
+    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory, &bus).await;
 
     let _ = orch
         .handle_inbound(test_inbound("bus input"), "clawhive-main")
@@ -251,7 +251,7 @@ async fn mock_server_handles_api_error() {
     ));
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = EventBus::new(16);
-    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory, &bus);
+    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory, &bus).await;
 
     let err = orch
         .handle_inbound(test_inbound("error input"), "clawhive-main")
@@ -441,7 +441,7 @@ async fn mock_server_multi_turn_session() {
     ));
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = EventBus::new(16);
-    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory.clone(), &bus);
+    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory.clone(), &bus).await;
 
     let first = test_inbound("first");
     let _key = SessionKey::from_inbound(&first);
@@ -474,7 +474,7 @@ async fn mock_server_includes_session_history() {
     ));
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = EventBus::new(16);
-    let (orch, tmp) = make_orchestrator_with_provider(provider, memory.clone(), &bus);
+    let (orch, tmp) = make_orchestrator_with_provider(provider, memory.clone(), &bus).await;
 
     // First turn
     let first = test_inbound("hello");
@@ -511,7 +511,7 @@ async fn expired_session_keeps_jsonl_history() {
     ));
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = EventBus::new(16);
-    let (orch, tmp) = make_orchestrator_with_provider(provider, memory.clone(), &bus);
+    let (orch, tmp) = make_orchestrator_with_provider(provider, memory.clone(), &bus).await;
 
     let key_str = "telegram:tg_main:chat:1:user:1";
 
@@ -579,7 +579,7 @@ async fn mock_server_tool_use_loop() {
     ));
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = EventBus::new(16);
-    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory, &bus);
+    let (orch, _tmp) = make_orchestrator_with_provider(provider, memory, &bus).await;
 
     let out = orch
         .handle_inbound(test_inbound("search my memory"), "clawhive-main")
