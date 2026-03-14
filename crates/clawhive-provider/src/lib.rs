@@ -283,7 +283,7 @@ pub fn register_from_configs(
 // Provider Registry
 // ============================================================
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn LlmProvider>>,
 }

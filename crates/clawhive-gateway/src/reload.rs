@@ -1,0 +1,294 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use anyhow::Result;
+use arc_swap::ArcSwap;
+use clawhive_bus::BusPublisher;
+use clawhive_core::{
+    build_config_view, load_config, validate_config, ApprovalRegistry, ClawhiveConfig, ConfigDiff,
+    ConfigView, Orchestrator,
+};
+use clawhive_memory::MemoryStore;
+
+use crate::supervisor::ChannelSupervisor;
+
+pub struct ReloadCoordinator {
+    current_config: ArcSwap<ClawhiveConfig>,
+    orchestrator: Arc<Orchestrator>,
+    supervisor: Arc<tokio::sync::Mutex<ChannelSupervisor>>,
+    apply_lock: tokio::sync::Mutex<()>,
+    generation: AtomicU64,
+    root: PathBuf,
+    memory: Arc<MemoryStore>,
+    publisher: BusPublisher,
+    schedule_manager: Arc<clawhive_scheduler::ScheduleManager>,
+    approval_registry: Option<Arc<ApprovalRegistry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum ChannelChangeResult {
+    Started { connector_id: String },
+    Stopped { connector_id: String },
+    Restarted { connector_id: String },
+    Failed { connector_id: String, error: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReloadOutcome {
+    pub generation: u64,
+    pub config_view_applied: bool,
+    pub channel_results: Vec<ChannelChangeResult>,
+    pub warnings: Vec<String>,
+}
+
+impl ReloadOutcome {
+    pub fn no_changes(generation: u64) -> Self {
+        Self {
+            generation,
+            config_view_applied: false,
+            channel_results: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl ReloadCoordinator {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        initial_config: ClawhiveConfig,
+        orchestrator: Arc<Orchestrator>,
+        supervisor: Arc<tokio::sync::Mutex<ChannelSupervisor>>,
+        root: PathBuf,
+        memory: Arc<MemoryStore>,
+        publisher: BusPublisher,
+        schedule_manager: Arc<clawhive_scheduler::ScheduleManager>,
+        approval_registry: Option<Arc<ApprovalRegistry>>,
+    ) -> Self {
+        let initial_generation = orchestrator.config_view().generation;
+
+        Self {
+            current_config: ArcSwap::from_pointee(initial_config),
+            orchestrator,
+            supervisor,
+            apply_lock: tokio::sync::Mutex::new(()),
+            generation: AtomicU64::new(initial_generation),
+            root,
+            memory,
+            publisher,
+            schedule_manager,
+            approval_registry,
+        }
+    }
+
+    pub async fn reload(&self) -> Result<ReloadOutcome> {
+        let _guard = self.apply_lock.lock().await;
+
+        let new_cfg = load_config(&self.root.join("config"))?;
+        validate_config(&new_cfg)?;
+
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let old_cfg = self.current_config.load_full();
+        let diff = ConfigDiff::between(old_cfg.as_ref(), &new_cfg);
+
+        if diff.is_empty() {
+            return Ok(ReloadOutcome::no_changes(generation));
+        }
+
+        let warnings = diff
+            .requires_restart
+            .iter()
+            .map(|item| format!("{item} changed - requires restart"))
+            .collect();
+
+        let new_view = self.build_config_view(&new_cfg, generation).await?;
+
+        self.orchestrator.apply_config_view(new_view);
+        self.current_config.store(Arc::new(new_cfg));
+
+        let channel_results = self.reconcile_channels(&diff).await;
+
+        Ok(ReloadOutcome {
+            generation,
+            config_view_applied: true,
+            channel_results,
+            warnings,
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    async fn build_config_view(
+        &self,
+        config: &ClawhiveConfig,
+        generation: u64,
+    ) -> Result<ConfigView> {
+        Ok(build_config_view(
+            config,
+            generation,
+            &self.root,
+            &self.memory,
+            &self.approval_registry,
+            &self.publisher,
+            Arc::clone(&self.schedule_manager),
+        )
+        .await)
+    }
+
+    async fn reconcile_channels(&self, _diff: &ConfigDiff) -> Vec<ChannelChangeResult> {
+        let _supervisor = self.supervisor.lock().await;
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use clawhive_bus::EventBus;
+    use clawhive_core::{
+        build_config_view, load_config, ApprovalRegistry, ClawhiveConfig, OrchestratorBuilder,
+    };
+    use clawhive_memory::MemoryStore;
+    use clawhive_runtime::NativeExecutor;
+    use clawhive_scheduler::{ScheduleManager, SqliteStore};
+
+    use super::{ChannelChangeResult, ReloadCoordinator};
+    use crate::{Gateway, RateLimitConfig, RateLimiter};
+
+    fn write_config(root: &std::path::Path, model: &str, log_level: &str) {
+        std::fs::create_dir_all(root.join("config/agents.d")).unwrap();
+        std::fs::create_dir_all(root.join("config/providers.d")).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(
+            root.join("config/main.yaml"),
+            format!(
+                "app:\n  name: clawhive\nruntime:\n  max_concurrent: 4\nfeatures:\n  multi_agent: true\n  sub_agent: true\n  tui: false\n  cli: true\nchannels:\n  telegram: null\n  discord: null\nlog_level: {log_level}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config/routing.yaml"),
+            "default_agent_id: agent-a\nbindings: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config/providers.d/openai.yaml"),
+            "provider_id: openai\nenabled: true\napi_base: https://api.openai.com/v1\napi_key: sk-test\nmodels:\n  - gpt-4o\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config/agents.d/agent-a.yaml"),
+            format!(
+                "agent_id: agent-a\nenabled: true\nmodel_policy:\n  primary: {model}\n  fallbacks: []\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn make_coordinator(
+        root: &std::path::Path,
+    ) -> (ReloadCoordinator, Arc<clawhive_core::Orchestrator>) {
+        let config: ClawhiveConfig = load_config(&root.join("config")).unwrap();
+        let bus = Arc::new(EventBus::new(16));
+        let publisher = bus.publisher();
+        let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
+        let schedule_manager = Arc::new(
+            ScheduleManager::new(
+                SqliteStore::open(&root.join("data/scheduler.db")).unwrap(),
+                Arc::clone(&bus),
+            )
+            .await
+            .unwrap(),
+        );
+        let approval_registry = Some(Arc::new(ApprovalRegistry::with_persistence(
+            root.join("data/runtime_allowlist.json"),
+        )));
+        let config_view = build_config_view(
+            &config,
+            0,
+            root,
+            &memory,
+            &approval_registry,
+            &publisher,
+            Arc::clone(&schedule_manager),
+        )
+        .await;
+        let orchestrator = Arc::new(
+            OrchestratorBuilder::new(
+                config_view,
+                publisher.clone(),
+                Arc::clone(&memory),
+                Arc::new(NativeExecutor),
+                root.to_path_buf(),
+                Arc::clone(&schedule_manager),
+            )
+            .approval_registry(approval_registry.clone().unwrap())
+            .project_root(root.to_path_buf())
+            .build(),
+        );
+        let gateway = Arc::new(Gateway::new(
+            Arc::clone(&orchestrator),
+            publisher.clone(),
+            RateLimiter::new(RateLimitConfig::default()),
+            approval_registry.clone(),
+        ));
+        let supervisor = Arc::new(tokio::sync::Mutex::new(
+            crate::supervisor::ChannelSupervisor::new(gateway, bus),
+        ));
+
+        (
+            ReloadCoordinator::new(
+                config,
+                Arc::clone(&orchestrator),
+                supervisor,
+                root.to_path_buf(),
+                memory,
+                publisher,
+                schedule_manager,
+                approval_registry,
+            ),
+            orchestrator,
+        )
+    }
+
+    #[tokio::test]
+    async fn reload_reports_no_changes_when_config_matches_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), "gpt-4o", "info");
+        let (coordinator, _orchestrator) = make_coordinator(tmp.path()).await;
+
+        let outcome = coordinator.reload().await.unwrap();
+
+        assert_eq!(outcome.generation, 1);
+        assert!(!outcome.config_view_applied);
+        assert!(outcome.channel_results.is_empty());
+        assert!(outcome.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_swaps_config_view_and_collects_warnings() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(tmp.path(), "gpt-4o", "info");
+        let (coordinator, orchestrator) = make_coordinator(tmp.path()).await;
+        write_config(tmp.path(), "gpt-4.1", "debug");
+
+        let outcome = coordinator.reload().await.unwrap();
+        let current = orchestrator.config_view();
+
+        assert_eq!(outcome.generation, 1);
+        assert!(outcome.config_view_applied);
+        assert_eq!(outcome.channel_results, Vec::<ChannelChangeResult>::new());
+        assert!(outcome
+            .warnings
+            .iter()
+            .any(|item| item.contains("requires restart")));
+        assert_eq!(current.generation, 1);
+        assert_eq!(
+            current.agent("agent-a").unwrap().model_policy.primary,
+            "gpt-4.1"
+        );
+    }
+}

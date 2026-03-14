@@ -4,9 +4,12 @@ use std::time::Duration;
 
 use clawhive_bus::{EventBus, Topic};
 use clawhive_core::{
-    ApprovalRegistry, FullAgentConfig, LlmRouter, ModelPolicy, Orchestrator, OrchestratorBuilder,
-    SecurityMode,
+    build_tool_registry, ApprovalRegistry, ConfigView, FullAgentConfig, LlmRouter, ModelPolicy,
+    Orchestrator, OrchestratorBuilder, RoutingConfig, SecurityMode,
 };
+use clawhive_memory::embedding::{EmbeddingProvider, StubEmbeddingProvider};
+use clawhive_memory::file_store::MemoryFileStore;
+use clawhive_memory::search_index::SearchIndex;
 use clawhive_memory::MemoryStore;
 use clawhive_provider::ProviderRegistry;
 use clawhive_runtime::NativeExecutor;
@@ -62,6 +65,10 @@ async fn make_orchestrator(
     let router = LlmRouter::new(ProviderRegistry::new(), HashMap::new(), vec![]);
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = Arc::new(EventBus::new(16));
+    let publisher = bus.publisher();
+    let file_store = MemoryFileStore::new(tmp.path());
+    let search_index = SearchIndex::new(memory.db());
+    let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let schedule_manager = Arc::new(
         ScheduleManager::new(
             SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
@@ -70,15 +77,42 @@ async fn make_orchestrator(
         .await
         .unwrap(),
     );
-    let mut builder = OrchestratorBuilder::new(
+    let agents = vec![test_full_agent()];
+    let personas = HashMap::new();
+    let tool_registry = build_tool_registry(
+        &file_store,
+        &search_index,
+        &embedding_provider,
+        tmp.path(),
+        tmp.path(),
+        &approval_registry,
+        &publisher,
+        Arc::clone(&schedule_manager),
+        None,
+        &router,
+        &agents,
+        &personas,
+    );
+    let config_view = ConfigView::new(
+        0,
+        agents,
+        personas,
+        RoutingConfig {
+            default_agent_id: "clawhive-main".to_string(),
+            bindings: vec![],
+        },
         router,
-        bus.publisher(),
+        tool_registry,
+        embedding_provider,
+    );
+    let mut builder = OrchestratorBuilder::new(
+        config_view,
+        publisher,
         memory,
         Arc::new(NativeExecutor),
         tmp.path().to_path_buf(),
         schedule_manager,
-    )
-    .agents(vec![test_full_agent()]);
+    );
     if let Some(reg) = approval_registry {
         builder = builder.approval_registry(reg);
     }

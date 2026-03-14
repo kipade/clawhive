@@ -7,6 +7,7 @@ pub mod config;
 pub mod consolidate;
 pub mod dashboard;
 pub mod logs;
+pub mod reload;
 pub mod schedule;
 pub mod session;
 pub mod setup;

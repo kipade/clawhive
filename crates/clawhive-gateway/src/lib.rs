@@ -8,7 +8,11 @@ use clawhive_schema::*;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
+pub mod reload;
+pub mod supervisor;
 pub mod webhook;
+
+pub use reload::*;
 
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
@@ -80,7 +84,6 @@ impl RateLimiter {
 
 pub struct Gateway {
     orchestrator: Arc<Orchestrator>,
-    routing: RoutingConfig,
     bus: BusPublisher,
     rate_limiter: RateLimiter,
     approval_registry: Option<Arc<ApprovalRegistry>>,
@@ -99,14 +102,12 @@ pub struct ChannelTarget {
 impl Gateway {
     pub fn new(
         orchestrator: Arc<Orchestrator>,
-        routing: RoutingConfig,
         bus: BusPublisher,
         rate_limiter: RateLimiter,
         approval_registry: Option<Arc<ApprovalRegistry>>,
     ) -> Self {
         Self {
             orchestrator,
-            routing,
             bus,
             rate_limiter,
             approval_registry,
@@ -162,7 +163,12 @@ impl Gateway {
     }
 
     pub fn resolve_agent(&self, inbound: &InboundMessage) -> String {
-        for binding in &self.routing.bindings {
+        let view = self.orchestrator.config_view();
+        Self::resolve_agent_from_routing(&view.routing, inbound)
+    }
+
+    fn resolve_agent_from_routing(routing: &RoutingConfig, inbound: &InboundMessage) -> String {
+        for binding in &routing.bindings {
             if binding.channel_type == inbound.channel_type
                 && binding.connector_id == inbound.connector_id
             {
@@ -184,11 +190,22 @@ impl Gateway {
                 }
             }
         }
-        self.routing.default_agent_id.clone()
+        routing.default_agent_id.clone()
     }
 
     pub async fn handle_inbound_for_agent(
         &self,
+        inbound: InboundMessage,
+        agent_id: &str,
+    ) -> Result<OutboundMessage> {
+        let view = self.orchestrator.config_view();
+        self.handle_inbound_for_agent_with_view(view, inbound, agent_id)
+            .await
+    }
+
+    pub async fn handle_inbound_for_agent_with_view(
+        &self,
+        view: Arc<clawhive_core::ConfigView>,
         inbound: InboundMessage,
         agent_id: &str,
     ) -> Result<OutboundMessage> {
@@ -220,7 +237,11 @@ impl Gateway {
             .publish(BusMessage::MessageAccepted { trace_id })
             .await;
 
-        match self.orchestrator.handle_inbound(inbound, agent_id).await {
+        match self
+            .orchestrator
+            .handle_with_view(view, inbound, agent_id)
+            .await
+        {
             Ok(outbound) => Ok(outbound),
             Err(err) => {
                 let _ = self
@@ -244,8 +265,15 @@ impl Gateway {
             return Err(anyhow::anyhow!("rate limited: too many requests"));
         }
 
-        let agent_id = self.resolve_agent(&inbound);
-        self.handle_inbound_for_agent(inbound, &agent_id).await
+        let view = self.orchestrator.config_view();
+        let agent_id = Self::resolve_agent_from_routing(&view.routing, &inbound);
+
+        self.handle_inbound_for_agent_with_view(view, inbound, &agent_id)
+            .await
+    }
+
+    pub fn orchestrator(&self) -> &Arc<Orchestrator> {
+        &self.orchestrator
     }
 
     /// Get the last active channel for an agent (for heartbeat delivery).
@@ -1010,6 +1038,9 @@ mod tests {
     use clawhive_bus::{EventBus, Topic};
     use clawhive_core::*;
 
+    use clawhive_memory::embedding::{EmbeddingProvider, StubEmbeddingProvider};
+    use clawhive_memory::file_store::MemoryFileStore;
+    use clawhive_memory::search_index::SearchIndex;
     use clawhive_memory::MemoryStore;
 
     use clawhive_provider::{register_builtin_providers, ProviderRegistry};
@@ -1018,6 +1049,45 @@ mod tests {
     use clawhive_schema::{ApprovalDecision, BusMessage, InboundMessage};
 
     use super::*;
+
+    fn clone_test_view(
+        view: &ConfigView,
+        agents: Option<Vec<FullAgentConfig>>,
+        routing: Option<RoutingConfig>,
+    ) -> ConfigView {
+        let agents = agents.unwrap_or_else(|| {
+            view.agents
+                .values()
+                .map(|agent| agent.as_ref().clone())
+                .collect()
+        });
+        let personas = view
+            .personas
+            .iter()
+            .map(|(agent_id, persona)| (agent_id.clone(), persona.as_ref().clone()))
+            .collect();
+
+        ConfigView::new(
+            view.generation + 1,
+            agents,
+            personas,
+            routing.unwrap_or_else(|| view.routing.clone()),
+            view.router.clone(),
+            ToolRegistry::new(),
+            view.embedding_provider.clone(),
+        )
+    }
+
+    fn apply_test_routing(gateway: &Gateway, mutate: impl FnOnce(&mut RoutingConfig)) {
+        let current = gateway.orchestrator().config_view();
+        let mut routing = current.routing.clone();
+        mutate(&mut routing);
+        gateway.orchestrator().apply_config_view(clone_test_view(
+            current.as_ref(),
+            None,
+            Some(routing),
+        ));
+    }
 
     async fn make_gateway() -> (Gateway, tempfile::TempDir) {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1038,6 +1108,10 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let file_store = MemoryFileStore::new(tmp.path());
+        let search_index = SearchIndex::new(memory.db());
+        let embedding_provider: Arc<dyn EmbeddingProvider> =
+            Arc::new(StubEmbeddingProvider::new(8));
         let agents = vec![FullAgentConfig {
             agent_id: "clawhive-main".into(),
             enabled: true,
@@ -1057,27 +1131,46 @@ mod tests {
             exec_security: None,
             sandbox: None,
         }];
+        let personas = HashMap::new();
+        let tool_registry = build_tool_registry(
+            &file_store,
+            &search_index,
+            &embedding_provider,
+            tmp.path(),
+            tmp.path(),
+            &None,
+            &publisher,
+            Arc::clone(&schedule_manager),
+            None,
+            &router,
+            &agents,
+            &personas,
+        );
+        let config_view = ConfigView::new(
+            0,
+            agents,
+            personas,
+            RoutingConfig {
+                default_agent_id: "clawhive-main".to_string(),
+                bindings: vec![],
+            },
+            router,
+            tool_registry,
+            embedding_provider,
+        );
         let orch = Arc::new(
             OrchestratorBuilder::new(
-                router,
+                config_view,
                 publisher.clone(),
                 memory,
                 Arc::new(NativeExecutor),
                 tmp.path().to_path_buf(),
                 schedule_manager,
             )
-            .agents(agents)
             .build(),
         );
-        let routing = RoutingConfig {
-            default_agent_id: "clawhive-main".into(),
-            bindings: vec![],
-        };
         let rate_limiter = RateLimiter::new(RateLimitConfig::default());
-        (
-            Gateway::new(orch, routing, publisher, rate_limiter, None),
-            tmp,
-        )
+        (Gateway::new(orch, publisher, rate_limiter, None), tmp)
     }
 
     async fn make_gateway_with_receivers() -> (
@@ -1108,6 +1201,10 @@ mod tests {
             .await
             .unwrap(),
         );
+        let file_store = MemoryFileStore::new(tmp.path());
+        let search_index = SearchIndex::new(memory.db());
+        let embedding_provider: Arc<dyn EmbeddingProvider> =
+            Arc::new(StubEmbeddingProvider::new(8));
         let agents = vec![FullAgentConfig {
             agent_id: "clawhive-main".into(),
             enabled: true,
@@ -1127,25 +1224,47 @@ mod tests {
             exec_security: None,
             sandbox: None,
         }];
+        let personas = HashMap::new();
+        let tool_registry = build_tool_registry(
+            &file_store,
+            &search_index,
+            &embedding_provider,
+            tmp.path(),
+            tmp.path(),
+            &None,
+            &publisher,
+            Arc::clone(&schedule_manager),
+            None,
+            &router,
+            &agents,
+            &personas,
+        );
+        let config_view = ConfigView::new(
+            0,
+            agents,
+            personas,
+            RoutingConfig {
+                default_agent_id: "clawhive-main".to_string(),
+                bindings: vec![],
+            },
+            router,
+            tool_registry,
+            embedding_provider,
+        );
         let orch = Arc::new(
             OrchestratorBuilder::new(
-                router,
+                config_view,
                 publisher.clone(),
                 memory,
                 Arc::new(NativeExecutor),
                 tmp.path().to_path_buf(),
                 schedule_manager,
             )
-            .agents(agents)
             .build(),
         );
-        let routing = RoutingConfig {
-            default_agent_id: "clawhive-main".into(),
-            bindings: vec![],
-        };
         let rate_limiter = RateLimiter::new(RateLimitConfig::default());
         (
-            Gateway::new(orch, routing, publisher, rate_limiter, None),
+            Gateway::new(orch, publisher, rate_limiter, None),
             handle_incoming_rx,
             message_accepted_rx,
             tmp,
@@ -1196,17 +1315,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_agent_mention_binding() {
-        let (mut gw, _tmp) = make_gateway().await;
-        gw.routing.bindings.push(RoutingBinding {
+    async fn resolve_agent_uses_latest_orchestrator_routing_snapshot() {
+        let (gw, _tmp) = make_gateway().await;
+        let current = gw.orchestrator().config_view();
+        let updated = clone_test_view(
+            current.as_ref(),
+            None,
+            Some(RoutingConfig {
+                default_agent_id: "clawhive-main".into(),
+                bindings: vec![RoutingBinding {
+                    channel_type: "telegram".into(),
+                    connector_id: "tg_main".into(),
+                    match_rule: MatchRule {
+                        kind: "mention".into(),
+                        pattern: Some("@mybot".into()),
+                    },
+                    agent_id: "clawhive-builder".into(),
+                    delivery: None,
+                }],
+            }),
+        );
+        gw.orchestrator().apply_config_view(updated);
+
+        let inbound = InboundMessage {
+            trace_id: uuid::Uuid::new_v4(),
             channel_type: "telegram".into(),
             connector_id: "tg_main".into(),
-            match_rule: MatchRule {
-                kind: "mention".into(),
-                pattern: Some("@mybot".into()),
-            },
-            agent_id: "clawhive-builder".into(),
-            delivery: None,
+            conversation_scope: "chat:1".into(),
+            user_scope: "user:1".into(),
+            text: "@mybot hello".into(),
+            at: chrono::Utc::now(),
+            thread_id: None,
+            is_mention: true,
+            mention_target: Some("@mybot".into()),
+            message_id: None,
+            attachments: vec![],
+            message_source: None,
+        };
+
+        assert_eq!(gw.resolve_agent(&inbound), "clawhive-builder");
+    }
+
+    #[tokio::test]
+    async fn handle_inbound_for_agent_with_view_uses_pinned_snapshot() {
+        let (gw, _tmp) = make_gateway().await;
+        let pinned = gw.orchestrator().config_view();
+
+        let mut updated_agents: Vec<FullAgentConfig> = pinned
+            .agents
+            .values()
+            .map(|agent| agent.as_ref().clone())
+            .collect();
+        updated_agents[0].model_policy.primary = "updated-model".into();
+        let updated = clone_test_view(pinned.as_ref(), Some(updated_agents), None);
+        gw.orchestrator().apply_config_view(updated);
+
+        let inbound = InboundMessage {
+            trace_id: uuid::Uuid::new_v4(),
+            channel_type: "telegram".into(),
+            connector_id: "tg_main".into(),
+            conversation_scope: "chat:1".into(),
+            user_scope: "user:1".into(),
+            text: "/model".into(),
+            at: chrono::Utc::now(),
+            thread_id: None,
+            is_mention: false,
+            mention_target: None,
+            message_id: None,
+            attachments: vec![],
+            message_source: None,
+        };
+
+        let out = gw
+            .handle_inbound_for_agent_with_view(pinned, inbound, "clawhive-main")
+            .await
+            .unwrap();
+
+        assert!(out.text.contains("Model: **sonnet**"));
+        assert!(!out.text.contains("updated-model"));
+    }
+
+    #[tokio::test]
+    async fn resolve_agent_mention_binding() {
+        let (gw, _tmp) = make_gateway().await;
+        apply_test_routing(&gw, |routing| {
+            routing.bindings.push(RoutingBinding {
+                channel_type: "telegram".into(),
+                connector_id: "tg_main".into(),
+                match_rule: MatchRule {
+                    kind: "mention".into(),
+                    pattern: Some("@mybot".into()),
+                },
+                agent_id: "clawhive-builder".into(),
+                delivery: None,
+            });
         });
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
@@ -1261,16 +1463,18 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_agent_dm_binding() {
-        let (mut gw, _tmp) = make_gateway().await;
-        gw.routing.bindings.push(RoutingBinding {
-            channel_type: "telegram".into(),
-            connector_id: "tg_main".into(),
-            match_rule: MatchRule {
-                kind: "dm".into(),
-                pattern: None,
-            },
-            agent_id: "clawhive-dm".into(),
-            delivery: None,
+        let (gw, _tmp) = make_gateway().await;
+        apply_test_routing(&gw, |routing| {
+            routing.bindings.push(RoutingBinding {
+                channel_type: "telegram".into(),
+                connector_id: "tg_main".into(),
+                match_rule: MatchRule {
+                    kind: "dm".into(),
+                    pattern: None,
+                },
+                agent_id: "clawhive-dm".into(),
+                delivery: None,
+            });
         });
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
@@ -1292,16 +1496,18 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_agent_dm_binding_skips_group() {
-        let (mut gw, _tmp) = make_gateway().await;
-        gw.routing.bindings.push(RoutingBinding {
-            channel_type: "telegram".into(),
-            connector_id: "tg_main".into(),
-            match_rule: MatchRule {
-                kind: "dm".into(),
-                pattern: None,
-            },
-            agent_id: "clawhive-dm".into(),
-            delivery: None,
+        let (gw, _tmp) = make_gateway().await;
+        apply_test_routing(&gw, |routing| {
+            routing.bindings.push(RoutingBinding {
+                channel_type: "telegram".into(),
+                connector_id: "tg_main".into(),
+                match_rule: MatchRule {
+                    kind: "dm".into(),
+                    pattern: None,
+                },
+                agent_id: "clawhive-dm".into(),
+                delivery: None,
+            });
         });
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
@@ -1323,16 +1529,18 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_agent_group_binding() {
-        let (mut gw, _tmp) = make_gateway().await;
-        gw.routing.bindings.push(RoutingBinding {
-            channel_type: "telegram".into(),
-            connector_id: "tg_main".into(),
-            match_rule: MatchRule {
-                kind: "group".into(),
-                pattern: None,
-            },
-            agent_id: "clawhive-group".into(),
-            delivery: None,
+        let (gw, _tmp) = make_gateway().await;
+        apply_test_routing(&gw, |routing| {
+            routing.bindings.push(RoutingBinding {
+                channel_type: "telegram".into(),
+                connector_id: "tg_main".into(),
+                match_rule: MatchRule {
+                    kind: "group".into(),
+                    pattern: None,
+                },
+                agent_id: "clawhive-group".into(),
+                delivery: None,
+            });
         });
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
@@ -1505,16 +1713,18 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_agent_mismatched_connector_uses_default() {
-        let (mut gw, _tmp) = make_gateway().await;
-        gw.routing.bindings.push(RoutingBinding {
-            channel_type: "telegram".into(),
-            connector_id: "tg_other".into(),
-            match_rule: MatchRule {
-                kind: "dm".into(),
-                pattern: None,
-            },
-            agent_id: "clawhive-other".into(),
-            delivery: None,
+        let (gw, _tmp) = make_gateway().await;
+        apply_test_routing(&gw, |routing| {
+            routing.bindings.push(RoutingBinding {
+                channel_type: "telegram".into(),
+                connector_id: "tg_other".into(),
+                match_rule: MatchRule {
+                    kind: "dm".into(),
+                    pattern: None,
+                },
+                agent_id: "clawhive-other".into(),
+                delivery: None,
+            });
         });
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),

@@ -141,6 +141,54 @@ fn test_full_agent(agent_id: &str, primary: &str, fallbacks: Vec<&str>) -> FullA
     }
 }
 
+struct TestToolDeps<'a> {
+    publisher: &'a clawhive_bus::BusPublisher,
+    workspace_root: &'a std::path::Path,
+    schedule_manager: Arc<ScheduleManager>,
+    file_store: &'a MemoryFileStore,
+    search_index: &'a SearchIndex,
+    embedding_provider: Arc<dyn EmbeddingProvider>,
+}
+
+fn build_test_config_view(
+    agents: Vec<FullAgentConfig>,
+    router: LlmRouter,
+    deps: TestToolDeps<'_>,
+) -> ConfigView {
+    let personas = HashMap::new();
+    let default_agent_id = agents
+        .first()
+        .map(|agent| agent.agent_id.clone())
+        .unwrap_or_else(|| "clawhive-main".to_string());
+    let tool_registry = build_tool_registry(
+        deps.file_store,
+        deps.search_index,
+        &deps.embedding_provider,
+        deps.workspace_root,
+        deps.workspace_root,
+        &None,
+        deps.publisher,
+        deps.schedule_manager,
+        None,
+        &router,
+        &agents,
+        &personas,
+    );
+
+    ConfigView::new(
+        0,
+        agents,
+        personas,
+        RoutingConfig {
+            default_agent_id,
+            bindings: vec![],
+        },
+        router,
+        tool_registry,
+        deps.embedding_provider,
+    )
+}
+
 async fn make_orchestrator(
     registry: ProviderRegistry,
     aliases: HashMap<String, String>,
@@ -151,6 +199,9 @@ async fn make_orchestrator(
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let bus = EventBus::new(16);
     let publisher = bus.publisher();
+    let file_store = MemoryFileStore::new(tmp.path());
+    let search_index = SearchIndex::new(memory.db());
+    let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let schedule_manager = Arc::new(
         ScheduleManager::new(
             SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
@@ -159,16 +210,27 @@ async fn make_orchestrator(
         .await
         .unwrap(),
     );
+    let config_view = build_test_config_view(
+        agents,
+        router,
+        TestToolDeps {
+            publisher: &publisher,
+            workspace_root: tmp.path(),
+            schedule_manager: Arc::clone(&schedule_manager),
+            file_store: &file_store,
+            search_index: &search_index,
+            embedding_provider,
+        },
+    );
     (
         OrchestratorBuilder::new(
-            router,
+            config_view,
             publisher,
             memory,
             Arc::new(NativeExecutor),
             tmp.path().to_path_buf(),
             schedule_manager,
         )
-        .agents(agents)
         .build(),
         tmp,
     )
@@ -212,20 +274,31 @@ async fn orchestrator_uses_search_index_for_memory_context() {
         .await
         .unwrap();
 
-    let orch = OrchestratorBuilder::new(
+    let config_view = build_test_config_view(
+        agents,
         router,
+        TestToolDeps {
+            publisher: &bus.publisher(),
+            workspace_root: tmp.path(),
+            schedule_manager: Arc::clone(&schedule_manager),
+            file_store: &file_store,
+            search_index: &search_index,
+            embedding_provider: Arc::clone(&embedding_provider),
+        },
+    );
+
+    let orch = OrchestratorBuilder::new(
+        config_view,
         bus.publisher(),
         memory,
         Arc::new(NativeExecutor),
         tmp.path().to_path_buf(),
         schedule_manager,
     )
-    .agents(agents)
     .file_store(file_store)
     .session_writer(session_writer)
     .session_reader(session_reader)
     .search_index(search_index)
-    .embedding_provider(Arc::clone(&embedding_provider))
     .build();
 
     let out = orch
@@ -234,6 +307,26 @@ async fn orchestrator_uses_search_index_for_memory_context() {
         .unwrap();
     assert!(out.text.contains("## Relevant Memory"));
     assert!(out.text.contains("MEMORY.md (score:"));
+}
+
+#[tokio::test]
+async fn disabled_agents_are_not_available_to_the_orchestrator() {
+    let mut registry = ProviderRegistry::new();
+    register_builtin_providers(&mut registry);
+    let aliases = HashMap::from([(
+        "sonnet".to_string(),
+        "anthropic/claude-sonnet-4-5".to_string(),
+    )]);
+    let mut agent = test_full_agent("clawhive-main", "sonnet", vec![]);
+    agent.enabled = false;
+
+    let (orch, _tmp) = make_orchestrator(registry, aliases, vec![agent]).await;
+    let err = orch
+        .handle_inbound(test_inbound("hello"), "clawhive-main")
+        .await
+        .expect_err("disabled agents should not be available");
+
+    assert!(err.to_string().contains("agent not found: clawhive-main"));
 }
 
 #[tokio::test]
@@ -362,15 +455,29 @@ async fn orchestrator_creates_session() {
         .await
         .unwrap(),
     );
-    let orch = OrchestratorBuilder::new(
+    let file_store = MemoryFileStore::new(tmp.path());
+    let search_index = SearchIndex::new(memory.db());
+    let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
+    let config_view = build_test_config_view(
+        agents,
         router,
+        TestToolDeps {
+            publisher: &bus.publisher(),
+            workspace_root: tmp.path(),
+            schedule_manager: Arc::clone(&schedule_manager),
+            file_store: &file_store,
+            search_index: &search_index,
+            embedding_provider,
+        },
+    );
+    let orch = OrchestratorBuilder::new(
+        config_view,
         bus.publisher(),
         memory.clone(),
         Arc::new(NativeExecutor),
         tmp.path().to_path_buf(),
         schedule_manager,
     )
-    .agents(agents)
     .build();
 
     let inbound = test_inbound("hello");
@@ -412,25 +519,6 @@ async fn orchestrator_unknown_agent_returns_error() {
 }
 
 #[tokio::test]
-async fn orchestrator_disabled_agent_still_reachable() {
-    let mut registry = ProviderRegistry::new();
-    register_builtin_providers(&mut registry);
-    let aliases = HashMap::from([(
-        "sonnet".to_string(),
-        "anthropic/claude-sonnet-4-5".to_string(),
-    )]);
-    let mut agent = test_full_agent("clawhive-main", "sonnet", vec![]);
-    agent.enabled = false;
-    let (orch, _tmp) = make_orchestrator(registry, aliases, vec![agent]).await;
-
-    let out = orch
-        .handle_inbound(test_inbound("hello"), "clawhive-main")
-        .await
-        .unwrap();
-    assert!(!out.text.is_empty());
-}
-
-#[tokio::test]
 async fn orchestrator_publishes_reply_ready() {
     let mut registry = ProviderRegistry::new();
     register_builtin_providers(&mut registry);
@@ -452,15 +540,29 @@ async fn orchestrator_publishes_reply_ready() {
         .await
         .unwrap(),
     );
-    let orch = OrchestratorBuilder::new(
+    let file_store = MemoryFileStore::new(tmp.path());
+    let search_index = SearchIndex::new(memory.db());
+    let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
+    let config_view = build_test_config_view(
+        agents,
         router,
+        TestToolDeps {
+            publisher: &bus.publisher(),
+            workspace_root: tmp.path(),
+            schedule_manager: Arc::clone(&schedule_manager),
+            file_store: &file_store,
+            search_index: &search_index,
+            embedding_provider,
+        },
+    );
+    let orch = OrchestratorBuilder::new(
+        config_view,
         bus.publisher(),
         memory,
         Arc::new(NativeExecutor),
         tmp.path().to_path_buf(),
         schedule_manager,
     )
-    .agents(agents)
     .build();
 
     let _ = orch

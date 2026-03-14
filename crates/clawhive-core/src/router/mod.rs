@@ -18,6 +18,7 @@ use tokio::time;
 const MAX_RETRIES: usize = 2;
 const BASE_BACKOFF_MS: u64 = 1000;
 
+#[derive(Clone)]
 pub struct LlmRouter {
     registry: ProviderRegistry,
     aliases: HashMap<String, String>,

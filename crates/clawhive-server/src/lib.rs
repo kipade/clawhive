@@ -84,6 +84,10 @@ fn is_schedule_run_path(path: &str) -> bool {
     path.starts_with("/api/schedules/") && path.ends_with("/run")
 }
 
+fn is_internal_cli_path(path: &str) -> bool {
+    is_schedule_run_path(path) || path == "/api/admin/reload-config"
+}
+
 fn read_internal_cli_token(root: &std::path::Path) -> Option<String> {
     let path = root.join(INTERNAL_CLI_TOKEN_FILE);
     let token = std::fs::read_to_string(path).ok()?;
@@ -202,7 +206,7 @@ pub(crate) fn is_valid_session(state: &AppState, token: &str) -> bool {
 async fn auth_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let path = request.uri().path();
 
-    if is_schedule_run_path(path)
+    if is_internal_cli_path(path)
         && request
             .headers()
             .get(INTERNAL_CLI_TOKEN_HEADER)
@@ -285,9 +289,8 @@ mod tests {
                 enable_openai_oauth_callback_listener: true,
                 daemon_mode: false,
                 port: 3000,
-                webhook_config: Arc::new(std::sync::RwLock::new(None)),
-                routing_config: Arc::new(std::sync::RwLock::new(None)),
                 schedule_manager: None,
+                reload_coordinator: None,
             },
             tmp,
         )
@@ -428,6 +431,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn internal_cli_token_can_call_reload_endpoint() {
+        let (state, tmp) = setup_state(Some(hash_password("correct")));
+        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
+        let token = "test-cli-token";
+        std::fs::write(tmp.path().join("data/cli_internal_token"), token).unwrap();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/reload-config")
+                    .header("x-clawhive-cli-token", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

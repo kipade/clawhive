@@ -609,9 +609,8 @@ mod tests {
                 enable_openai_oauth_callback_listener: false,
                 daemon_mode: false,
                 port: 3000,
-                webhook_config: Arc::new(RwLock::new(None)),
-                routing_config: Arc::new(RwLock::new(None)),
                 schedule_manager: None,
+                reload_coordinator: None,
             },
             tmp,
         )

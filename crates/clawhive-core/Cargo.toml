@@ -25,6 +25,7 @@ clawhive-memory = { path = "../clawhive-memory" }
 clawhive-bus = { path = "../clawhive-bus" }
 clawhive-runtime = { path = "../clawhive-runtime" }
 clawhive-scheduler = { path = "../clawhive-scheduler" }
+clawhive-auth = { path = "../clawhive-auth" }
 reqwest.workspace = true
 htmd = "0.5"
 corral-core = { git = "https://github.com/longzhi/corral", rev = "99c6361", package = "corral-core", default-features = false, features = ["broker"] }

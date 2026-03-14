@@ -741,6 +741,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "clawhive-auth",
  "clawhive-bus",
  "clawhive-memory",
  "clawhive-provider",
@@ -771,6 +772,7 @@ name = "clawhive-gateway"
 version = "0.1.0-alpha.27"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "chrono",
  "clawhive-bus",
  "clawhive-core",
@@ -784,6 +786,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -5133,6 +5136,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

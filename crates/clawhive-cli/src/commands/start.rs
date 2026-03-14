@@ -13,8 +13,10 @@ use clawhive_channels::wecom::WeComBot;
 use clawhive_channels::ChannelBot;
 use clawhive_core::heartbeat::{is_heartbeat_ack, should_skip_heartbeat, DEFAULT_HEARTBEAT_PROMPT};
 use clawhive_core::*;
+use clawhive_gateway::supervisor::{BotFactory, ChannelSupervisor};
 use clawhive_gateway::{
     spawn_approval_delivery_listener, spawn_scheduled_task_listener, spawn_wait_task_listener,
+    ReloadCoordinator,
 };
 
 use crate::runtime::bootstrap::{bootstrap, build_embedding_provider, build_router_from_config};
@@ -180,6 +182,180 @@ fn stop_process(root: &Path) -> Result<bool> {
     remove_port_file(root);
     println!("Killed.");
     Ok(true)
+}
+
+fn build_bot_factory() -> BotFactory {
+    Arc::new(|channel_type, config, gateway, bus| match channel_type {
+        "telegram" => {
+            let token = config["token"].as_str().unwrap_or_default().to_string();
+            let connector_id = config["connector_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let require_mention = config["require_mention"].as_bool().unwrap_or(false);
+            let bot = TelegramBot::new(token, connector_id, gateway, bus)
+                .with_require_mention(require_mention);
+            Ok(Box::pin(async move { Box::new(bot).run().await })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
+                >)
+        }
+        "discord" => {
+            let token = config["token"].as_str().unwrap_or_default().to_string();
+            let connector_id = config["connector_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let groups = config["groups"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
+            let require_mention = config["require_mention"].as_bool().unwrap_or(false);
+            let bot = DiscordBot::new(token, connector_id, gateway)
+                .with_bus(bus)
+                .with_groups(groups)
+                .with_require_mention(require_mention);
+            Ok(Box::pin(async move { Box::new(bot).run().await })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
+                >)
+        }
+        "feishu" => {
+            let app_id = config["app_id"].as_str().unwrap_or_default().to_string();
+            let app_secret = config["app_secret"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let connector_id = config["connector_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let bot = FeishuBot::new(app_id, app_secret, connector_id, gateway, bus);
+            Ok(Box::pin(async move { Box::new(bot).run().await })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
+                >)
+        }
+        "dingtalk" => {
+            let client_id = config["client_id"].as_str().unwrap_or_default().to_string();
+            let client_secret = config["client_secret"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let connector_id = config["connector_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let bot = DingTalkBot::new(client_id, client_secret, connector_id, gateway, bus);
+            Ok(Box::pin(async move { Box::new(bot).run().await })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
+                >)
+        }
+        "wecom" => {
+            let bot_id = config["bot_id"].as_str().unwrap_or_default().to_string();
+            let secret = config["secret"].as_str().unwrap_or_default().to_string();
+            let connector_id = config["connector_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let bot = WeComBot::new(bot_id, secret, connector_id, gateway, bus);
+            Ok(Box::pin(async move { Box::new(bot).run().await })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
+                >)
+        }
+        _ => Err(anyhow::anyhow!("unknown channel type: {channel_type}")),
+    })
+}
+
+fn start_configured_bots(
+    supervisor: &mut ChannelSupervisor,
+    config: &ClawhiveConfig,
+) -> Result<usize> {
+    let mut started = 0usize;
+
+    if let Some(tg) = &config.main.channels.telegram {
+        if tg.enabled {
+            for connector in &tg.connectors {
+                let config_json = serde_json::to_value(connector)?;
+                if let Err(error) =
+                    supervisor.start(connector.connector_id.clone(), "telegram", config_json)
+                {
+                    tracing::error!(connector = %connector.connector_id, "failed to start telegram bot: {error}");
+                } else {
+                    started += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(dc) = &config.main.channels.discord {
+        if dc.enabled {
+            for connector in &dc.connectors {
+                let config_json = serde_json::to_value(connector)?;
+                if let Err(error) =
+                    supervisor.start(connector.connector_id.clone(), "discord", config_json)
+                {
+                    tracing::error!(connector = %connector.connector_id, "failed to start discord bot: {error}");
+                } else {
+                    started += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(feishu) = &config.main.channels.feishu {
+        if feishu.enabled {
+            for connector in &feishu.connectors {
+                let config_json = serde_json::to_value(connector)?;
+                if let Err(error) =
+                    supervisor.start(connector.connector_id.clone(), "feishu", config_json)
+                {
+                    tracing::error!(connector = %connector.connector_id, "failed to start feishu bot: {error}");
+                } else {
+                    started += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(dingtalk) = &config.main.channels.dingtalk {
+        if dingtalk.enabled {
+            for connector in &dingtalk.connectors {
+                let config_json = serde_json::to_value(connector)?;
+                if let Err(error) =
+                    supervisor.start(connector.connector_id.clone(), "dingtalk", config_json)
+                {
+                    tracing::error!(connector = %connector.connector_id, "failed to start dingtalk bot: {error}");
+                } else {
+                    started += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(wecom) = &config.main.channels.wecom {
+        if wecom.enabled {
+            for connector in &wecom.connectors {
+                let config_json = serde_json::to_value(connector)?;
+                if let Err(error) =
+                    supervisor.start(connector.connector_id.clone(), "wecom", config_json)
+                {
+                    tracing::error!(connector = %connector.connector_id, "failed to start wecom bot: {error}");
+                } else {
+                    started += 1;
+                }
+            }
+        }
+    }
+
+    Ok(started)
 }
 
 async fn start_bot(
@@ -372,7 +548,40 @@ async fn start_bot(
         );
     }
 
-    // Start embedded HTTP API server
+    let bot_factory = build_bot_factory();
+    let mut supervisor =
+        ChannelSupervisor::new(gateway.clone(), bus.clone()).with_bot_factory(bot_factory);
+    let started_bots = start_configured_bots(&mut supervisor, &config)?;
+    let supervisor = Arc::new(tokio::sync::Mutex::new(supervisor));
+    let reload_coordinator = Arc::new(ReloadCoordinator::new(
+        config.clone(),
+        Arc::clone(gateway.orchestrator()),
+        Arc::clone(&supervisor),
+        root.to_path_buf(),
+        Arc::clone(&memory),
+        bus.publisher(),
+        Arc::clone(&schedule_manager),
+        Some(Arc::clone(&approval_registry)),
+    ));
+
+    #[cfg(unix)]
+    {
+        let rc = Arc::clone(&reload_coordinator);
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        tokio::spawn(async move {
+            loop {
+                sighup.recv().await;
+                tracing::info!("SIGHUP received, triggering config reload");
+                match rc.reload().await {
+                    Ok(outcome) => {
+                        tracing::info!(generation = outcome.generation, "reload complete")
+                    }
+                    Err(error) => tracing::error!("reload failed: {error}"),
+                }
+            }
+        });
+    }
+
     let web_password_hash = std::fs::read_to_string(root.join("config/main.yaml"))
         .ok()
         .and_then(|content| serde_yaml::from_str::<serde_yaml::Value>(&content).ok())
@@ -388,12 +597,9 @@ async fn start_bot(
         enable_openai_oauth_callback_listener: true,
         daemon_mode: false,
         port,
-        webhook_config: Arc::new(RwLock::new(None)),
-        routing_config: Arc::new(RwLock::new(None)),
         schedule_manager: Some(Arc::clone(&schedule_manager)),
+        reload_coordinator: Some(Arc::clone(&reload_coordinator)),
     };
-    http_state.load_webhook_config_from_disk();
-    http_state.load_routing_config_from_disk();
     let http_addr = format!("0.0.0.0:{port}");
     tokio::spawn(async move {
         if let Err(err) = clawhive_server::serve(http_state, &http_addr).await {
@@ -413,116 +619,6 @@ async fn start_bot(
         None
     };
 
-    let mut bots: Vec<Box<dyn ChannelBot>> = Vec::new();
-
-    if let Some(tg_config) = &config.main.channels.telegram {
-        if tg_config.enabled {
-            for connector in &tg_config.connectors {
-                let token = resolve_env_var(&connector.token);
-                if token.is_empty() {
-                    tracing::warn!(
-                        "Telegram token is empty for connector {}, skipping",
-                        connector.connector_id
-                    );
-                    continue;
-                }
-                tracing::info!(
-                    "Registering Telegram bot: {} (require_mention: {})",
-                    connector.connector_id,
-                    connector.require_mention
-                );
-                bots.push(Box::new(
-                    TelegramBot::new(
-                        token,
-                        connector.connector_id.clone(),
-                        gateway.clone(),
-                        bus.clone(),
-                    )
-                    .with_require_mention(connector.require_mention),
-                ));
-            }
-        }
-    }
-
-    if let Some(dc_config) = &config.main.channels.discord {
-        if dc_config.enabled {
-            for connector in &dc_config.connectors {
-                let token = resolve_env_var(&connector.token);
-                if token.is_empty() {
-                    tracing::warn!(
-                        "Discord token is empty for connector {}, skipping",
-                        connector.connector_id
-                    );
-                    continue;
-                }
-                tracing::info!(
-                    "Registering Discord bot: {} (groups: {}, require_mention: {})",
-                    connector.connector_id,
-                    if connector.groups.is_empty() {
-                        "all".to_string()
-                    } else {
-                        connector.groups.len().to_string()
-                    },
-                    connector.require_mention
-                );
-                bots.push(Box::new(
-                    DiscordBot::new(token, connector.connector_id.clone(), gateway.clone())
-                        .with_bus(bus.clone())
-                        .with_groups(connector.groups.clone())
-                        .with_require_mention(connector.require_mention),
-                ));
-            }
-        }
-    }
-
-    // Feishu
-    if let Some(feishu_config) = &config.main.channels.feishu {
-        if feishu_config.enabled {
-            for connector in &feishu_config.connectors {
-                tracing::info!("Registering Feishu bot: {}", connector.connector_id);
-                bots.push(Box::new(FeishuBot::new(
-                    connector.app_id.clone(),
-                    connector.app_secret.clone(),
-                    connector.connector_id.clone(),
-                    gateway.clone(),
-                    bus.clone(),
-                )));
-            }
-        }
-    }
-
-    // DingTalk
-    if let Some(dingtalk_config) = &config.main.channels.dingtalk {
-        if dingtalk_config.enabled {
-            for connector in &dingtalk_config.connectors {
-                tracing::info!("Registering DingTalk bot: {}", connector.connector_id);
-                bots.push(Box::new(DingTalkBot::new(
-                    connector.client_id.clone(),
-                    connector.client_secret.clone(),
-                    connector.connector_id.clone(),
-                    gateway.clone(),
-                    bus.clone(),
-                )));
-            }
-        }
-    }
-
-    // WeCom
-    if let Some(wecom_config) = &config.main.channels.wecom {
-        if wecom_config.enabled {
-            for connector in &wecom_config.connectors {
-                tracing::info!("Registering WeCom bot: {}", connector.connector_id);
-                bots.push(Box::new(WeComBot::new(
-                    connector.bot_id.clone(),
-                    connector.secret.clone(),
-                    connector.connector_id.clone(),
-                    gateway.clone(),
-                    bus.clone(),
-                )));
-            }
-        }
-    }
-
     // Webhook sources (no ChannelBot needed — uses HTTP endpoint in clawhive-server)
     if let Some(webhook_config) = &config.main.channels.webhook {
         if webhook_config.enabled {
@@ -536,7 +632,7 @@ async fn start_bot(
         }
     }
 
-    if bots.is_empty() {
+    if started_bots == 0 {
         tracing::warn!("No channel bots configured or enabled. HTTP server is running for setup.");
         eprintln!("  No channel bots configured yet.");
         eprintln!();
@@ -565,38 +661,7 @@ async fn start_bot(
         return Ok(());
     }
 
-    tracing::info!("Starting {} channel bot(s)", bots.len());
-
-    // Run bots with graceful shutdown on SIGTERM/SIGINT
     let root_for_cleanup = root.to_path_buf();
-    let bot_future = async {
-        if bots.len() == 1 {
-            let bot = bots.into_iter().next().unwrap();
-            tracing::info!(
-                "Starting {} bot: {}",
-                bot.channel_type(),
-                bot.connector_id()
-            );
-            bot.run().await
-        } else {
-            let mut handles = Vec::new();
-            for bot in bots {
-                let channel = bot.channel_type().to_string();
-                let connector = bot.connector_id().to_string();
-                handles.push(tokio::spawn(async move {
-                    tracing::info!("Starting {channel} bot: {connector}");
-                    if let Err(err) = bot.run().await {
-                        tracing::error!("{channel} bot ({connector}) exited with error: {err}");
-                    }
-                }));
-            }
-            for handle in handles {
-                let _ = handle.await;
-            }
-            Ok(())
-        }
-    };
-
     let shutdown_signal = async {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
@@ -617,12 +682,8 @@ async fn start_bot(
     };
 
     tokio::select! {
-        result = bot_future => {
-            remove_pid_file(&root_for_cleanup);
-            remove_port_file(&root_for_cleanup);
-            result?;
-        }
         _ = shutdown_signal => {
+            supervisor.lock().await.shutdown_all().await;
             remove_pid_file(&root_for_cleanup);
             remove_port_file(&root_for_cleanup);
             tracing::info!("PID file cleaned up. Goodbye.");

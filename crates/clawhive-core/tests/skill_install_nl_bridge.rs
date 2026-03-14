@@ -3,9 +3,12 @@ use std::sync::Arc;
 
 use clawhive_bus::EventBus;
 use clawhive_core::{
-    detect_skill_install_intent, FullAgentConfig, LlmRouter, ModelPolicy, Orchestrator,
-    OrchestratorBuilder, SecurityMode,
+    build_tool_registry, detect_skill_install_intent, ConfigView, FullAgentConfig, LlmRouter,
+    ModelPolicy, Orchestrator, OrchestratorBuilder, RoutingConfig, SecurityMode,
 };
+use clawhive_memory::embedding::{EmbeddingProvider, StubEmbeddingProvider};
+use clawhive_memory::file_store::MemoryFileStore;
+use clawhive_memory::search_index::SearchIndex;
 use clawhive_memory::MemoryStore;
 use clawhive_provider::ProviderRegistry;
 use clawhive_runtime::NativeExecutor;
@@ -57,6 +60,9 @@ async fn make_orchestrator() -> (Orchestrator, tempfile::TempDir) {
     let tmp = tempfile::TempDir::new().unwrap();
     let router = LlmRouter::new(ProviderRegistry::new(), HashMap::new(), vec![]);
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
+    let file_store = MemoryFileStore::new(tmp.path());
+    let search_index = SearchIndex::new(memory.db());
+    let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let schedule_manager = Arc::new(
         ScheduleManager::new(
             SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
@@ -65,16 +71,44 @@ async fn make_orchestrator() -> (Orchestrator, tempfile::TempDir) {
         .await
         .unwrap(),
     );
+    let publisher = EventBus::new(16).publisher();
+    let agents = vec![test_full_agent()];
+    let personas = HashMap::new();
+    let tool_registry = build_tool_registry(
+        &file_store,
+        &search_index,
+        &embedding_provider,
+        tmp.path(),
+        tmp.path(),
+        &None,
+        &publisher,
+        Arc::clone(&schedule_manager),
+        None,
+        &router,
+        &agents,
+        &personas,
+    );
+    let config_view = ConfigView::new(
+        0,
+        agents,
+        personas,
+        RoutingConfig {
+            default_agent_id: "clawhive-main".to_string(),
+            bindings: vec![],
+        },
+        router,
+        tool_registry,
+        embedding_provider,
+    );
 
     let orchestrator = OrchestratorBuilder::new(
-        router,
-        EventBus::new(16).publisher(),
+        config_view,
+        publisher,
         memory,
         Arc::new(NativeExecutor),
         tmp.path().to_path_buf(),
         schedule_manager,
     )
-    .agents(vec![test_full_agent()])
     .build();
 
     (orchestrator, tmp)

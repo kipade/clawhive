@@ -62,6 +62,8 @@ enum Commands {
     Status,
     #[command(about = "Stop a running clawhive process")]
     Stop,
+    #[command(about = "Trigger config hot-reload on a running clawhive daemon")]
+    Reload,
     #[command(about = "Restart clawhive (stop + start as daemon)")]
     Restart {
         #[arg(long, default_value_t = DEFAULT_PORT, help = "HTTP API server port")]
@@ -254,6 +256,9 @@ async fn main() -> Result<()> {
         }
         Commands::Stop => {
             commands::start::run_stop(&cli.config_root)?;
+        }
+        Commands::Reload => {
+            commands::reload::run(&cli.config_root).await?;
         }
         Commands::Restart {
             port,
@@ -463,6 +468,12 @@ mod tests {
     fn parses_stop_subcommand() {
         let cli = Cli::try_parse_from(["clawhive", "stop"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Stop));
+    }
+
+    #[test]
+    fn parses_reload_subcommand() {
+        let cli = Cli::try_parse_from(["clawhive", "reload"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Reload));
     }
 
     #[test]

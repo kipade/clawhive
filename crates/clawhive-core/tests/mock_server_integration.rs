@@ -3,6 +3,9 @@ use std::sync::Arc;
 
 use clawhive_bus::{EventBus, Topic};
 use clawhive_core::*;
+use clawhive_memory::embedding::{EmbeddingProvider, StubEmbeddingProvider};
+use clawhive_memory::file_store::MemoryFileStore;
+use clawhive_memory::search_index::SearchIndex;
 use clawhive_memory::MemoryStore;
 use clawhive_memory::SessionReader;
 use clawhive_provider::{AnthropicProvider, LlmMessage, LlmProvider, LlmRequest, ProviderRegistry};
@@ -100,16 +103,46 @@ async fn make_orchestrator_with_provider(
         .await
         .unwrap(),
     );
+    let publisher = bus.publisher();
+    let file_store = MemoryFileStore::new(tmp.path());
+    let search_index = SearchIndex::new(memory.db());
+    let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
+    let personas = HashMap::new();
+    let tool_registry = build_tool_registry(
+        &file_store,
+        &search_index,
+        &embedding_provider,
+        tmp.path(),
+        tmp.path(),
+        &None,
+        &publisher,
+        Arc::clone(&schedule_manager),
+        None,
+        &router,
+        &agents,
+        &personas,
+    );
+    let config_view = ConfigView::new(
+        0,
+        agents,
+        personas,
+        RoutingConfig {
+            default_agent_id: "clawhive-main".to_string(),
+            bindings: vec![],
+        },
+        router,
+        tool_registry,
+        embedding_provider,
+    );
     (
         OrchestratorBuilder::new(
-            router,
-            bus.publisher(),
+            config_view,
+            publisher,
             memory,
             Arc::new(NativeExecutor),
             tmp.path().to_path_buf(),
             schedule_manager,
         )
-        .agents(agents)
         .build(),
         tmp,
     )

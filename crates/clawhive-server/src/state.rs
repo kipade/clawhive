@@ -4,8 +4,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use clawhive_auth::oauth::{OpenAiOAuthConfig, OPENAI_OAUTH_CLIENT_ID};
-use clawhive_core::config::{RoutingConfig, WebhookChannelConfig};
-use clawhive_gateway::Gateway;
+use clawhive_core::config_view::ConfigView;
+use clawhive_gateway::{Gateway, ReloadCoordinator};
 use clawhive_scheduler::ScheduleManager;
 
 #[derive(Debug, Clone)]
@@ -41,43 +41,15 @@ pub struct AppState {
     pub daemon_mode: bool,
     /// HTTP port the server is listening on (for restart).
     pub port: u16,
-    /// Cached webhook channel config (loaded at startup, refreshed on CRUD writes).
-    pub webhook_config: Arc<RwLock<Option<WebhookChannelConfig>>>,
-    /// Cached routing config (loaded at startup).
-    pub routing_config: Arc<RwLock<Option<RoutingConfig>>>,
     /// Shared schedule manager for schedule API routes.
     pub schedule_manager: Option<Arc<ScheduleManager>>,
+    pub reload_coordinator: Option<Arc<ReloadCoordinator>>,
 }
 
 impl AppState {
-    /// Refresh the webhook config cache from a parsed main.yaml value.
-    pub fn refresh_webhook_cache(&self, main_yaml: &serde_yaml::Value) {
-        let cfg = main_yaml
-            .get("channels")
-            .and_then(|c| c.get("webhook").cloned())
-            .and_then(|w| serde_yaml::from_value::<WebhookChannelConfig>(w).ok())
-            .filter(|c| c.enabled);
-        *self.webhook_config.write().unwrap() = cfg;
-    }
-
-    /// Load webhook config from disk into the cache.
-    pub fn load_webhook_config_from_disk(&self) {
-        let path = self.root.join("config/main.yaml");
-        let cfg = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| serde_yaml::from_str::<serde_yaml::Value>(&content).ok())
-            .and_then(|val| val.get("channels")?.get("webhook").cloned())
-            .and_then(|w| serde_yaml::from_value::<WebhookChannelConfig>(w).ok())
-            .filter(|c| c.enabled);
-        *self.webhook_config.write().unwrap() = cfg;
-    }
-
-    /// Load routing config from disk into the cache.
-    pub fn load_routing_config_from_disk(&self) {
-        let path = self.root.join("config/routing.yaml");
-        let cfg = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| serde_yaml::from_str::<RoutingConfig>(&content).ok());
-        *self.routing_config.write().unwrap() = cfg;
+    pub fn config_view(&self) -> Option<Arc<ConfigView>> {
+        self.gateway
+            .as_ref()
+            .map(|gateway| gateway.orchestrator().config_view())
     }
 }

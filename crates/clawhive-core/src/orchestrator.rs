@@ -15,6 +15,8 @@ use clawhive_runtime::TaskExecutor;
 use clawhive_schema::*;
 use futures_core::Stream;
 
+use crate::config_view::ConfigView;
+
 use super::language_prefs::{
     apply_language_policy_prompt, detect_response_language, is_language_guard_exempt,
     log_language_guard, LanguagePrefs,
@@ -42,9 +44,7 @@ use super::workspace_manager::{AgentWorkspaceManager, AgentWorkspaceState};
 const SKILL_INSTALL_USAGE_HINT: &str = "请提供 skill 来源路径或 URL。用法: /skill install <source>";
 
 pub struct Orchestrator {
-    router: Arc<LlmRouter>,
-    agents: HashMap<String, FullAgentConfig>,
-    personas: HashMap<String, Persona>,
+    config_view: ArcSwap<ConfigView>,
     session_mgr: SessionManager,
     session_locks: super::session_lock::SessionLockManager,
     context_manager: super::context::ContextManager,
@@ -57,8 +57,6 @@ pub struct Orchestrator {
     approval_registry: Option<Arc<ApprovalRegistry>>,
     runtime: Arc<dyn TaskExecutor>,
     workspaces: AgentWorkspaceManager,
-    embedding_provider: Arc<dyn EmbeddingProvider>,
-    tool_registry: ToolRegistry,
     skill_install_state: Arc<SkillInstallState>,
     language_prefs: LanguagePrefs,
 }
@@ -66,20 +64,15 @@ pub struct Orchestrator {
 /// Builder for [`Orchestrator`]. Use [`OrchestratorBuilder::new`] to start,
 /// call optional setters, then call [`OrchestratorBuilder::build`].
 pub struct OrchestratorBuilder {
-    router: LlmRouter,
+    config_view: Option<ConfigView>,
     bus: BusPublisher,
     memory: Arc<MemoryStore>,
     runtime: Arc<dyn TaskExecutor>,
     workspace_root: std::path::PathBuf,
-    schedule_manager: Arc<clawhive_scheduler::ScheduleManager>,
     // Optional with defaults
-    agents: Vec<FullAgentConfig>,
-    personas: HashMap<String, Persona>,
     session_mgr: Option<SessionManager>,
     skill_registry: Option<SkillRegistry>,
     approval_registry: Option<Arc<ApprovalRegistry>>,
-    embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
-    brave_api_key: Option<String>,
     project_root: Option<std::path::PathBuf>,
     // Allow overriding auto-derived workspace I/O (e.g. in tests with pre-populated stores)
     file_store: Option<MemoryFileStore>,
@@ -90,43 +83,28 @@ pub struct OrchestratorBuilder {
 
 impl OrchestratorBuilder {
     pub fn new(
-        router: LlmRouter,
+        config_view: ConfigView,
         bus: BusPublisher,
         memory: Arc<MemoryStore>,
         runtime: Arc<dyn TaskExecutor>,
         workspace_root: std::path::PathBuf,
-        schedule_manager: Arc<clawhive_scheduler::ScheduleManager>,
+        _schedule_manager: Arc<clawhive_scheduler::ScheduleManager>,
     ) -> Self {
         Self {
-            router,
+            config_view: Some(config_view),
             bus,
             memory,
             runtime,
             workspace_root,
-            schedule_manager,
-            agents: vec![],
-            personas: HashMap::new(),
             session_mgr: None,
             skill_registry: None,
             approval_registry: None,
-            embedding_provider: None,
-            brave_api_key: None,
             project_root: None,
             file_store: None,
             session_writer: None,
             session_reader: None,
             search_index: None,
         }
-    }
-
-    pub fn agents(mut self, agents: Vec<FullAgentConfig>) -> Self {
-        self.agents = agents;
-        self
-    }
-
-    pub fn personas(mut self, personas: HashMap<String, Persona>) -> Self {
-        self.personas = personas;
-        self
     }
 
     pub fn session_mgr(mut self, session_mgr: SessionManager) -> Self {
@@ -141,16 +119,6 @@ impl OrchestratorBuilder {
 
     pub fn approval_registry(mut self, approval_registry: Arc<ApprovalRegistry>) -> Self {
         self.approval_registry = Some(approval_registry);
-        self
-    }
-
-    pub fn embedding_provider(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
-        self.embedding_provider = Some(provider);
-        self
-    }
-
-    pub fn brave_api_key(mut self, key: Option<String>) -> Self {
-        self.brave_api_key = key;
         self
     }
 
@@ -195,14 +163,12 @@ impl OrchestratorBuilder {
         let session_mgr = self
             .session_mgr
             .unwrap_or_else(|| SessionManager::new(self.memory.clone(), 1800));
-        let embedding_provider = self
-            .embedding_provider
-            .unwrap_or_else(|| Arc::new(clawhive_memory::embedding::StubEmbeddingProvider::new(8)));
+        let config_view = self
+            .config_view
+            .expect("orchestrator builder requires config_view");
 
         Orchestrator::new(
-            self.router,
-            self.agents,
-            self.personas,
+            config_view,
             session_mgr,
             self.skill_registry.unwrap_or_default(),
             self.memory,
@@ -213,11 +179,8 @@ impl OrchestratorBuilder {
             session_writer,
             session_reader,
             search_index,
-            embedding_provider,
             self.workspace_root,
-            self.brave_api_key,
             self.project_root,
-            self.schedule_manager,
         )
     }
 }
@@ -225,9 +188,7 @@ impl OrchestratorBuilder {
 impl Orchestrator {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        router: LlmRouter,
-        agents: Vec<FullAgentConfig>,
-        personas: HashMap<String, Persona>,
+        config_view: ConfigView,
         session_mgr: SessionManager,
         skill_registry: SkillRegistry,
         memory: Arc<MemoryStore>,
@@ -238,23 +199,15 @@ impl Orchestrator {
         session_writer: SessionWriter,
         session_reader: SessionReader,
         search_index: SearchIndex,
-        embedding_provider: Arc<dyn EmbeddingProvider>,
         workspace_root: std::path::PathBuf,
-        brave_api_key: Option<String>,
         project_root: Option<std::path::PathBuf>,
-        schedule_manager: Arc<clawhive_scheduler::ScheduleManager>,
     ) -> Self {
-        let router = Arc::new(router);
-        let agents_map: HashMap<String, FullAgentConfig> = agents
-            .into_iter()
-            .map(|a| (a.agent_id.clone(), a))
-            .collect();
-        let personas_for_subagent = personas.clone();
+        let router = Arc::new(config_view.router.clone());
 
         // Build per-agent workspace states
         let effective_project_root = project_root.unwrap_or_else(|| workspace_root.clone());
         let mut agent_workspace_map = HashMap::new();
-        for (agent_id, agent_cfg) in &agents_map {
+        for (agent_id, agent_cfg) in &config_view.agents {
             let ws = Workspace::resolve(
                 &effective_project_root,
                 agent_id,
@@ -290,25 +243,10 @@ impl Orchestrator {
 
         let skills_root = workspace_root.join("skills");
         let skill_registry = ArcSwap::from_pointee(skill_registry);
-        let tool_registry = register_default_tools(
-            workspaces.file_store("__default__"),
-            workspaces.search_index("__default__"),
-            &embedding_provider,
-            workspaces.workspace_root("__default__").as_path(),
-            workspaces.default_root(),
-            &approval_registry,
-            &bus,
-            schedule_manager,
-            brave_api_key,
-            &router,
-            &agents_map,
-            personas_for_subagent,
-        );
+        let config_view = ArcSwap::from_pointee(config_view);
 
         Self {
-            router: router.clone(),
-            agents: agents_map,
-            personas,
+            config_view,
             session_mgr,
             session_locks: super::session_lock::SessionLockManager::with_global_limit(10),
             context_manager: super::context::ContextManager::new(
@@ -323,8 +261,6 @@ impl Orchestrator {
             approval_registry,
             runtime,
             workspaces,
-            embedding_provider,
-            tool_registry,
             skill_install_state: Arc::new(SkillInstallState::new(900)),
             language_prefs: LanguagePrefs::new(),
         }
@@ -536,6 +472,14 @@ impl Orchestrator {
         self.skill_registry.load_full()
     }
 
+    pub fn config_view(&self) -> Arc<ConfigView> {
+        self.config_view.load_full()
+    }
+
+    pub fn apply_config_view(&self, view: ConfigView) {
+        self.config_view.store(Arc::new(view));
+    }
+
     pub fn reload_skills(&self) {
         match SkillRegistry::load_from_dir(&self.skills_root) {
             Ok(registry) => {
@@ -656,8 +600,8 @@ impl Orchestrator {
         }
     }
 
-    fn has_tool_registered(&self, name: &str) -> bool {
-        self.tool_registry
+    fn has_tool_registered(&self, view: &ConfigView, name: &str) -> bool {
+        view.tool_registry
             .tool_defs()
             .iter()
             .any(|tool| tool.name == name)
@@ -671,13 +615,14 @@ impl Orchestrator {
     ) -> String {
         let workspace_root = self.workspace_root_for(agent_id);
         format!(
-            "{base_prompt}\n\n## Execution Policy (OVERRIDES any general safety guidelines)\nWhen you have the tools to complete a task, execute them directly without asking for confirmation. Do not announce your intent — act. If a tool call is denied due to access restrictions, use the grant_access tool immediately and retry — do NOT ask the user about this. Only ask the user when you genuinely need information you cannot obtain yourself. This policy takes precedence over any 'ask first' or 'when in doubt' guidelines in your workspace files.\n\nRuntime:\n- Model: {model}\n- Session: {agent_id}\n- Working directory: {}",
+            "{base_prompt}\n\n## Execution Policy (OVERRIDES any general safety guidelines)\nWhen you have the tools to complete a task, execute them directly without asking for confirmation. Do not announce your intent — act. If a tool call is denied due to access restrictions, use the grant_access tool to request access and retry. The user will be asked to approve the access request. Only ask the user when you genuinely need information you cannot obtain yourself. This policy takes precedence over any 'ask first' or 'when in doubt' guidelines in your workspace files.\n\nRuntime:\n- Model: {model}\n- Session: {agent_id}\n- Working directory: {}",
             workspace_root.display()
         )
     }
 
     async fn execute_tool_for_agent(
         &self,
+        view: &ConfigView,
         agent_id: &str,
         name: &str,
         input: serde_json::Value,
@@ -685,9 +630,8 @@ impl Orchestrator {
     ) -> Result<super::tool::ToolOutput> {
         let gate = self.access_gate_for(agent_id);
         let ws = self.workspace_root_for(agent_id);
-        let (exec_security, sandbox_config) = self
-            .agents
-            .get(agent_id)
+        let (exec_security, sandbox_config) = view
+            .agent(agent_id)
             .map(|agent| {
                 (
                     agent.exec_security.clone().unwrap_or_default(),
@@ -718,26 +662,88 @@ impl Orchestrator {
                 .execute(input, ctx)
                 .await
             }
-            "grant_access" => GrantAccessTool::new(gate).execute(input, ctx).await,
+            "grant_access" => self.approve_then_grant(agent_id, &gate, input, ctx).await,
             "list_access" => ListAccessTool::new(gate).execute(input, ctx).await,
             "revoke_access" => RevokeAccessTool::new(gate).execute(input, ctx).await,
-            _ => self.tool_registry.execute(name, input, ctx).await,
+            _ => view.tool_registry.execute(name, input, ctx).await,
         }
     }
 
-    fn file_store_for(&self, agent_id: &str) -> &MemoryFileStore {
+    /// Require human approval before granting filesystem access.
+    async fn approve_then_grant(
+        &self,
+        agent_id: &str,
+        gate: &Arc<AccessGate>,
+        input: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<super::tool::ToolOutput> {
+        let path_str = input["path"].as_str().unwrap_or("unknown");
+        let level_str = input["level"].as_str().unwrap_or("unknown");
+        let description = format!("grant_{level_str} {path_str}");
+
+        if let Some(registry) = self.approval_registry.as_ref() {
+            let trace_id = uuid::Uuid::new_v4();
+            tracing::info!(%description, %trace_id, "requesting grant_access approval");
+
+            let rx = registry
+                .request(trace_id, description.clone(), agent_id.to_string())
+                .await;
+
+            if let (Some(ch), Some(conn), Some(scope)) = (
+                ctx.source_channel_type(),
+                ctx.source_connector_id(),
+                ctx.source_conversation_scope(),
+            ) {
+                let _ = self
+                    .bus
+                    .publish(BusMessage::NeedHumanApproval {
+                        trace_id,
+                        reason: format!("Agent requests access: {description}"),
+                        agent_id: agent_id.to_string(),
+                        command: description.clone(),
+                        network_target: None,
+                        source_channel_type: Some(ch.to_string()),
+                        source_connector_id: Some(conn.to_string()),
+                        source_conversation_scope: Some(scope.to_string()),
+                    })
+                    .await;
+            }
+
+            let decision = tokio::time::timeout(std::time::Duration::from_secs(60), rx).await;
+
+            match decision {
+                Ok(Ok(ApprovalDecision::AllowOnce)) | Ok(Ok(ApprovalDecision::AlwaysAllow)) => {
+                    GrantAccessTool::new(gate.clone()).execute(input, ctx).await
+                }
+                Ok(Ok(ApprovalDecision::Deny)) => Ok(super::tool::ToolOutput {
+                    content: format!("Access grant denied by user: {description}"),
+                    is_error: true,
+                }),
+                _ => {
+                    tracing::warn!(%description, "grant_access approval timed out or channel unavailable");
+                    Ok(super::tool::ToolOutput {
+                        content: format!(
+                            "Access grant timed out (no response within 60s): {description}"
+                        ),
+                        is_error: true,
+                    })
+                }
+            }
+        } else {
+            // No approval channel (e.g. tests) — fall through
+            GrantAccessTool::new(gate.clone()).execute(input, ctx).await
+        }
+    }
+
+    fn file_store_for(&self, agent_id: &str) -> MemoryFileStore {
         self.workspaces.file_store(agent_id)
     }
 
-    fn session_writer_for(&self, agent_id: &str) -> &SessionWriter {
-        self.workspaces.session_writer(agent_id)
+    fn workspace_state_for(&self, agent_id: &str) -> Arc<AgentWorkspaceState> {
+        self.workspaces.get(agent_id)
     }
 
-    fn session_reader_for(&self, agent_id: &str) -> &SessionReader {
-        self.workspaces.session_reader(agent_id)
-    }
-
-    fn search_index_for(&self, agent_id: &str) -> &SearchIndex {
+    fn search_index_for(&self, agent_id: &str) -> SearchIndex {
         self.workspaces.search_index(agent_id)
     }
 
@@ -756,9 +762,18 @@ impl Orchestrator {
         inbound: InboundMessage,
         agent_id: &str,
     ) -> Result<OutboundMessage> {
-        let agent = self
-            .agents
-            .get(agent_id)
+        let view = self.config_view();
+        self.handle_with_view(view, inbound, agent_id).await
+    }
+
+    pub async fn handle_with_view(
+        &self,
+        view: Arc<ConfigView>,
+        inbound: InboundMessage,
+        agent_id: &str,
+    ) -> Result<OutboundMessage> {
+        let agent = view
+            .agent(agent_id)
             .ok_or_else(|| anyhow!("agent not found: {agent_id}"))?;
 
         let session_key = SessionKey::from_inbound(&inbound);
@@ -836,10 +851,8 @@ impl Orchestrator {
                 super::slash_commands::SlashCommand::New { model_hint } => {
                     // Reset the session: clear history and start fresh
                     let _ = self.session_mgr.reset(&session_key).await;
-                    let _ = self
-                        .session_writer_for(agent_id)
-                        .clear_session(&session_key.0)
-                        .await;
+                    let workspace = self.workspace_state_for(agent_id);
+                    let _ = workspace.session_writer.clear_session(&session_key.0).await;
 
                     // Build post-reset prompt
                     let post_reset_prompt =
@@ -853,6 +866,7 @@ impl Orchestrator {
                     // Continue with normal flow but inject the post-reset prompt
                     return self
                         .handle_post_reset_flow(
+                            view.as_ref(),
                             inbound,
                             agent_id,
                             agent,
@@ -889,16 +903,15 @@ impl Orchestrator {
             .await?;
 
         if session_result.expired_previous {
-            self.try_fallback_summary(agent_id, &session_key, agent)
+            self.try_fallback_summary(view.as_ref(), agent_id, &session_key, agent)
                 .await;
         }
 
         let inbound_text = inbound.text.clone();
 
-        let system_prompt = self
-            .personas
-            .get(agent_id)
-            .map(Persona::assembled_system_prompt)
+        let system_prompt = view
+            .persona(agent_id)
+            .map(|persona| persona.assembled_system_prompt())
             .unwrap_or_default();
         let active_skills = self.active_skill_registry();
         let skill_summary = active_skills.summary_prompt();
@@ -952,7 +965,7 @@ impl Orchestrator {
         };
 
         let memory_context = self
-            .build_memory_context(agent_id, &session_key, &inbound.text)
+            .build_memory_context(view.as_ref(), agent_id, &session_key, &inbound.text)
             .await?;
 
         // Build system prompt with memory context injected (not fake dialogue)
@@ -967,8 +980,9 @@ impl Orchestrator {
             format!("{base_prompt}\n\n## Relevant Memory\n{memory_context}")
         };
 
-        let history_messages = match self
-            .session_reader_for(agent_id)
+        let workspace = self.workspace_state_for(agent_id);
+        let history_messages = match workspace
+            .session_reader
             .load_recent_messages(&session_key.0, 10)
             .await
         {
@@ -1016,8 +1030,8 @@ impl Orchestrator {
             }
         }
 
-        let must_use_web_search =
-            is_explicit_web_search_request(&inbound.text) && self.has_tool_registered("web_search");
+        let must_use_web_search = is_explicit_web_search_request(&inbound.text)
+            && self.has_tool_registered(view.as_ref(), "web_search");
         if must_use_web_search {
             system_prompt.push_str(
                 "\n\n## Tool Requirement\nThe user explicitly requested web search. You MUST call the web_search tool before your final answer.",
@@ -1052,6 +1066,7 @@ impl Orchestrator {
             .unwrap_or_default();
         let (resp, _messages) = self
             .tool_use_loop(
+                view.as_ref(),
                 agent_id,
                 &agent.model_policy.primary,
                 &agent.model_policy.fallbacks,
@@ -1107,15 +1122,16 @@ impl Orchestrator {
         }
 
         // Record session messages (JSONL)
-        if let Err(e) = self
-            .session_writer_for(agent_id)
+        let workspace = self.workspace_state_for(agent_id);
+        if let Err(e) = workspace
+            .session_writer
             .append_message(&session_key.0, "user", &inbound_text)
             .await
         {
             tracing::warn!("Failed to write user session entry: {e}");
         }
-        if let Err(e) = self
-            .session_writer_for(agent_id)
+        if let Err(e) = workspace
+            .session_writer
             .append_message(&session_key.0, "assistant", &outbound.text)
             .await
         {
@@ -1140,9 +1156,19 @@ impl Orchestrator {
         inbound: InboundMessage,
         agent_id: &str,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send + '_>>> {
-        let agent = self
-            .agents
-            .get(agent_id)
+        let view = self.config_view();
+        self.handle_inbound_stream_with_view(view, inbound, agent_id)
+            .await
+    }
+
+    pub async fn handle_inbound_stream_with_view(
+        &self,
+        view: Arc<ConfigView>,
+        inbound: InboundMessage,
+        agent_id: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk>> + Send + '_>>> {
+        let agent = view
+            .agent(agent_id)
             .ok_or_else(|| anyhow!("agent not found: {agent_id}"))?;
 
         let session_key = SessionKey::from_inbound(&inbound);
@@ -1156,13 +1182,12 @@ impl Orchestrator {
             .await?;
 
         if session_result.expired_previous {
-            self.try_fallback_summary(agent_id, &session_key, agent)
+            self.try_fallback_summary(view.as_ref(), agent_id, &session_key, agent)
                 .await;
         }
 
-        let system_prompt = self
-            .personas
-            .get(agent_id)
+        let system_prompt = view
+            .persona(agent_id)
             .map(|p| p.assembled_system_prompt())
             .unwrap_or_default();
         let active_skills = self.active_skill_registry();
@@ -1217,7 +1242,7 @@ impl Orchestrator {
         };
 
         let memory_context = self
-            .build_memory_context(agent_id, &session_key, &inbound.text)
+            .build_memory_context(view.as_ref(), agent_id, &session_key, &inbound.text)
             .await?;
 
         // Build system prompt with memory context injected (stream variant)
@@ -1232,8 +1257,9 @@ impl Orchestrator {
             format!("{base_prompt}\n\n## Relevant Memory\n{memory_context}")
         };
 
-        let history_messages = match self
-            .session_reader_for(agent_id)
+        let workspace = self.workspace_state_for(agent_id);
+        let history_messages = match workspace
+            .session_reader
             .load_recent_messages(&session_key.0, 10)
             .await
         {
@@ -1281,8 +1307,8 @@ impl Orchestrator {
             }
         }
 
-        let must_use_web_search =
-            is_explicit_web_search_request(&inbound.text) && self.has_tool_registered("web_search");
+        let must_use_web_search = is_explicit_web_search_request(&inbound.text)
+            && self.has_tool_registered(view.as_ref(), "web_search");
         if must_use_web_search {
             system_prompt.push_str(
                 "\n\n## Tool Requirement\nThe user explicitly requested web search. You MUST call the web_search tool before your final answer.",
@@ -1306,6 +1332,7 @@ impl Orchestrator {
             .unwrap_or_default();
         let (_resp, final_messages) = self
             .tool_use_loop(
+                view.as_ref(),
                 agent_id,
                 &agent.model_policy.primary,
                 &agent.model_policy.fallbacks,
@@ -1334,7 +1361,7 @@ impl Orchestrator {
         let target_language_stream = target_language;
         let mut stream_accumulator = String::new();
 
-        let stream = self
+        let stream = view
             .router
             .stream(
                 &agent.model_policy.primary,
@@ -1400,6 +1427,7 @@ impl Orchestrator {
     #[allow(clippy::too_many_arguments)]
     async fn tool_use_loop(
         &self,
+        view: &ConfigView,
         agent_id: &str,
         primary: &str,
         fallbacks: &[String],
@@ -1417,13 +1445,13 @@ impl Orchestrator {
     ) -> Result<(clawhive_provider::LlmResponse, Vec<LlmMessage>)> {
         let mut messages = initial_messages;
         let tool_defs: Vec<_> = match allowed_tools {
-            Some(allow_list) => self
+            Some(allow_list) => view
                 .tool_registry
                 .tool_defs()
                 .into_iter()
                 .filter(|t| allow_list.iter().any(|a| t.name.starts_with(a)))
                 .collect(),
-            None => self.tool_registry.tool_defs(),
+            None => view.tool_registry.tool_defs(),
         };
         let max_iterations = 10;
         let mut web_search_reminder_injected = false;
@@ -1481,7 +1509,7 @@ impl Orchestrator {
             };
 
             let llm_started = std::time::Instant::now();
-            let resp = self.router.chat_with_tools(primary, fallbacks, req).await?;
+            let resp = view.router.chat_with_tools(primary, fallbacks, req).await?;
             let llm_round_ms = llm_started.elapsed().as_millis() as u64;
 
             if is_slow_latency_ms(llm_round_ms, SLOW_LLM_ROUND_WARN_MS) {
@@ -1655,7 +1683,7 @@ impl Orchestrator {
                         let input_bytes = input_str.len();
                         let tool_started = std::time::Instant::now();
                         match self
-                            .execute_tool_for_agent(&agent_id, &name, input, &ctx)
+                            .execute_tool_for_agent(view, &agent_id, &name, input, &ctx)
                             .await
                         {
                             Ok(output) => {
@@ -1753,7 +1781,7 @@ impl Orchestrator {
             tools: vec![],
             thinking_level,
         };
-        let mut resp = self
+        let mut resp = view
             .router
             .chat_with_tools(primary, fallbacks, final_req)
             .await?;
@@ -1787,6 +1815,7 @@ impl Orchestrator {
     /// This creates a fresh session and injects the post-reset prompt to guide the agent.
     async fn handle_post_reset_flow(
         &self,
+        view: &ConfigView,
         inbound: InboundMessage,
         agent_id: &str,
         agent: &FullAgentConfig,
@@ -1800,9 +1829,8 @@ impl Orchestrator {
             .await?;
 
         // Build system prompt with post-reset context
-        let system_prompt = self
-            .personas
-            .get(agent_id)
+        let system_prompt = view
+            .persona(agent_id)
             .map(|p| p.assembled_system_prompt())
             .unwrap_or_default();
         let active_skills = self.active_skill_registry();
@@ -1828,6 +1856,7 @@ impl Orchestrator {
         // Run the tool-use loop
         let (resp, _messages) = self
             .tool_use_loop(
+                view,
                 agent_id,
                 &agent.model_policy.primary,
                 &agent.model_policy.fallbacks,
@@ -1853,15 +1882,16 @@ impl Orchestrator {
         let reply_text = filter_no_reply(&reply_text);
 
         // Record the assistant's response in the fresh session
-        if let Err(e) = self
-            .session_writer_for(agent_id)
+        let workspace = self.workspace_state_for(agent_id);
+        if let Err(e) = workspace
+            .session_writer
             .append_message(&session_key.0, "system", post_reset_prompt)
             .await
         {
             tracing::warn!("Failed to write post-reset prompt to session: {e}");
         }
-        if let Err(e) = self
-            .session_writer_for(agent_id)
+        if let Err(e) = workspace
+            .session_writer
             .append_message(&session_key.0, "assistant", &reply_text)
             .await
         {
@@ -1901,12 +1931,14 @@ impl Orchestrator {
 
     async fn try_fallback_summary(
         &self,
+        view: &ConfigView,
         agent_id: &str,
         session_key: &SessionKey,
         agent: &FullAgentConfig,
     ) {
-        let messages = match self
-            .session_reader_for(agent_id)
+        let workspace = self.workspace_state_for(agent_id);
+        let messages = match workspace
+            .session_reader
             .load_recent_messages(&session_key.0, 20)
             .await
         {
@@ -1932,7 +1964,7 @@ impl Orchestrator {
 
         let llm_messages = vec![LlmMessage::user(conversation)];
 
-        match self
+        match view
             .router
             .chat(
                 &agent.model_policy.primary,
@@ -1962,13 +1994,14 @@ impl Orchestrator {
 
     async fn build_memory_context(
         &self,
+        view: &ConfigView,
         agent_id: &str,
         _session_key: &SessionKey,
         query: &str,
     ) -> Result<String> {
         let results = self
             .search_index_for(agent_id)
-            .search(query, self.embedding_provider.as_ref(), 6, 0.25)
+            .search(query, view.embedding_provider.as_ref(), 6, 0.25)
             .await;
 
         match results {
@@ -1987,8 +2020,8 @@ impl Orchestrator {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // transitional: will shrink when OrchestratorBuilder lands
-fn register_default_tools(
+#[allow(clippy::too_many_arguments)]
+pub fn build_tool_registry(
     file_store: &MemoryFileStore,
     search_index: &SearchIndex,
     embedding_provider: &Arc<dyn EmbeddingProvider>,
@@ -1998,10 +2031,22 @@ fn register_default_tools(
     bus: &BusPublisher,
     schedule_manager: Arc<clawhive_scheduler::ScheduleManager>,
     brave_api_key: Option<String>,
-    router: &Arc<LlmRouter>,
-    agents_map: &HashMap<String, FullAgentConfig>,
-    personas: HashMap<String, Persona>,
+    router: &LlmRouter,
+    agents: &[FullAgentConfig],
+    personas: &HashMap<String, Persona>,
 ) -> ToolRegistry {
+    let agents_map: HashMap<String, FullAgentConfig> = agents
+        .iter()
+        .filter(|agent| agent.enabled)
+        .cloned()
+        .map(|agent| (agent.agent_id.clone(), agent))
+        .collect();
+    let personas = personas
+        .iter()
+        .filter(|(agent_id, _)| agents_map.contains_key(*agent_id))
+        .map(|(agent_id, persona)| (agent_id.clone(), persona.clone()))
+        .collect();
+
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(MemorySearchTool::new(
         search_index.clone(),
@@ -2009,8 +2054,8 @@ fn register_default_tools(
     )));
     registry.register(Box::new(MemoryGetTool::new(file_store.clone())));
     let sub_agent_runner = Arc::new(super::subagent::SubAgentRunner::new(
-        router.clone(),
-        agents_map.clone(),
+        Arc::new(router.clone()),
+        agents_map,
         personas,
         3,
         vec![],

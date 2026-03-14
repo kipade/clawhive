@@ -231,7 +231,6 @@ fn write_main_config(
     let yaml =
         serde_yaml::to_string(val).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     std::fs::write(&path, yaml).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    state.refresh_webhook_cache(val);
     Ok(())
 }
 
@@ -728,9 +727,8 @@ mod tests {
             enable_openai_oauth_callback_listener: true,
             daemon_mode: false,
             port: 3000,
-            webhook_config: Arc::new(std::sync::RwLock::new(None)),
-            routing_config: Arc::new(std::sync::RwLock::new(None)),
             schedule_manager: None,
+            reload_coordinator: None,
         };
         (
             Router::new()

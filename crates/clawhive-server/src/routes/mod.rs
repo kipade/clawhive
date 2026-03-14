@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod agents;
 pub mod auth;
 pub mod channels;
@@ -17,6 +18,7 @@ use crate::state::AppState;
 
 pub fn api_router() -> Router<AppState> {
     Router::new()
+        .nest("/admin", admin::router())
         .nest("/agents", agents::router())
         .nest("/auth", auth::router())
         .nest("/chat", chat::router())

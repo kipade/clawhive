@@ -19,6 +19,8 @@ use clawhive_memory::embedding::{
     EmbeddingProvider, GeminiEmbeddingProvider, OllamaEmbeddingProvider, OpenAiEmbeddingProvider,
     StubEmbeddingProvider,
 };
+use clawhive_memory::file_store::MemoryFileStore;
+use clawhive_memory::search_index::SearchIndex;
 use clawhive_memory::MemoryStore;
 use clawhive_provider::{
     custom, minimax, moonshot, qianfan, qwen, register_builtin_providers, volcengine, zhipu,
@@ -435,6 +437,8 @@ pub(crate) async fn bootstrap(
     });
     let workspace_dir = root.to_path_buf();
     let embedding_provider = build_embedding_provider(&config).await;
+    let file_store = MemoryFileStore::new(&workspace_dir);
+    let search_index = SearchIndex::new(memory.db());
 
     let brave_api_key = config
         .main
@@ -445,21 +449,41 @@ pub(crate) async fn bootstrap(
         .and_then(|ws| ws.api_key.clone())
         .filter(|k| !k.is_empty());
 
+    let tool_registry = build_tool_registry(
+        &file_store,
+        &search_index,
+        &embedding_provider,
+        workspace_dir.as_path(),
+        workspace_dir.as_path(),
+        &Some(approval_registry.clone()),
+        &publisher,
+        Arc::clone(&schedule_manager),
+        brave_api_key.clone(),
+        &router,
+        &config.agents,
+        &personas,
+    );
+    let config_view = ConfigView::new(
+        0,
+        config.agents.clone(),
+        personas,
+        config.routing.clone(),
+        router,
+        tool_registry,
+        embedding_provider,
+    );
+
     let orchestrator = Arc::new(
         OrchestratorBuilder::new(
-            router,
+            config_view,
             publisher.clone(),
             memory.clone(),
             Arc::new(NativeExecutor),
             workspace_dir.clone(),
             Arc::clone(&schedule_manager),
         )
-        .agents(config.agents.clone())
-        .personas(personas)
         .skill_registry(skill_registry)
         .approval_registry(approval_registry.clone())
-        .embedding_provider(embedding_provider)
-        .brave_api_key(brave_api_key)
         .project_root(root.to_path_buf())
         .build(),
     );
@@ -467,7 +491,6 @@ pub(crate) async fn bootstrap(
     let rate_limiter = RateLimiter::new(RateLimitConfig::default());
     let gateway = Arc::new(Gateway::new(
         orchestrator,
-        config.routing.clone(),
         publisher,
         rate_limiter,
         Some(approval_registry.clone()),
@@ -911,7 +934,7 @@ pub(crate) async fn build_embedding_provider(
                     embedding_config.model,
                     embedding_config.dimensions
                 );
-                return Arc::new(provider);
+                return Arc::new(provider) as Arc<dyn EmbeddingProvider>;
             }
             tracing::warn!("Ollama not available, falling back");
         }
@@ -923,7 +946,7 @@ pub(crate) async fn build_embedding_provider(
                     "Auto-detected Ollama, using embedding model: {}",
                     ollama.model_id()
                 );
-                return Arc::new(ollama);
+                return Arc::new(ollama) as Arc<dyn EmbeddingProvider>;
             }
             tracing::debug!("Ollama not available for auto-detection");
         }
@@ -943,7 +966,7 @@ pub(crate) async fn build_embedding_provider(
                     embedding_config.model,
                     embedding_config.dimensions
                 );
-                return Arc::new(provider);
+                return Arc::new(provider) as Arc<dyn EmbeddingProvider>;
             }
             tracing::warn!("Gemini embedding API key not set, falling back");
         }
@@ -967,7 +990,7 @@ pub(crate) async fn build_embedding_provider(
             embedding_config.model,
             embedding_config.dimensions
         );
-        return Arc::new(provider);
+        return Arc::new(provider) as Arc<dyn EmbeddingProvider>;
     }
 
     // Try to reuse API key from configured LLM providers
@@ -993,7 +1016,7 @@ pub(crate) async fn build_embedding_provider(
                 .with_base_url(p.api_base.clone());
 
                 tracing::info!("Reusing OpenAI API key for embeddings (text-embedding-3-small)");
-                return Arc::new(provider);
+                return Arc::new(provider) as Arc<dyn EmbeddingProvider>;
             }
 
             // Gemini / Google
@@ -1018,7 +1041,7 @@ pub(crate) async fn build_embedding_provider(
 
     if let Some(key) = gemini_key {
         tracing::info!("Using Gemini API key for embeddings (gemini-embedding-001)");
-        return Arc::new(GeminiEmbeddingProvider::new(key));
+        return Arc::new(GeminiEmbeddingProvider::new(key)) as Arc<dyn EmbeddingProvider>;
     }
 
     // No embedding provider available — stub will be used

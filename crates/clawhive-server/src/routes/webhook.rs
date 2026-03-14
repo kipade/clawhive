@@ -132,18 +132,21 @@ async fn handle_webhook(
 }
 
 fn load_webhook_config(state: &AppState) -> Result<WebhookChannelConfig, StatusCode> {
-    state
-        .webhook_config
-        .read()
-        .unwrap()
-        .clone()
+    let path = state.root.join("config/main.yaml");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_yaml::from_str::<serde_yaml::Value>(&content).ok())
+        .and_then(|val| val.get("channels")?.get("webhook").cloned())
+        .and_then(|webhook| serde_yaml::from_value::<WebhookChannelConfig>(webhook).ok())
+        .filter(|config| config.enabled)
         .ok_or(StatusCode::NOT_FOUND)
 }
 
 fn find_delivery_for_webhook(state: &AppState, source_id: &str) -> Option<DeliveryRoutingConfig> {
-    let routing = state.routing_config.read().unwrap();
-    let delivery = routing
-        .as_ref()?
+    let view = state.config_view();
+    let delivery = view
+        .as_ref()
+        .map(|view| &view.routing)?
         .bindings
         .iter()
         .find(|binding| binding.channel_type == "webhook" && binding.connector_id == source_id)
@@ -209,7 +212,7 @@ bindings: []
     }
 
     fn test_state(dir: &std::path::Path) -> AppState {
-        let state = AppState {
+        AppState {
             root: dir.to_path_buf(),
             bus: Arc::new(EventBus::new(16)),
             gateway: None,
@@ -220,13 +223,9 @@ bindings: []
             enable_openai_oauth_callback_listener: false,
             daemon_mode: false,
             port: 8848,
-            webhook_config: Arc::new(RwLock::new(None)),
-            routing_config: Arc::new(RwLock::new(None)),
             schedule_manager: None,
-        };
-        state.load_webhook_config_from_disk();
-        state.load_routing_config_from_disk();
-        state
+            reload_coordinator: None,
+        }
     }
 
     #[tokio::test]
@@ -412,5 +411,20 @@ channels:
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn load_webhook_config_reads_latest_config_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        setup_test_config(tmp.path());
+        let state = test_state(tmp.path());
+
+        let webhook_cfg = load_webhook_config(&state).expect("initial webhook config");
+        assert_eq!(webhook_cfg.sources.len(), 1);
+
+        setup_disabled_webhook_config(tmp.path());
+
+        let err = load_webhook_config(&state).expect_err("disabled webhook should disappear");
+        assert_eq!(err, StatusCode::NOT_FOUND);
     }
 }
