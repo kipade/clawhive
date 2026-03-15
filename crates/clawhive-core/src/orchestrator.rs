@@ -616,7 +616,7 @@ impl Orchestrator {
     ) -> String {
         let workspace_root = self.workspace_root_for(agent_id);
         format!(
-            "{base_prompt}\n\n## Execution Policy (OVERRIDES any general safety guidelines)\nWhen you have the tools to complete a task, execute them directly without asking for confirmation. Do not announce your intent — act. If a tool call is denied due to access restrictions, use the grant_access tool to request access and retry. The user will be asked to approve the access request. Only ask the user when you genuinely need information you cannot obtain yourself. This policy takes precedence over any 'ask first' or 'when in doubt' guidelines in your workspace files.\n\n## Tool Usage Efficiency\nYou have a limited budget of tool calls per response. Be efficient:\n- Combine multiple file reads into a single `cat file1 file2 file3` command.\n- Use `grep -r pattern dir/` to search across files instead of reading them one by one.\n- Chain related commands with `&&` in a single execute_command call.\n- Do NOT read files one at a time when you need to check multiple files.\n\nRuntime:\n- Model: {model}\n- Session: {agent_id}\n- Working directory: {}",
+            "{base_prompt}\n\n## Execution Policy (OVERRIDES any general safety guidelines)\nWhen you have the tools to complete a task, execute them directly without asking for confirmation. Do not announce your intent — act. If a tool call is denied due to access restrictions, use the grant_access tool to request access and retry. The user will be asked to approve the access request. Only ask the user when you genuinely need information you cannot obtain yourself. This policy takes precedence over any 'ask first' or 'when in doubt' guidelines in your workspace files.\n\n### Action-Response Rule (MANDATORY)\nIf your response does not contain tool calls, it MUST NOT promise, commit to, or announce any future action. Either:\n- DO the action (include tool_use blocks in this response), or\n- REPORT what you know (text-only, no action promises)\nNever say 'I will do X', 'Let me do X', or 'I'll fix that' without immediately calling the relevant tool in the SAME response.\n\n## Tool Usage Efficiency\nYou have a limited budget of tool calls per response. Be efficient:\n- Combine multiple file reads into a single `cat file1 file2 file3` command.\n- Use `grep -r pattern dir/` to search across files instead of reading them one by one.\n- Chain related commands with `&&` in a single execute_command call.\n- Do NOT read files one at a time when you need to check multiple files.\n\nRuntime:\n- Model: {model}\n- Session: {agent_id}\n- Working directory: {}",
             workspace_root.display()
         )
     }
@@ -1632,26 +1632,37 @@ impl Orchestrator {
                     &resp.text,
                 ) {
                     scheduled_task_retries += 1;
+                    let task_type = if is_scheduled_task {
+                        "scheduled_task"
+                    } else {
+                        "conversation"
+                    };
                     tracing::warn!(
                         agent_id = %agent_id,
                         iteration = iteration_no,
                         retry_count = scheduled_task_retries,
                         response_len = resp.text.len(),
-                        "tool_use_loop: scheduled task fabrication, injecting retry {}/2",
-                        scheduled_task_retries
+                        task_type,
+                        "tool_use_loop: fabricated response detected, nudging to use tools"
                     );
                     messages.push(LlmMessage {
                         role: "assistant".into(),
                         content: resp.content.clone(),
                     });
-                    messages.push(LlmMessage::user(concat!(
-                        "[SYSTEM] You responded without making any tool calls. ",
-                        "This is UNACCEPTABLE for a scheduled task. ",
-                        "You MUST use tools to execute the task. ",
-                        "Start with step 1 RIGHT NOW: call execute_command or read_file ",
-                        "to begin the work. Do NOT reply with text \u{2014} your next message ",
-                        "MUST contain tool_use blocks.",
-                    )));
+                    let nudge = if is_scheduled_task {
+                        "[SYSTEM] You responded without making any tool calls. \
+                         This is UNACCEPTABLE for a scheduled task. \
+                         You MUST use tools to execute the task. \
+                         Start with step 1 RIGHT NOW: call execute_command or read_file \
+                         to begin the work. Do NOT reply with text — your next message \
+                         MUST contain tool_use blocks."
+                    } else {
+                        "[SYSTEM] You claimed to have performed actions, but you did not \
+                         make any tool calls. Do NOT fabricate results. Call the appropriate \
+                         tool (execute_command, read_file, write_file, etc.) RIGHT NOW to \
+                         actually carry out the action."
+                    };
+                    messages.push(LlmMessage::user(nudge));
                     continue;
                 }
 
@@ -1689,21 +1700,32 @@ impl Orchestrator {
                     )
                 {
                     scheduled_task_retries += 1;
+                    let task_type = if is_scheduled_task {
+                        "scheduled_task"
+                    } else {
+                        "conversation"
+                    };
                     tracing::warn!(
                         agent_id = %agent_id,
                         iteration = iteration_no,
                         retry_count = scheduled_task_retries,
                         response_len = resp.text.len(),
-                        "tool_use_loop: scheduled task incomplete thought, continuing"
+                        task_type,
+                        "tool_use_loop: incomplete thought detected, nudging to use tools"
                     );
                     messages.push(LlmMessage {
                         role: "assistant".into(),
                         content: resp.content.clone(),
                     });
-                    messages.push(LlmMessage::user(
+                    let nudge = if is_scheduled_task {
                         "[SYSTEM] You stopped mid-task with a planning statement instead of producing output. \
-                         Continue executing — use tools to complete the task and produce the final deliverable.",
-                    ));
+                         Continue executing — use tools to complete the task and produce the final deliverable."
+                    } else {
+                        "[SYSTEM] You announced your intent but did not act on it. \
+                         Do NOT describe what you plan to do — call the appropriate tool NOW \
+                         to actually do it."
+                    };
+                    messages.push(LlmMessage::user(nudge));
                     continue;
                 }
 
@@ -2422,9 +2444,16 @@ fn should_retry_fabricated_scheduled_response(
     // session. If tools were already called in prior iterations (e.g. the agent
     // ran a pipeline and is now composing a text summary), the current zero-tool
     // iteration is legitimate — not hallucination.
-    const MAX_RETRIES: u32 = 2;
+    //
+    // Scheduled tasks: up to 2 retries (no user in loop).
+    // Conversations: up to 1 retry (user can re-prompt).
+    let max_retries: u32 = if is_scheduled_task { 2 } else { 1 };
+    if retry_count >= max_retries || total_tool_calls > 0 || current_tool_calls > 0 {
+        return false;
+    }
+
     let text = response_text.to_lowercase();
-    let claims_execution_without_evidence = [
+    [
         "i ran",
         "i executed",
         "i wrote",
@@ -2441,13 +2470,7 @@ fn should_retry_fabricated_scheduled_response(
         "已经完成",
     ]
     .iter()
-    .any(|k| text.contains(k));
-
-    is_scheduled_task
-        && retry_count < MAX_RETRIES
-        && total_tool_calls == 0
-        && current_tool_calls == 0
-        && claims_execution_without_evidence
+    .any(|k| text.contains(k))
 }
 
 fn should_retry_incomplete_scheduled_thought(
@@ -2456,8 +2479,9 @@ fn should_retry_incomplete_scheduled_thought(
     total_tool_calls: usize,
     response_text: &str,
 ) -> bool {
-    const MAX_RETRIES: u32 = 2;
-    if !is_scheduled_task || retry_count >= MAX_RETRIES || total_tool_calls == 0 {
+    // Scheduled tasks: up to 2 retries. Conversations: up to 1 retry.
+    let max_retries: u32 = if is_scheduled_task { 2 } else { 1 };
+    if retry_count >= max_retries || total_tool_calls == 0 {
         return false;
     }
 
@@ -2652,6 +2676,108 @@ Body"#,
             1,
             0,
             "I executed all steps and saved the file.",
+        ));
+    }
+
+    #[test]
+    fn fabricated_response_detected_in_conversation() {
+        assert!(should_retry_fabricated_scheduled_response(
+            false,
+            0,
+            0,
+            0,
+            "I created the file and saved it.",
+        ));
+    }
+
+    #[test]
+    fn fabricated_response_conversation_max_one_retry() {
+        assert!(should_retry_fabricated_scheduled_response(
+            false,
+            0,
+            0,
+            0,
+            "I updated the config.",
+        ));
+        assert!(!should_retry_fabricated_scheduled_response(
+            false,
+            1,
+            0,
+            0,
+            "I updated the config.",
+        ));
+    }
+
+    #[test]
+    fn fabricated_response_scheduled_still_allows_two_retries() {
+        assert!(should_retry_fabricated_scheduled_response(
+            true,
+            0,
+            0,
+            0,
+            "已创建文件",
+        ));
+        assert!(should_retry_fabricated_scheduled_response(
+            true,
+            1,
+            0,
+            0,
+            "已创建文件",
+        ));
+        assert!(!should_retry_fabricated_scheduled_response(
+            true,
+            2,
+            0,
+            0,
+            "已创建文件",
+        ));
+    }
+
+    #[test]
+    fn incomplete_thought_detected_in_conversation() {
+        assert!(should_retry_incomplete_scheduled_thought(
+            false,
+            0,
+            1,
+            "让我来处理这个问题",
+        ));
+    }
+
+    #[test]
+    fn incomplete_thought_conversation_max_one_retry() {
+        assert!(should_retry_incomplete_scheduled_thought(
+            false,
+            0,
+            1,
+            "Let me fix that.",
+        ));
+        assert!(!should_retry_incomplete_scheduled_thought(
+            false,
+            1,
+            1,
+            "Let me fix that.",
+        ));
+    }
+
+    #[test]
+    fn incomplete_thought_scheduled_still_allows_two_retries() {
+        assert!(should_retry_incomplete_scheduled_thought(
+            true,
+            0,
+            1,
+            "I will create the file.",
+        ));
+        assert!(should_retry_incomplete_scheduled_thought(
+            true,
+            1,
+            1,
+            "I will create the file.",
+        ));
+        assert!(!should_retry_incomplete_scheduled_thought(
+            true,
+            2,
+            1,
+            "I will create the file.",
         ));
     }
 
