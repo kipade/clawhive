@@ -199,6 +199,7 @@ pub async fn start_whatsapp(
                         tracing::info!("WhatsApp pairing successful!");
                     }
                     Event::Message(msg, info) => {
+                        let is_self_chat;
                         let effective_msg: &wa::Message =
                             if let Some(ref dsm) = msg.device_sent_message {
                                 let sender_number =
@@ -209,38 +210,38 @@ pub async fn start_whatsapp(
                                     .map(extract_number_from_jid)
                                     .unwrap_or_default();
                                 if sender_number != dest_number {
-                                    tracing::debug!(
-                                        msg_id = %info.id,
-                                        dest = ?dsm.destination_jid,
-                                        "Skipping device_sent_message (outgoing to another user)"
-                                    );
                                     return;
                                 }
+                                is_self_chat = true;
                                 match dsm.message.as_deref() {
                                     Some(inner) => inner,
                                     None => return,
                                 }
                             } else {
+                                is_self_chat = false;
                                 &msg
                             };
 
                         let chat_jid = info.source.chat.to_string();
                         let sender_jid = info.source.sender.to_string();
                         let is_group = chat_jid.ends_with("@g.us");
-                        let allowed = if is_group {
-                            policy.is_allowed_group(&sender_jid)
-                        } else {
-                            policy.is_allowed_dm(&sender_jid)
-                        };
 
-                        if !allowed {
-                            tracing::info!(
-                                sender = %sender_jid,
-                                chat = %chat_jid,
-                                is_group,
-                                "WhatsApp message blocked by access policy"
-                            );
-                            return;
+                        if !is_self_chat {
+                            let allowed = if is_group {
+                                policy.is_allowed_group(&sender_jid)
+                            } else {
+                                policy.is_allowed_dm(&sender_jid)
+                            };
+
+                            if !allowed {
+                                tracing::info!(
+                                    sender = %sender_jid,
+                                    chat = %chat_jid,
+                                    is_group,
+                                    "WhatsApp message blocked by access policy"
+                                );
+                                return;
+                            }
                         }
 
                         let text = extract_message_text(effective_msg);
@@ -266,26 +267,13 @@ pub async fn start_whatsapp(
 
                         let inbound = adapter.to_inbound(&chat_jid, &sender_jid, &text, msg_id);
 
-                        tracing::debug!(
-                            sender = %sender_jid,
-                            chat = %chat_jid,
-                            text = %text,
-                            "Forwarding WhatsApp message to gateway"
-                        );
+                        let _ = client.chatstate().send_composing(&info.source.chat).await;
 
                         match gateway.handle_inbound(inbound).await {
                             Ok(outbound) => {
-                                tracing::debug!(
-                                    reply = %adapter.render_outbound(&outbound),
-                                    "WhatsApp gateway produced outbound reply"
-                                );
+                                let _ = client.chatstate().send_paused(&info.source.chat).await;
 
                                 if outbound.text.trim().is_empty() {
-                                    tracing::debug!(
-                                        sender = %sender_jid,
-                                        chat = %chat_jid,
-                                        "WhatsApp outbound reply was empty"
-                                    );
                                     return;
                                 }
 
@@ -306,6 +294,7 @@ pub async fn start_whatsapp(
                                 }
                             }
                             Err(err) => {
+                                let _ = client.chatstate().send_paused(&info.source.chat).await;
                                 tracing::error!("Gateway error for WhatsApp message: {err}");
                             }
                         }
