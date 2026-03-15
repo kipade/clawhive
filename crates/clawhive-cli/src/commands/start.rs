@@ -290,9 +290,10 @@ fn build_bot_factory() -> BotFactory {
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
+            let default_db = format!("~/.clawhive/data/whatsapp-{connector_id}.db");
             let raw_db_path = config["db_path"]
                 .as_str()
-                .unwrap_or("~/.clawhive/data/whatsapp.db")
+                .unwrap_or(&default_db)
                 .to_string();
             let db_path = expand_tilde(&raw_db_path);
             if let Some(parent) = db_path.parent() {

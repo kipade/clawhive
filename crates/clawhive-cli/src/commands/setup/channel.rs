@@ -295,7 +295,7 @@ pub(super) fn handle_add_channel(
             .interact()?;
 
         if do_pair {
-            run_whatsapp_pairing(config_root)?;
+            run_whatsapp_pairing(config_root, &connector_id)?;
         }
     }
 
@@ -433,10 +433,9 @@ fn add_channel_to_config(
         "whatsapp" => {
             let connector = WhatsAppConnectorConfig {
                 connector_id: cfg.connector_id.clone(),
-                db_path: cfg
-                    .db_path
-                    .clone()
-                    .unwrap_or_else(|| "~/.clawhive/data/whatsapp.db".to_string()),
+                db_path: cfg.db_path.clone().unwrap_or_else(|| {
+                    format!("~/.clawhive/data/whatsapp-{}.db", cfg.connector_id)
+                }),
                 dm_policy: "allowlist".to_string(),
                 allow_from: cfg.allow_from.clone().unwrap_or_default(),
                 group_policy: "disabled".to_string(),
@@ -604,12 +603,13 @@ fn generate_routing_yaml(
     out
 }
 
-fn run_whatsapp_pairing(config_root: &Path) -> Result<()> {
+fn run_whatsapp_pairing(config_root: &Path, connector_id: &str) -> Result<()> {
     use std::time::Duration;
 
     use clawhive_channels::whatsapp::{run_pairing, PairStatus};
 
-    let raw_db_path = "~/.clawhive/data/whatsapp.db";
+    let raw_db_path = format!("~/.clawhive/data/whatsapp-{connector_id}.db");
+    let raw_db_path = raw_db_path.as_str();
     let db_path = if let Some(rest) = raw_db_path.strip_prefix("~/") {
         if let Ok(home) = std::env::var("HOME") {
             std::path::PathBuf::from(home).join(rest)
