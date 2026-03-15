@@ -269,6 +269,18 @@ pub(super) fn handle_add_channel(
         &Term::stdout(),
         &format!("Channel {connector_id} ({channel_type}) configured."),
     );
+
+    if channel_type == "whatsapp" {
+        let do_pair = Confirm::with_theme(theme)
+            .with_prompt("Pair with WhatsApp now? (scan QR code)")
+            .default(true)
+            .interact()?;
+
+        if do_pair {
+            run_whatsapp_pairing(config_root)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -568,6 +580,111 @@ fn generate_routing_yaml(
     }
 
     out
+}
+
+fn run_whatsapp_pairing(config_root: &Path) -> Result<()> {
+    use std::time::Duration;
+
+    use clawhive_channels::whatsapp::{run_pairing, PairStatus};
+
+    let raw_db_path = "~/.clawhive/data/whatsapp.db";
+    let db_path = if let Some(rest) = raw_db_path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            std::path::PathBuf::from(home).join(rest)
+        } else {
+            std::path::PathBuf::from(raw_db_path)
+        }
+    } else {
+        std::path::PathBuf::from(raw_db_path)
+    };
+
+    if let Some(parent) = db_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    println!("\n  {ARROW} Connecting to WhatsApp...");
+    println!("  Scan the QR code with your phone: WhatsApp → Linked Devices → Link a Device\n");
+
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+            let pair_handle = tokio::spawn(async move {
+                if let Err(e) = run_pairing(db_path, tx).await {
+                    tracing::error!("WhatsApp pairing error: {e}");
+                }
+            });
+
+            let timeout = Duration::from_secs(180);
+            let result = loop {
+                match tokio::time::timeout(timeout, rx.recv()).await {
+                    Ok(Some(PairStatus::QrCode(data, valid_for))) => {
+                        render_qr(&data, valid_for);
+                    }
+                    Ok(Some(PairStatus::Paired)) => {
+                        break Ok(true);
+                    }
+                    Ok(Some(PairStatus::AlreadyPaired)) => {
+                        break Ok(false);
+                    }
+                    Ok(Some(PairStatus::Failed(e))) => {
+                        break Err(anyhow!("WhatsApp pairing failed: {e}"));
+                    }
+                    Ok(None) => {
+                        break Err(anyhow!("WhatsApp connection closed unexpectedly"));
+                    }
+                    Err(_) => {
+                        break Err(anyhow!("WhatsApp pairing timed out (3 minutes)"));
+                    }
+                }
+            };
+
+            pair_handle.abort();
+            result
+        })
+    });
+
+    match result {
+        Ok(true) => {
+            print_done(&Term::stdout(), "WhatsApp paired successfully!");
+        }
+        Ok(false) => {
+            print_done(
+                &Term::stdout(),
+                "WhatsApp already paired (existing session found).",
+            );
+        }
+        Err(e) => {
+            eprintln!("  ⚠ {e}");
+            eprintln!(
+                "  You can pair later by restarting clawhive — the QR code will appear in logs."
+            );
+        }
+    }
+
+    let _ = config_root;
+    Ok(())
+}
+
+fn render_qr(data: &str, valid_for: std::time::Duration) {
+    match qrcode::QrCode::new(data) {
+        Ok(code) => {
+            let rendered = code
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .dark_color(qrcode::render::unicode::Dense1x2::Light)
+                .light_color(qrcode::render::unicode::Dense1x2::Dark)
+                .build();
+            println!("{rendered}");
+            println!(
+                "  ↑ Scan this QR code (valid for {}s)\n",
+                valid_for.as_secs()
+            );
+        }
+        Err(e) => {
+            eprintln!("  Failed to render QR code: {e}");
+            eprintln!("  Raw data: {data}");
+        }
+    }
 }
 
 #[cfg(test)]
