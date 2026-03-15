@@ -665,6 +665,8 @@ fn run_whatsapp_pairing(config_root: &Path, connector_id: &str) -> Result<()> {
             };
 
             pair_handle.abort();
+            let _ = pair_handle.await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             result
         })
     });
