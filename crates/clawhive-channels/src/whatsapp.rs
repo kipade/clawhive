@@ -9,6 +9,7 @@ use uuid::Uuid;
 use wacore::types::events::Event;
 use waproto::whatsapp as wa;
 use whatsapp_rust::bot::Bot;
+use whatsapp_rust::client::Client;
 use whatsapp_rust_sqlite_storage::SqliteStore;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
@@ -56,6 +57,51 @@ impl WhatsAppAdapter {
     }
 }
 
+pub enum PairStatus {
+    QrCode(String, std::time::Duration),
+    AlreadyPaired,
+    Paired,
+    Failed(String),
+}
+
+pub async fn run_pairing(
+    db_path: PathBuf,
+    tx: tokio::sync::mpsc::Sender<PairStatus>,
+) -> anyhow::Result<()> {
+    let db_str = db_path.to_string_lossy().to_string();
+    let backend = Arc::new(SqliteStore::new(&db_str).await?);
+
+    let tx_event = tx.clone();
+    let mut bot = Bot::builder()
+        .with_backend(backend)
+        .with_transport_factory(TokioWebSocketTransportFactory::new())
+        .with_http_client(UreqHttpClient::new())
+        .skip_history_sync()
+        .on_event(move |event, _client| {
+            let tx = tx_event.clone();
+            async move {
+                match event {
+                    Event::PairingQrCode { code, timeout } => {
+                        let _ = tx.send(PairStatus::QrCode(code, timeout)).await;
+                    }
+                    Event::PairSuccess { .. } => {
+                        let _ = tx.send(PairStatus::Paired).await;
+                    }
+                    Event::Connected(_) => {
+                        let _ = tx.send(PairStatus::AlreadyPaired).await;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .build()
+        .await?;
+
+    let _handle = bot.run().await?;
+    tokio::signal::ctrl_c().await.ok();
+    Ok(())
+}
+
 /// Start the WhatsApp channel.
 ///
 /// `db_path` is the path to the SQLite file used for WhatsApp session persistence.
@@ -67,16 +113,6 @@ pub async fn start_whatsapp(
 ) -> anyhow::Result<()> {
     let adapter = Arc::new(WhatsAppAdapter::new(&connector_id));
 
-    // Spawn action listener for reactions/edit/delete
-    let bus_clone = bus.clone();
-    let connector_id_clone = connector_id.clone();
-    tokio::spawn(spawn_action_listener(bus_clone, connector_id_clone));
-
-    // Spawn delivery listener for scheduled messages
-    let bus_clone = bus.clone();
-    let connector_id_clone = connector_id.clone();
-    tokio::spawn(spawn_delivery_listener(bus_clone, connector_id_clone));
-
     let db_str = db_path.to_string_lossy().to_string();
     let backend = Arc::new(SqliteStore::new(&db_str).await?);
 
@@ -87,7 +123,8 @@ pub async fn start_whatsapp(
         .with_backend(backend)
         .with_transport_factory(TokioWebSocketTransportFactory::new())
         .with_http_client(UreqHttpClient::new())
-        .on_event(move |event, _client| {
+        .skip_history_sync()
+        .on_event(move |event, client| {
             let gateway = gateway_for_bot.clone();
             let adapter = adapter_for_bot.clone();
 
@@ -95,13 +132,11 @@ pub async fn start_whatsapp(
                 match event {
                     Event::PairingQrCode { code, .. } => {
                         tracing::info!("WhatsApp QR code for pairing:\n{}", code);
-                        // TODO: render QR to terminal or deliver via bus
                     }
                     Event::PairSuccess { .. } => {
                         tracing::info!("WhatsApp pairing successful!");
                     }
                     Event::Message(msg, info) => {
-                        // Extract text from message
                         let text = extract_message_text(&msg);
                         if text.is_empty() {
                             return;
@@ -126,8 +161,20 @@ pub async fn start_whatsapp(
                                     "WhatsApp reply: {}",
                                     adapter.render_outbound(&outbound)
                                 );
-                                // TODO: send reply via client
-                                // client.send_text_message(chat_jid, &outbound.text).await
+
+                                if outbound.text.trim().is_empty() {
+                                    return;
+                                }
+
+                                let reply = wa::Message {
+                                    conversation: Some(outbound.text),
+                                    ..Default::default()
+                                };
+                                if let Err(e) =
+                                    client.send_message(info.source.chat.clone(), reply).await
+                                {
+                                    tracing::error!("Failed to send WhatsApp reply: {e}");
+                                }
                             }
                             Err(err) => {
                                 tracing::error!("Gateway error for WhatsApp message: {err}");
@@ -147,13 +194,25 @@ pub async fn start_whatsapp(
         .build()
         .await?;
 
+    let wa_client = bot.client();
+
+    tokio::spawn(spawn_action_listener(
+        bus.clone(),
+        connector_id.clone(),
+        wa_client.clone(),
+    ));
+    tokio::spawn(spawn_delivery_listener(
+        bus.clone(),
+        connector_id.clone(),
+        wa_client.clone(),
+    ));
+
     tracing::info!("Starting WhatsApp channel (connector: {})", connector_id);
     bot.run().await?.await?;
 
     Ok(())
 }
 
-/// Extract text content from a WhatsApp message.
 fn extract_message_text(msg: &wa::Message) -> String {
     if let Some(ref conv) = msg.conversation {
         return conv.to_string();
@@ -166,13 +225,11 @@ fn extract_message_text(msg: &wa::Message) -> String {
     String::new()
 }
 
-/// Parse chat JID from conversation_scope (format: "chat:xxx@s.whatsapp.net")
 fn parse_chat_jid(conversation_scope: &str) -> Option<&str> {
     conversation_scope.strip_prefix("chat:")
 }
 
-/// Listen for ActionReady events (reactions, edits, deletes)
-async fn spawn_action_listener(bus: Arc<EventBus>, connector_id: String) {
+async fn spawn_action_listener(bus: Arc<EventBus>, connector_id: String, client: Arc<Client>) {
     let mut rx = bus.subscribe(Topic::ActionReady).await;
     while let Some(msg) = rx.recv().await {
         let BusMessage::ActionReady { action } = msg else {
@@ -183,7 +240,7 @@ async fn spawn_action_listener(bus: Arc<EventBus>, connector_id: String) {
             continue;
         }
 
-        let Some(_chat_jid) = parse_chat_jid(&action.conversation_scope) else {
+        let Some(chat_jid_str) = parse_chat_jid(&action.conversation_scope) else {
             tracing::warn!(
                 "Could not parse WhatsApp chat JID: {}",
                 action.conversation_scope
@@ -191,28 +248,53 @@ async fn spawn_action_listener(bus: Arc<EventBus>, connector_id: String) {
             continue;
         };
 
+        let Ok(chat_jid) = chat_jid_str.parse() else {
+            tracing::warn!("Invalid WhatsApp JID: {chat_jid_str}");
+            continue;
+        };
+
         match action.action {
             ActionKind::React { ref emoji } => {
-                tracing::debug!("WhatsApp reaction: {emoji} (TODO: implement)");
-                // TODO: client.send_reaction(chat_jid, msg_id, emoji)
+                tracing::debug!("WhatsApp reaction: {emoji} (not supported by protocol)");
             }
             ActionKind::Edit { ref new_text } => {
-                tracing::debug!("WhatsApp edit: {new_text} (TODO: implement)");
-                // TODO: client.edit_message(chat_jid, msg_id, new_text)
+                if let Some(ref original_id) = action.message_id {
+                    let edit_msg = wa::Message {
+                        conversation: Some(new_text.clone()),
+                        ..Default::default()
+                    };
+                    if let Err(e) = client
+                        .edit_message(chat_jid, original_id.clone(), edit_msg)
+                        .await
+                    {
+                        tracing::error!("Failed to edit WhatsApp message: {e}");
+                    }
+                } else {
+                    tracing::warn!("WhatsApp edit requires original message_id");
+                }
             }
             ActionKind::Delete => {
-                tracing::debug!("WhatsApp delete (TODO: implement)");
-                // TODO: client.revoke_message(chat_jid, msg_id)
+                if let Some(ref original_id) = action.message_id {
+                    if let Err(e) = client
+                        .revoke_message(
+                            chat_jid,
+                            original_id.clone(),
+                            whatsapp_rust::send::RevokeType::Sender,
+                        )
+                        .await
+                    {
+                        tracing::error!("Failed to delete WhatsApp message: {e}");
+                    }
+                } else {
+                    tracing::warn!("WhatsApp delete requires original message_id");
+                }
             }
-            ActionKind::Unreact { .. } => {
-                tracing::debug!("WhatsApp unreact (TODO: implement)");
-            }
+            ActionKind::Unreact { .. } => {}
         }
     }
 }
 
-/// Listen for DeliverAnnounce events (scheduled task delivery)
-async fn spawn_delivery_listener(bus: Arc<EventBus>, connector_id: String) {
+async fn spawn_delivery_listener(bus: Arc<EventBus>, connector_id: String, client: Arc<Client>) {
     let mut rx = bus.subscribe(Topic::DeliverAnnounce).await;
     while let Some(msg) = rx.recv().await {
         let BusMessage::DeliverAnnounce {
@@ -229,13 +311,23 @@ async fn spawn_delivery_listener(bus: Arc<EventBus>, connector_id: String) {
             continue;
         }
 
-        let Some(_chat_jid) = parse_chat_jid(&conversation_scope) else {
+        let Some(chat_jid_str) = parse_chat_jid(&conversation_scope) else {
             tracing::warn!("Could not parse WhatsApp chat JID: {}", conversation_scope);
             continue;
         };
 
-        tracing::info!("WhatsApp delivery: {} → {} (TODO: send)", _chat_jid, text);
-        // TODO: client.send_text_message(chat_jid, &text)
+        let Ok(chat_jid) = chat_jid_str.parse() else {
+            tracing::warn!("Invalid WhatsApp JID: {chat_jid_str}");
+            continue;
+        };
+
+        let message = wa::Message {
+            conversation: Some(text.clone()),
+            ..Default::default()
+        };
+        if let Err(e) = client.send_message(chat_jid, message).await {
+            tracing::error!("Failed to deliver WhatsApp announce: {e}");
+        }
     }
 }
 
