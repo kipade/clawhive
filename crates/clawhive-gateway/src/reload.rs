@@ -296,6 +296,33 @@ fn extract_connectors(
             }
         }
     }
+    if let Some(sl) = &channels.slack {
+        if sl.enabled {
+            for c in &sl.connectors {
+                if let Ok(v) = serde_json::to_value(c) {
+                    map.insert(c.connector_id.clone(), ("slack".into(), v));
+                }
+            }
+        }
+    }
+    if let Some(wa) = &channels.whatsapp {
+        if wa.enabled {
+            for c in &wa.connectors {
+                if let Ok(v) = serde_json::to_value(c) {
+                    map.insert(c.connector_id.clone(), ("whatsapp".into(), v));
+                }
+            }
+        }
+    }
+    if let Some(im) = &channels.imessage {
+        if im.enabled {
+            for c in &im.connectors {
+                if let Ok(v) = serde_json::to_value(c) {
+                    map.insert(c.connector_id.clone(), ("imessage".into(), v));
+                }
+            }
+        }
+    }
     map
 }
 

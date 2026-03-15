@@ -7,8 +7,9 @@ use dialoguer::{theme::ColorfulTheme, Confirm, Select};
 
 use clawhive_core::config::{
     DingTalkChannelConfig, DingTalkConnectorConfig, DiscordChannelConfig, DiscordConnectorConfig,
-    FeishuChannelConfig, FeishuConnectorConfig, TelegramChannelConfig, TelegramConnectorConfig,
-    WeComChannelConfig, WeComConnectorConfig,
+    FeishuChannelConfig, FeishuConnectorConfig, IMessageChannelConfig, IMessageConnectorConfig,
+    SlackChannelConfig, SlackConnectorConfig, TelegramChannelConfig, TelegramConnectorConfig,
+    WeComChannelConfig, WeComConnectorConfig, WhatsAppChannelConfig, WhatsAppConnectorConfig,
 };
 
 use super::config_io::{
@@ -30,6 +31,9 @@ pub(super) struct ChannelConfig {
     pub(super) client_secret: Option<String>,
     pub(super) bot_id: Option<String>,
     pub(super) secret: Option<String>,
+    pub(super) bot_token: Option<String>,
+    pub(super) db_path: Option<String>,
+    pub(super) poll_interval_secs: Option<u64>,
 }
 
 pub(super) fn handle_add_channel(
@@ -39,7 +43,8 @@ pub(super) fn handle_add_channel(
     _force: bool,
 ) -> Result<()> {
     let channel_types = [
-        "Telegram", "Discord", "Feishu", "DingTalk", "WeCom", "← Back",
+        "Telegram", "Discord", "Slack", "WhatsApp", "iMessage", "Feishu", "DingTalk", "WeCom",
+        "← Back",
     ];
     let selected = Select::with_theme(theme)
         .with_prompt("Channel type")
@@ -49,14 +54,20 @@ pub(super) fn handle_add_channel(
     let channel_type = match selected {
         0 => "telegram",
         1 => "discord",
-        2 => "feishu",
-        3 => "dingtalk",
-        4 => "wecom",
+        2 => "slack",
+        3 => "whatsapp",
+        4 => "imessage",
+        5 => "feishu",
+        6 => "dingtalk",
+        7 => "wecom",
         _ => return Ok(()),
     };
     let default_id = match channel_type {
         "telegram" => "my_telegram_bot",
         "discord" => "my_discord_bot",
+        "slack" => "my_slack_bot",
+        "whatsapp" => "my_whatsapp_bot",
+        "imessage" => "my_imessage_bot",
         "feishu" => "my_feishu_bot",
         "dingtalk" => "my_dingtalk_bot",
         "wecom" => "my_wecom_bot",
@@ -79,8 +90,33 @@ pub(super) fn handle_add_channel(
     let mut client_secret = None;
     let mut bot_id_str = None;
     let mut secret = None;
+    let mut bot_token_str = None;
+    let mut poll_interval = None;
 
     match channel_type {
+        "slack" => {
+            let bt = match input_or_back(theme, "Bot token (xoxb-...)")? {
+                Some(t) if !t.is_empty() => t,
+                Some(_) => anyhow::bail!("Bot token cannot be empty"),
+                None => return Ok(()),
+            };
+            println!("  {ARROW} Token saved: {}", mask_secret(&bt));
+            bot_token_str = Some(bt);
+            token = String::new();
+        }
+        "whatsapp" => {
+            token = String::new();
+        }
+        "imessage" => {
+            let interval: u64 =
+                match input_or_back_with_default(theme, "Poll interval in seconds", "5")? {
+                    Some(s) => s.parse().unwrap_or(5),
+                    None => return Ok(()),
+                };
+            println!("  {ARROW} Poll interval: {interval}s");
+            poll_interval = Some(interval);
+            token = String::new();
+        }
         "feishu" => {
             let id = match input_or_back(theme, "App ID (from Feishu Developer Console)")? {
                 Some(t) if !t.is_empty() => t,
@@ -224,6 +260,9 @@ pub(super) fn handle_add_channel(
         client_secret,
         bot_id: bot_id_str,
         secret,
+        bot_token: bot_token_str,
+        db_path: None,
+        poll_interval_secs: poll_interval,
     };
     add_channel_to_config(config_root, channel_type, &cfg)?;
     print_done(
@@ -342,6 +381,66 @@ fn add_channel_to_config(
                 }
             }
         }
+        "slack" => {
+            let connector = SlackConnectorConfig {
+                connector_id: cfg.connector_id.clone(),
+                bot_token: cfg.bot_token.clone().unwrap_or_default(),
+            };
+            match main_cfg.channels.slack.as_mut() {
+                Some(sl) => {
+                    sl.enabled = true;
+                    sl.connectors.retain(|c| c.connector_id != cfg.connector_id);
+                    sl.connectors.push(connector);
+                }
+                None => {
+                    main_cfg.channels.slack = Some(SlackChannelConfig {
+                        enabled: true,
+                        connectors: vec![connector],
+                    });
+                }
+            }
+        }
+        "whatsapp" => {
+            let connector = WhatsAppConnectorConfig {
+                connector_id: cfg.connector_id.clone(),
+                db_path: cfg
+                    .db_path
+                    .clone()
+                    .unwrap_or_else(|| "~/.clawhive/data/whatsapp.db".to_string()),
+            };
+            match main_cfg.channels.whatsapp.as_mut() {
+                Some(wa) => {
+                    wa.enabled = true;
+                    wa.connectors.retain(|c| c.connector_id != cfg.connector_id);
+                    wa.connectors.push(connector);
+                }
+                None => {
+                    main_cfg.channels.whatsapp = Some(WhatsAppChannelConfig {
+                        enabled: true,
+                        connectors: vec![connector],
+                    });
+                }
+            }
+        }
+        "imessage" => {
+            let connector = IMessageConnectorConfig {
+                connector_id: cfg.connector_id.clone(),
+                poll_interval_secs: cfg.poll_interval_secs.unwrap_or(5),
+            };
+            match main_cfg.channels.imessage.as_mut() {
+                Some(im) => {
+                    im.enabled = true;
+                    im.connectors.retain(|c| c.connector_id != cfg.connector_id);
+                    im.connectors.push(connector);
+                }
+                None => {
+                    main_cfg.channels.imessage = Some(IMessageChannelConfig {
+                        enabled: true,
+                        connectors: vec![connector],
+                    });
+                }
+            }
+        }
         _ => return Err(anyhow!("unsupported channel type: {channel_type}")),
     }
 
@@ -419,6 +518,15 @@ pub(super) fn remove_channel_from_config(config_root: &Path, connector_id: &str)
     }
     if let Some(dc) = cfg.channels.discord.as_mut() {
         dc.connectors.retain(|c| c.connector_id != connector_id);
+    }
+    if let Some(sl) = cfg.channels.slack.as_mut() {
+        sl.connectors.retain(|c| c.connector_id != connector_id);
+    }
+    if let Some(wa) = cfg.channels.whatsapp.as_mut() {
+        wa.connectors.retain(|c| c.connector_id != connector_id);
+    }
+    if let Some(im) = cfg.channels.imessage.as_mut() {
+        im.connectors.retain(|c| c.connector_id != connector_id);
     }
     save_main_config(config_root, &cfg)?;
     Ok(())

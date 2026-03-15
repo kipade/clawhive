@@ -8,6 +8,8 @@ use anyhow::Result;
 use clawhive_channels::dingtalk::DingTalkBot;
 use clawhive_channels::discord::DiscordBot;
 use clawhive_channels::feishu::FeishuBot;
+use clawhive_channels::imessage::IMessageBot;
+use clawhive_channels::slack::{SlackBot, SlackBotConfig};
 use clawhive_channels::telegram::TelegramBot;
 use clawhive_channels::wecom::WeComBot;
 use clawhive_channels::ChannelBot;
@@ -270,6 +272,49 @@ fn build_bot_factory() -> BotFactory {
                     Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
                 >)
         }
+        "slack" => {
+            let bot_token = config["bot_token"].as_str().unwrap_or_default().to_string();
+            let connector_id = config["connector_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let slack_config = SlackBotConfig::new(bot_token, connector_id);
+            let bot = SlackBot::new(slack_config, gateway);
+            Ok(Box::pin(async move { Box::new(bot).run().await })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
+                >)
+        }
+        "whatsapp" => {
+            let connector_id = config["connector_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let db_path = std::path::PathBuf::from(
+                config["db_path"]
+                    .as_str()
+                    .unwrap_or("~/.clawhive/data/whatsapp.db"),
+            );
+            Ok(Box::pin(async move {
+                clawhive_channels::whatsapp::start_whatsapp(connector_id, db_path, gateway, bus)
+                    .await
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
+                >)
+        }
+        "imessage" => {
+            let connector_id = config["connector_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let poll_interval = config["poll_interval_secs"].as_u64().unwrap_or(5);
+            let bot = IMessageBot::new(connector_id, gateway).with_poll_interval(poll_interval);
+            Ok(Box::pin(async move { Box::new(bot).run().await })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
+                >)
+        }
         _ => Err(anyhow::anyhow!("unknown channel type: {channel_type}")),
     })
 }
@@ -348,6 +393,51 @@ fn start_configured_bots(
                     supervisor.start(connector.connector_id.clone(), "wecom", config_json)
                 {
                     tracing::error!(connector = %connector.connector_id, "failed to start wecom bot: {error}");
+                } else {
+                    started += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(slack) = &config.main.channels.slack {
+        if slack.enabled {
+            for connector in &slack.connectors {
+                let config_json = serde_json::to_value(connector)?;
+                if let Err(error) =
+                    supervisor.start(connector.connector_id.clone(), "slack", config_json)
+                {
+                    tracing::error!(connector = %connector.connector_id, "failed to start slack bot: {error}");
+                } else {
+                    started += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(whatsapp) = &config.main.channels.whatsapp {
+        if whatsapp.enabled {
+            for connector in &whatsapp.connectors {
+                let config_json = serde_json::to_value(connector)?;
+                if let Err(error) =
+                    supervisor.start(connector.connector_id.clone(), "whatsapp", config_json)
+                {
+                    tracing::error!(connector = %connector.connector_id, "failed to start whatsapp bot: {error}");
+                } else {
+                    started += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(imessage) = &config.main.channels.imessage {
+        if imessage.enabled {
+            for connector in &imessage.connectors {
+                let config_json = serde_json::to_value(connector)?;
+                if let Err(error) =
+                    supervisor.start(connector.connector_id.clone(), "imessage", config_json)
+                {
+                    tracing::error!(connector = %connector.connector_id, "failed to start imessage bot: {error}");
                 } else {
                     started += 1;
                 }
