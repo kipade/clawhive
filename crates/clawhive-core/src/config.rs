@@ -264,21 +264,23 @@ pub struct DeliveryRoutingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telegram: Option<TelegramChannelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discord: Option<DiscordChannelConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feishu: Option<FeishuChannelConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dingtalk: Option<DingTalkChannelConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wecom: Option<WeComChannelConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slack: Option<SlackChannelConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub whatsapp: Option<WhatsAppChannelConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imessage: Option<IMessageChannelConfig>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook: Option<WebhookChannelConfig>,
 }
 
