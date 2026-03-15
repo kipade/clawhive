@@ -289,7 +289,7 @@ export default function ChannelsPage() {
   // Only consider a channel kind as "existing" if it has at least one connector
   const existingKinds = new Set(
     Object.entries(channels ?? {})
-      .filter(([, ch]) => ch.connectors && ch.connectors.length > 0)
+      .filter(([, ch]) => ch?.connectors && ch.connectors.length > 0)
       .map(([kind]) => kind)
   );
 
