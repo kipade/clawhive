@@ -1,4 +1,5 @@
 use crate::migrations::run_migrations;
+#[allow(deprecated)]
 use crate::models::{Concept, ConceptStatus, ConceptType, Episode, Link, LinkRelation};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -18,6 +19,11 @@ pub struct SessionRecord {
     pub ttl_seconds: i64,
 }
 
+#[deprecated(
+    since = "0.1.0-alpha",
+    note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
+)]
+#[allow(deprecated)]
 #[derive(Debug, Clone)]
 pub struct MemoryContext {
     pub recent_episodes: Vec<Episode>,
@@ -25,6 +31,7 @@ pub struct MemoryContext {
     pub active_concepts: Vec<Concept>,
 }
 
+#[allow(deprecated)]
 impl MemoryContext {
     pub fn to_prompt_text(&self) -> String {
         let mut parts = Vec::new();
@@ -99,6 +106,31 @@ impl MemoryStore {
         })
     }
 
+    pub async fn record_trace(
+        &self,
+        agent_id: &str,
+        operation: &str,
+        details: &str,
+        duration_ms: Option<i64>,
+    ) {
+        let db = Arc::clone(&self.db);
+        let agent_id = agent_id.to_owned();
+        let operation = operation.to_owned();
+        let details = details.to_owned();
+
+        let _ = task::spawn_blocking(move || -> Result<()> {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
+            conn.execute(
+                "INSERT INTO memory_trace (agent_id, operation, details, duration_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![agent_id, operation, details, duration_ms],
+            )?;
+            Ok(())
+        })
+        .await;
+    }
+
     pub fn db(&self) -> Arc<Mutex<Connection>> {
         Arc::clone(&self.db)
     }
@@ -107,6 +139,7 @@ impl MemoryStore {
         since = "0.1.0-alpha",
         note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
     )]
+    #[allow(deprecated)]
     pub async fn insert_episode(&self, episode: Episode) -> Result<()> {
         let db = Arc::clone(&self.db);
         task::spawn_blocking(move || {
@@ -139,6 +172,7 @@ impl MemoryStore {
         Ok(())
     }
 
+    #[allow(deprecated)]
     pub async fn recent_episodes(&self, session_id: &str, limit: usize) -> Result<Vec<Episode>> {
         let db = Arc::clone(&self.db);
         let session_id = session_id.to_owned();
@@ -165,6 +199,7 @@ impl MemoryStore {
         .await?
     }
 
+    #[allow(deprecated)]
     pub async fn search_episodes(
         &self,
         query: &str,
@@ -204,6 +239,7 @@ impl MemoryStore {
         since = "0.1.0-alpha",
         note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
     )]
+    #[allow(deprecated)]
     pub async fn upsert_concept(&self, concept: Concept) -> Result<()> {
         let db = Arc::clone(&self.db);
         task::spawn_blocking(move || {
@@ -244,6 +280,7 @@ impl MemoryStore {
         Ok(())
     }
 
+    #[allow(deprecated)]
     pub async fn get_concepts_by_type(&self, concept_type: ConceptType) -> Result<Vec<Concept>> {
         let db = Arc::clone(&self.db);
         let concept_type = concept_type_as_str(&concept_type).to_owned();
@@ -269,6 +306,7 @@ impl MemoryStore {
         .await?
     }
 
+    #[allow(deprecated)]
     pub async fn get_active_concepts(&self) -> Result<Vec<Concept>> {
         let db = Arc::clone(&self.db);
         task::spawn_blocking(move || {
@@ -293,6 +331,7 @@ impl MemoryStore {
         .await?
     }
 
+    #[allow(deprecated)]
     pub async fn find_concept_by_key(&self, key: &str) -> Result<Option<Concept>> {
         let db = Arc::clone(&self.db);
         let key = key.to_owned();
@@ -321,6 +360,7 @@ impl MemoryStore {
         since = "0.1.0-alpha",
         note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
     )]
+    #[allow(deprecated)]
     pub async fn insert_link(&self, link: Link) -> Result<()> {
         let db = Arc::clone(&self.db);
         task::spawn_blocking(move || {
@@ -425,6 +465,11 @@ impl MemoryStore {
         .await?
     }
 
+    #[deprecated(
+        since = "0.1.0-alpha",
+        note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
+    )]
+    #[allow(deprecated)]
     pub async fn retrieve_context(
         &self,
         session_id: &str,
@@ -587,6 +632,7 @@ impl MemoryStore {
     }
 }
 
+#[allow(deprecated)]
 fn concept_type_as_str(v: &ConceptType) -> &'static str {
     match v {
         ConceptType::Fact => "Fact",
@@ -597,6 +643,7 @@ fn concept_type_as_str(v: &ConceptType) -> &'static str {
     }
 }
 
+#[allow(deprecated)]
 fn concept_status_as_str(v: &ConceptStatus) -> &'static str {
     match v {
         ConceptStatus::Active => "Active",
@@ -605,6 +652,7 @@ fn concept_status_as_str(v: &ConceptStatus) -> &'static str {
     }
 }
 
+#[allow(deprecated)]
 fn link_relation_as_str(v: &LinkRelation) -> &'static str {
     match v {
         LinkRelation::Supports => "Supports",
@@ -613,6 +661,7 @@ fn link_relation_as_str(v: &LinkRelation) -> &'static str {
     }
 }
 
+#[allow(deprecated)]
 fn parse_concept_type(s: &str) -> ConceptType {
     match s {
         "Fact" => ConceptType::Fact,
@@ -624,6 +673,7 @@ fn parse_concept_type(s: &str) -> ConceptType {
     }
 }
 
+#[allow(deprecated)]
 fn parse_concept_status(s: &str) -> ConceptStatus {
     match s {
         "Active" => ConceptStatus::Active,
@@ -665,6 +715,7 @@ where
     }
 }
 
+#[allow(deprecated)]
 fn row_to_episode(row: &Row<'_>) -> rusqlite::Result<Episode> {
     let id_raw: String = row.get(0)?;
     let ts_raw: String = row.get(1)?;
@@ -684,6 +735,7 @@ fn row_to_episode(row: &Row<'_>) -> rusqlite::Result<Episode> {
     })
 }
 
+#[allow(deprecated)]
 fn row_to_concept(row: &Row<'_>) -> rusqlite::Result<Concept> {
     let id_raw: String = row.get(0)?;
     let concept_type_raw: String = row.get(1)?;

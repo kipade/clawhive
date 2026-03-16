@@ -764,12 +764,66 @@ impl SearchIndex {
             }
         }
 
+        // --- Access-count boost (Hot/Warm/Cold protection) ---
+        {
+            let chunk_ids: Vec<String> = results.iter().map(|r| r.chunk_id.clone()).collect();
+            if !chunk_ids.is_empty() {
+                let db = Arc::clone(&self.db);
+                let counts = task::spawn_blocking(
+                    move || -> Result<std::collections::HashMap<String, i64>> {
+                        let conn = db.lock().map_err(|_| anyhow!("lock failed"))?;
+                        let placeholders: String =
+                            chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                        let sql = format!(
+                            "SELECT id, access_count FROM chunks WHERE id IN ({placeholders})"
+                        );
+                        let mut stmt = conn.prepare(&sql)?;
+                        let mut map = std::collections::HashMap::new();
+                        let rows = stmt.query_map(rusqlite::params_from_iter(&chunk_ids), |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                        })?;
+                        for row in rows {
+                            let (id, count) = row?;
+                            map.insert(id, count);
+                        }
+                        Ok(map)
+                    },
+                )
+                .await;
+
+                if let Ok(Ok(counts)) = counts {
+                    for result in &mut results {
+                        let count = counts.get(&result.chunk_id).copied().unwrap_or(0);
+                        if count > 0 {
+                            result.score *= 1.0 + (1.0 + count as f64).ln() * 0.2;
+                        }
+                    }
+                }
+            }
+        }
+
         results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
         // --- MMR (Maximal Marginal Relevance) ---
         // Re-rank to reduce redundancy (lambda=0.7: balance relevance + diversity)
         let mmr_lambda = 0.7_f64;
         let mmr_results = mmr_rerank(&results, mmr_lambda, target_results);
+
+        // Bump access_count for returned chunks (fire-and-forget)
+        if !mmr_results.is_empty() {
+            let db = Arc::clone(&self.db);
+            let ids: Vec<String> = mmr_results.iter().map(|r| r.chunk_id.clone()).collect();
+            let _ = task::spawn_blocking(move || -> Result<()> {
+                let conn = db.lock().map_err(|_| anyhow!("lock failed"))?;
+                let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                conn.execute(
+                    &format!("UPDATE chunks SET access_count = access_count + 1 WHERE id IN ({placeholders})"),
+                    rusqlite::params_from_iter(&ids),
+                )?;
+                Ok(())
+            })
+            .await;
+        }
 
         Ok(mmr_results)
     }

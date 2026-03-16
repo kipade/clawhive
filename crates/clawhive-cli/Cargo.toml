@@ -27,6 +27,7 @@ tempfile.workspace = true
 zip = "2"
 tar = "0.4"
 flate2 = "1"
+rusqlite.workspace = true
 clawhive-core = { path = "../clawhive-core" }
 clawhive-bus = { path = "../clawhive-bus" }
 clawhive-memory = { path = "../clawhive-memory" }

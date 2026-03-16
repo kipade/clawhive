@@ -126,6 +126,25 @@ fn migrations() -> Vec<Migration> {
             );
             "#,
         ),
+        (
+            6,
+            r#"
+            CREATE TABLE IF NOT EXISTS memory_trace (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+                agent_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '{}',
+                duration_ms INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_trace_agent ON memory_trace(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_trace_op ON memory_trace(agent_id, operation);
+            CREATE INDEX IF NOT EXISTS idx_memory_trace_ts ON memory_trace(timestamp DESC);
+
+            ALTER TABLE chunks ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
+            "#,
+        ),
     ]
 }
 

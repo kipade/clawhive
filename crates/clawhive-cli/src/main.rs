@@ -108,6 +108,8 @@ enum Commands {
     Validate,
     #[command(about = "Run memory consolidation manually")]
     Consolidate,
+    #[command(subcommand, about = "Memory management")]
+    Memory(commands::memory::MemoryCommands),
     #[command(subcommand, about = "Agent management")]
     Agent(commands::agent::AgentCommands),
     #[command(subcommand, about = "Skill management")]
@@ -287,6 +289,9 @@ async fn main() -> Result<()> {
         }
         Commands::Consolidate => {
             commands::consolidate::run(&cli.config_root).await?;
+        }
+        Commands::Memory(cmd) => {
+            commands::memory::run(cmd, &cli.config_root).await?;
         }
         Commands::Agent(cmd) => {
             commands::agent::run(cmd, &cli.config_root)?;

@@ -28,7 +28,7 @@ impl ToolExecutor for MemorySearchTool {
     fn definition(&self) -> ToolDef {
         ToolDef {
             name: "memory_search".into(),
-            description: "Search through long-term memory using semantic and keyword search. Returns relevant memory chunks ranked by relevance.".into(),
+            description: "Search through long-term memory. Returns snippets ranked by relevance. Use memory_get to read full content of interesting results.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -65,9 +65,18 @@ impl ToolExecutor for MemorySearchTool {
             Ok(results) => {
                 let mut output = String::new();
                 for r in &results {
+                    let snippet: String = r.text.chars().take(200).collect();
+                    let truncated = if r.text.chars().count() > 200 {
+                        "..."
+                    } else {
+                        ""
+                    };
                     output.push_str(&format!(
-                        "## {} (score: {:.2})\n{}\n\n",
-                        r.path, r.score, r.text
+                        "- [{path}:{start}-{end}] (score: {score:.2}) {snippet}{truncated}\n",
+                        path = r.path,
+                        start = r.start_line,
+                        end = r.end_line,
+                        score = r.score,
                     ));
                 }
                 Ok(ToolOutput {

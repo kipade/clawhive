@@ -26,7 +26,8 @@ pub(crate) async fn run(root: &Path) -> Result<()> {
         .with_search_index(consolidation_search_index)
         .with_embedding_provider(consolidation_embedding_provider)
         .with_file_store_for_reindex(file_store)
-        .with_session_reader_for_reindex(session_reader),
+        .with_session_reader_for_reindex(session_reader)
+        .with_memory_store(Arc::clone(&memory)),
     );
 
     let scheduler =

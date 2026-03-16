@@ -5,6 +5,7 @@ use clawhive_memory::embedding::EmbeddingProvider;
 use clawhive_memory::file_store::MemoryFileStore;
 use clawhive_memory::search_index::SearchIndex;
 use clawhive_memory::session::SessionReader;
+use clawhive_memory::MemoryStore;
 use clawhive_provider::LlmMessage;
 
 use super::router::LlmRouter;
@@ -70,6 +71,7 @@ pub struct HippocampusConsolidator {
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     reindex_file_store: Option<MemoryFileStore>,
     reindex_session_reader: Option<SessionReader>,
+    memory_store: Option<Arc<MemoryStore>>,
 }
 
 #[derive(Debug)]
@@ -97,6 +99,7 @@ impl HippocampusConsolidator {
             embedding_provider: None,
             reindex_file_store: None,
             reindex_session_reader: None,
+            memory_store: None,
         }
     }
 
@@ -117,6 +120,11 @@ impl HippocampusConsolidator {
 
     pub fn with_file_store_for_reindex(mut self, file_store: MemoryFileStore) -> Self {
         self.reindex_file_store = Some(file_store);
+        self
+    }
+
+    pub fn with_memory_store(mut self, store: Arc<MemoryStore>) -> Self {
+        self.memory_store = Some(store);
         self
     }
 
@@ -262,6 +270,22 @@ impl HippocampusConsolidator {
         } else {
             false
         };
+
+        if let Some(ref store) = self.memory_store {
+            store
+                .record_trace(
+                    "system",
+                    "consolidation",
+                    &serde_json::json!({
+                        "daily_files_read": daily_files_read,
+                        "reindexed": reindexed,
+                        "memory_chars": updated_memory.len(),
+                    })
+                    .to_string(),
+                    None,
+                )
+                .await;
+        }
 
         Ok(ConsolidationReport {
             daily_files_read,

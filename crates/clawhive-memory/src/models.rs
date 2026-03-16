@@ -2,6 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[deprecated(
+    since = "0.1.0-alpha",
+    note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
     pub id: Uuid,
@@ -15,6 +19,10 @@ pub struct Episode {
     pub source_ref: Option<String>,
 }
 
+#[deprecated(
+    since = "0.1.0-alpha",
+    note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
+)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ConceptType {
     Fact,
@@ -24,6 +32,10 @@ pub enum ConceptType {
     TaskState,
 }
 
+#[deprecated(
+    since = "0.1.0-alpha",
+    note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
+)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ConceptStatus {
     Active,
@@ -31,6 +43,11 @@ pub enum ConceptStatus {
     Conflicted,
 }
 
+#[deprecated(
+    since = "0.1.0-alpha",
+    note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
+)]
+#[allow(deprecated)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Concept {
     pub id: Uuid,
@@ -44,6 +61,10 @@ pub struct Concept {
     pub status: ConceptStatus,
 }
 
+#[deprecated(
+    since = "0.1.0-alpha",
+    note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
+)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum LinkRelation {
     Supports,
@@ -51,6 +72,11 @@ pub enum LinkRelation {
     Updates,
 }
 
+#[deprecated(
+    since = "0.1.0-alpha",
+    note = "Will be replaced by Facts auxiliary layer. See memory-system-revised-plan."
+)]
+#[allow(deprecated)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Link {
     pub id: Uuid,

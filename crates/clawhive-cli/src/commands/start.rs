@@ -547,7 +547,8 @@ async fn start_bot(
         .with_search_index(consolidation_search_index)
         .with_embedding_provider(consolidation_embedding_provider)
         .with_file_store_for_reindex(file_store_for_consolidation)
-        .with_session_reader_for_reindex(session_reader_for_consolidation),
+        .with_session_reader_for_reindex(session_reader_for_consolidation)
+        .with_memory_store(Arc::clone(&memory)),
     );
     let consolidation_interval_hours = config.main.consolidation_interval_hours;
     let scheduler = ConsolidationScheduler::new(consolidator, consolidation_interval_hours);

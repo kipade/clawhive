@@ -1572,6 +1572,19 @@ impl Orchestrator {
                     result.compacted_count,
                     result.tokens_saved
                 );
+                self.memory
+                    .record_trace(
+                        agent_id,
+                        "compaction",
+                        &serde_json::json!({
+                            "compacted_count": result.compacted_count,
+                            "tokens_saved": result.tokens_saved,
+                            "summary_len": result.summary.len(),
+                        })
+                        .to_string(),
+                        None,
+                    )
+                    .await;
             }
 
             let req = LlmRequest {
@@ -2142,6 +2155,18 @@ impl Orchestrator {
                     tracing::warn!("Failed to write fallback summary: {e}");
                 } else {
                     tracing::info!("Wrote fallback summary for expired session");
+                    self.memory
+                        .record_trace(
+                            agent_id,
+                            "write",
+                            &serde_json::json!({
+                                "source": "fallback_summary",
+                                "target": format!("memory/{}.md", today.format("%Y-%m-%d")),
+                            })
+                            .to_string(),
+                            None,
+                        )
+                        .await;
                 }
             }
             Err(e) => {
@@ -2163,21 +2188,63 @@ impl Orchestrator {
             .map(|policy| policy.max_injected_chars)
             .unwrap_or(6000);
 
+        let search_start = std::time::Instant::now();
         let results = self
             .search_index_for(agent_id)
             .search(query, view.embedding_provider.as_ref(), 6, 0.25)
             .await;
+        let search_ms = search_start.elapsed().as_millis() as i64;
 
         match results {
-            Ok(results) if !results.is_empty() => Ok(clamp_to_budget(&results, budget)),
+            Ok(results) if !results.is_empty() => {
+                let context = clamp_to_budget(&results, budget);
+                self.memory.record_trace(
+                    agent_id,
+                    "search",
+                    &serde_json::json!({
+                        "query": query.chars().take(200).collect::<String>(),
+                        "candidates": results.len(),
+                        "scores": results.iter().map(|r| format!("{:.2}", r.score)).collect::<Vec<_>>(),
+                    }).to_string(),
+                    Some(search_ms),
+                ).await;
+                self.memory
+                    .record_trace(
+                        agent_id,
+                        "inject",
+                        &serde_json::json!({
+                            "budget": budget,
+                            "injected_chars": context.len(),
+                            "result_count": results.len(),
+                        })
+                        .to_string(),
+                        None,
+                    )
+                    .await;
+                Ok(context)
+            }
             _ => {
                 let fallback = self.file_store_for(agent_id).build_memory_context().await?;
-                if fallback.len() > budget {
+                let context = if fallback.len() > budget {
                     let truncated: String = fallback.chars().take(budget).collect();
-                    Ok(format!("{truncated}\n...[truncated]"))
+                    format!("{truncated}\n...[truncated]")
                 } else {
-                    Ok(fallback)
-                }
+                    fallback
+                };
+                self.memory
+                    .record_trace(
+                        agent_id,
+                        "inject",
+                        &serde_json::json!({
+                            "budget": budget,
+                            "injected_chars": context.len(),
+                            "source": "fallback",
+                        })
+                        .to_string(),
+                        Some(search_ms),
+                    )
+                    .await;
+                Ok(context)
             }
         }
     }

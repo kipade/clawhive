@@ -724,6 +724,7 @@ dependencies = [
  "openssl",
  "qrcode",
  "reqwest 0.12.28",
+ "rusqlite",
  "self-replace",
  "semver",
  "serde",
