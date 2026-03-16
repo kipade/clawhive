@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use clawhive_memory::embedding::EmbeddingProvider;
+use clawhive_memory::fact_store::{self, Fact, FactStore};
 use clawhive_memory::file_store::MemoryFileStore;
 use clawhive_memory::search_index::SearchIndex;
 use clawhive_memory::session::SessionReader;
@@ -42,6 +44,41 @@ Rules:
 - Be concise - only keep information that is useful for future conversations
 - Output the COMPLETE updated MEMORY.md content (not a diff)"#;
 
+const FACT_EXTRACTION_SYSTEM_PROMPT: &str = r#"You are a fact extraction system. Extract key facts from the conversation summaries below.
+
+Return a JSON array of facts. Each fact should have:
+- "content": A clear, concise statement of the fact (e.g., "User prefers Rust over Go")
+- "fact_type": One of: "preference", "decision", "event", "person", "rule"
+- "importance": 0.0 to 1.0 (how important this fact is for future interactions)
+- "occurred_at": ISO date string if the fact has a specific date, null otherwise
+
+Rules:
+- Extract only concrete, actionable facts. Skip pleasantries and transient details.
+- Each fact should be self-contained and understandable without context.
+- Deduplicate: if the same fact appears multiple times, include it only once.
+- Return valid JSON only. No markdown fencing, no explanation.
+
+Example output:
+[
+  {"content": "User prefers Rust over Go", "fact_type": "preference", "importance": 0.8, "occurred_at": null},
+  {"content": "User moved to Tokyo", "fact_type": "event", "importance": 0.7, "occurred_at": "2026-03"}
+]
+
+If no facts can be extracted, return an empty array: []"#;
+
+#[derive(Debug, serde::Deserialize)]
+struct ExtractedFact {
+    content: String,
+    fact_type: String,
+    #[serde(default = "default_importance")]
+    importance: f64,
+    occurred_at: Option<String>,
+}
+
+fn default_importance() -> f64 {
+    0.5
+}
+
 #[derive(Debug, Clone)]
 pub struct AddInstruction {
     pub section: String,
@@ -62,6 +99,7 @@ pub struct MemoryPatch {
 }
 
 pub struct HippocampusConsolidator {
+    agent_id: String,
     file_store: MemoryFileStore,
     router: Arc<LlmRouter>,
     model_primary: String,
@@ -79,17 +117,20 @@ pub struct ConsolidationReport {
     pub daily_files_read: usize,
     pub memory_updated: bool,
     pub reindexed: bool,
+    pub facts_extracted: usize,
     pub summary: String,
 }
 
 impl HippocampusConsolidator {
     pub fn new(
+        agent_id: String,
         file_store: MemoryFileStore,
         router: Arc<LlmRouter>,
         model_primary: String,
         model_fallbacks: Vec<String>,
     ) -> Self {
         Self {
+            agent_id,
             file_store,
             router,
             model_primary,
@@ -145,6 +186,7 @@ impl HippocampusConsolidator {
                 daily_files_read: 0,
                 memory_updated: false,
                 reindexed: false,
+                facts_extracted: 0,
                 summary: "No daily files found in lookback window; skipped consolidation."
                     .to_string(),
             });
@@ -167,17 +209,24 @@ impl HippocampusConsolidator {
             Ok(patch) => {
                 if patch.keep {
                     tracing::info!("Consolidation returned [KEEP]; leaving MEMORY.md unchanged");
+                    let facts_extracted = self.extract_facts(&self.agent_id, &daily_sections).await;
                     return Ok(ConsolidationReport {
                         daily_files_read: recent_daily.len(),
                         memory_updated: false,
                         reindexed: false,
+                        facts_extracted,
                         summary: "Consolidation returned [KEEP]; MEMORY.md unchanged.".to_string(),
                     });
                 }
 
                 let updated_memory = apply_patch(&current_memory, &patch);
                 return self
-                    .finalize_updated_memory(updated_memory, &current_memory, recent_daily.len())
+                    .finalize_updated_memory(
+                        updated_memory,
+                        &current_memory,
+                        &daily_sections,
+                        recent_daily.len(),
+                    )
                     .await;
             }
             Err(error) => {
@@ -195,16 +244,23 @@ impl HippocampusConsolidator {
         let updated_memory = strip_markdown_fence(&response.text);
         if updated_memory.trim() == "[KEEP]" {
             tracing::info!("Consolidation returned [KEEP]; leaving MEMORY.md unchanged");
+            let facts_extracted = self.extract_facts(&self.agent_id, &daily_sections).await;
             return Ok(ConsolidationReport {
                 daily_files_read: recent_daily.len(),
                 memory_updated: false,
                 reindexed: false,
+                facts_extracted,
                 summary: "Consolidation returned [KEEP]; MEMORY.md unchanged.".to_string(),
             });
         }
 
-        self.finalize_updated_memory(updated_memory, &current_memory, recent_daily.len())
-            .await
+        self.finalize_updated_memory(
+            updated_memory,
+            &current_memory,
+            &daily_sections,
+            recent_daily.len(),
+        )
+        .await
     }
 
     async fn request_consolidation(
@@ -227,6 +283,7 @@ impl HippocampusConsolidator {
         &self,
         updated_memory: String,
         current_memory: &str,
+        daily_sections: &str,
         daily_files_read: usize,
     ) -> Result<ConsolidationReport> {
         if let Err(error) = validate_consolidation_output(&updated_memory, current_memory) {
@@ -235,6 +292,7 @@ impl HippocampusConsolidator {
                 daily_files_read,
                 memory_updated: false,
                 reindexed: false,
+                facts_extracted: 0,
                 summary: "Consolidation skipped because LLM output failed validation.".to_string(),
             });
         }
@@ -245,6 +303,7 @@ impl HippocampusConsolidator {
                 daily_files_read,
                 memory_updated: false,
                 reindexed: false,
+                facts_extracted: 0,
                 summary: "Consolidation produced no MEMORY.md changes.".to_string(),
             });
         }
@@ -271,14 +330,17 @@ impl HippocampusConsolidator {
             false
         };
 
+        let facts_extracted = self.extract_facts(&self.agent_id, daily_sections).await;
+
         if let Some(ref store) = self.memory_store {
             store
                 .record_trace(
-                    "system",
+                    &self.agent_id,
                     "consolidation",
                     &serde_json::json!({
                         "daily_files_read": daily_files_read,
                         "reindexed": reindexed,
+                        "facts_extracted": facts_extracted,
                         "memory_chars": updated_memory.len(),
                     })
                     .to_string(),
@@ -291,8 +353,133 @@ impl HippocampusConsolidator {
             daily_files_read,
             memory_updated: true,
             reindexed,
+            facts_extracted,
             summary: format!("Consolidated {daily_files_read} daily files into MEMORY.md."),
         })
+    }
+
+    async fn extract_facts(&self, agent_id: &str, daily_sections: &str) -> usize {
+        let Some(memory_store) = &self.memory_store else {
+            return 0;
+        };
+
+        let fact_store = FactStore::new(memory_store.db());
+
+        match self
+            .extract_facts_inner(agent_id, daily_sections, &fact_store)
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(agent_id, error = %error, "Fact extraction failed after consolidation");
+                0
+            }
+        }
+    }
+
+    async fn extract_facts_inner(
+        &self,
+        agent_id: &str,
+        daily_sections: &str,
+        fact_store: &FactStore,
+    ) -> Result<usize> {
+        let response = self
+            .request_consolidation(FACT_EXTRACTION_SYSTEM_PROMPT, daily_sections.to_string())
+            .await?;
+        let extracted =
+            serde_json::from_str::<Vec<ExtractedFact>>(&strip_markdown_fence(&response.text))?;
+        if extracted.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut active_facts = fact_store.get_active_facts(agent_id).await?;
+
+        for extracted_fact in &extracted {
+            let content = extracted_fact.content.trim();
+            if content.is_empty() {
+                continue;
+            }
+
+            let fact = Fact {
+                id: fact_store::generate_fact_id(agent_id, content),
+                agent_id: agent_id.to_string(),
+                content: content.to_string(),
+                fact_type: extracted_fact.fact_type.trim().to_string(),
+                importance: extracted_fact.importance.clamp(0.0, 1.0),
+                confidence: 1.0,
+                status: "active".to_string(),
+                occurred_at: extracted_fact.occurred_at.clone(),
+                recorded_at: now.clone(),
+                source_type: "consolidation".to_string(),
+                source_session: None,
+                access_count: 0,
+                last_accessed: None,
+                superseded_by: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+
+            if fact_store
+                .find_by_content(agent_id, &fact.content)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+
+            if let Some(conflict) = self
+                .find_conflicting_fact(&fact, &active_facts)
+                .await?
+                .filter(|existing| existing.agent_id == agent_id)
+            {
+                fact_store
+                    .supersede(&conflict.id, &fact, "Updated by consolidation")
+                    .await?;
+                active_facts.retain(|existing| existing.id != conflict.id);
+                active_facts.push(fact);
+                continue;
+            }
+
+            fact_store.insert_fact(&fact).await?;
+            fact_store.record_add(&fact).await?;
+            active_facts.push(fact);
+        }
+
+        Ok(extracted.len())
+    }
+
+    async fn find_conflicting_fact(
+        &self,
+        new_fact: &Fact,
+        active_facts: &[Fact],
+    ) -> Result<Option<Fact>> {
+        let Some(provider) = &self.embedding_provider else {
+            return Ok(None);
+        };
+        if active_facts.is_empty() {
+            return Ok(None);
+        }
+
+        let mut texts = Vec::with_capacity(active_facts.len() + 1);
+        texts.push(new_fact.content.clone());
+        texts.extend(active_facts.iter().map(|fact| fact.content.clone()));
+
+        let embeddings = provider.embed(&texts).await?.embeddings;
+        if embeddings.len() != texts.len() {
+            return Ok(None);
+        }
+
+        let new_embedding = &embeddings[0];
+        let conflict = active_facts
+            .iter()
+            .zip(embeddings.iter().skip(1))
+            .find(|(existing, embedding)| {
+                existing.id != new_fact.id && cosine_similarity(new_embedding, embedding) > 0.85
+            })
+            .map(|(fact, _)| fact.clone());
+
+        Ok(conflict)
     }
 }
 
@@ -550,6 +737,27 @@ fn strip_markdown_fence(text: &str) -> String {
         .to_string()
 }
 
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.is_empty() || b.is_empty() || a.len() != b.len() {
+        return 0.0;
+    }
+
+    let mut dot = 0.0_f32;
+    let mut norm_a = 0.0_f32;
+    let mut norm_b = 0.0_f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+
+    if norm_a <= f32::EPSILON || norm_b <= f32::EPSILON {
+        return 0.0;
+    }
+
+    (dot / (norm_a.sqrt() * norm_b.sqrt())).clamp(0.0, 1.0)
+}
+
 fn validate_consolidation_output(output: &str, existing: &str) -> Result<()> {
     let trimmed = output.trim();
     if trimmed.is_empty() {
@@ -629,14 +837,17 @@ impl ConsolidationScheduler {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use anyhow::Result;
     use async_trait::async_trait;
     use clawhive_memory::embedding::EmbeddingProvider;
+    use clawhive_memory::fact_store::{generate_fact_id, Fact, FactStore};
     use clawhive_memory::file_store::MemoryFileStore;
     use clawhive_memory::session::SessionReader;
-    use clawhive_provider::{ProviderRegistry, StubProvider};
+    use clawhive_memory::store::MemoryStore;
+    use clawhive_provider::{LlmProvider, LlmRequest, LlmResponse, ProviderRegistry, StubProvider};
     use tempfile::TempDir;
 
     use super::{
@@ -668,12 +879,14 @@ mod tests {
             daily_files_read: 0,
             memory_updated: false,
             reindexed: false,
+            facts_extracted: 0,
             summary: "none".to_string(),
         };
 
         assert_eq!(report.daily_files_read, 0);
         assert!(!report.memory_updated);
         assert!(!report.reindexed);
+        assert_eq!(report.facts_extracted, 0);
         assert_eq!(report.summary, "none");
     }
 
@@ -895,8 +1108,13 @@ Working on Clawhive memory safety.
     #[test]
     fn hippocampus_new_default_lookback() -> Result<()> {
         let (_dir, file_store) = build_file_store()?;
-        let consolidator =
-            HippocampusConsolidator::new(file_store, build_router(), "sonnet".to_string(), vec![]);
+        let consolidator = HippocampusConsolidator::new(
+            "agent-1".to_string(),
+            file_store,
+            build_router(),
+            "sonnet".to_string(),
+            vec![],
+        );
 
         assert_eq!(consolidator.lookback_days, 7);
         Ok(())
@@ -905,9 +1123,14 @@ Working on Clawhive memory safety.
     #[test]
     fn hippocampus_with_lookback_days() -> Result<()> {
         let (_dir, file_store) = build_file_store()?;
-        let consolidator =
-            HippocampusConsolidator::new(file_store, build_router(), "sonnet".to_string(), vec![])
-                .with_lookback_days(30);
+        let consolidator = HippocampusConsolidator::new(
+            "agent-1".to_string(),
+            file_store,
+            build_router(),
+            "sonnet".to_string(),
+            vec![],
+        )
+        .with_lookback_days(30);
 
         assert_eq!(consolidator.lookback_days, 30);
         Ok(())
@@ -917,6 +1140,7 @@ Working on Clawhive memory safety.
     fn consolidation_scheduler_new() -> Result<()> {
         let (_dir, file_store) = build_file_store()?;
         let consolidator = Arc::new(HippocampusConsolidator::new(
+            "agent-1".to_string(),
             file_store,
             build_router(),
             "sonnet".to_string(),
@@ -933,8 +1157,13 @@ Working on Clawhive memory safety.
         let (_dir, file_store) = build_file_store()?;
         file_store.write_long_term("# Memory\n\nExisting").await?;
 
-        let consolidator =
-            HippocampusConsolidator::new(file_store, build_router(), "sonnet".to_string(), vec![]);
+        let consolidator = HippocampusConsolidator::new(
+            "agent-1".to_string(),
+            file_store,
+            build_router(),
+            "sonnet".to_string(),
+            vec![],
+        );
 
         let report = consolidator.consolidate().await?;
         assert_eq!(report.daily_files_read, 0);
@@ -973,6 +1202,7 @@ Working on Clawhive memory safety.
 
         // Create consolidator with re-indexing enabled
         let consolidator = HippocampusConsolidator::new(
+            "agent-1".to_string(),
             file_store.clone(),
             build_router(),
             "sonnet".to_string(),
@@ -994,6 +1224,142 @@ Working on Clawhive memory safety.
         assert!(report.reindexed);
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn consolidation_extracts_and_supersedes_conflicting_facts() -> Result<()> {
+        use chrono::{Local, Utc};
+
+        let (_dir, file_store) = build_file_store()?;
+        file_store.write_long_term("# Memory\n\nExisting").await?;
+
+        let today = Local::now().date_naive();
+        file_store
+            .write_daily(today, "## Observations\n\nUser moved to Tokyo.")
+            .await?;
+
+        let memory_store = Arc::new(MemoryStore::open_in_memory()?);
+        let fact_store = FactStore::new(memory_store.db());
+        let now = Utc::now().to_rfc3339();
+        let old_fact = Fact {
+            id: generate_fact_id("agent-1", "User lives in Berlin"),
+            agent_id: "agent-1".to_string(),
+            content: "User lives in Berlin".to_string(),
+            fact_type: "event".to_string(),
+            importance: 0.6,
+            confidence: 1.0,
+            status: "active".to_string(),
+            occurred_at: None,
+            recorded_at: now.clone(),
+            source_type: "consolidation".to_string(),
+            source_session: None,
+            access_count: 0,
+            last_accessed: None,
+            superseded_by: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        fact_store.insert_fact(&old_fact).await?;
+        fact_store.record_add(&old_fact).await?;
+
+        let router = build_router_with_provider(SequenceProvider::new(vec![
+            "[KEEP]".to_string(),
+            r#"[{"content":"User lives in Tokyo","fact_type":"event","importance":0.9,"occurred_at":null}]"#.to_string(),
+        ]));
+
+        let consolidator = HippocampusConsolidator::new(
+            "agent-1".to_string(),
+            file_store,
+            router,
+            "sonnet".to_string(),
+            vec![],
+        )
+        .with_memory_store(Arc::clone(&memory_store))
+        .with_embedding_provider(Arc::new(KeywordEmbeddingProvider));
+
+        let report = consolidator.consolidate().await?;
+
+        assert_eq!(report.facts_extracted, 1);
+        let facts = fact_store.get_active_facts("agent-1").await?;
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "User lives in Tokyo");
+
+        let history = fact_store.get_history(&old_fact.id).await?;
+        assert_eq!(history[0].event, "SUPERSEDE");
+        Ok(())
+    }
+
+    fn build_router_with_provider(provider: Arc<dyn LlmProvider>) -> Arc<LlmRouter> {
+        let mut registry = ProviderRegistry::new();
+        registry.register("anthropic", provider);
+        let aliases = HashMap::from([(
+            "sonnet".to_string(),
+            "anthropic/claude-sonnet-4-5".to_string(),
+        )]);
+        Arc::new(LlmRouter::new(registry, aliases, vec![]))
+    }
+
+    struct SequenceProvider {
+        responses: Vec<String>,
+        call_count: AtomicUsize,
+    }
+
+    impl SequenceProvider {
+        fn new(responses: Vec<String>) -> Arc<Self> {
+            Arc::new(Self {
+                responses,
+                call_count: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequenceProvider {
+        async fn chat(&self, _request: LlmRequest) -> Result<LlmResponse> {
+            let index = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let text = self.responses.get(index).cloned().unwrap_or_default();
+            Ok(LlmResponse {
+                text,
+                content: vec![],
+                input_tokens: None,
+                output_tokens: None,
+                stop_reason: Some("end_turn".to_string()),
+            })
+        }
+    }
+
+    struct KeywordEmbeddingProvider;
+
+    #[async_trait]
+    impl EmbeddingProvider for KeywordEmbeddingProvider {
+        async fn embed(
+            &self,
+            texts: &[String],
+        ) -> anyhow::Result<clawhive_memory::embedding::EmbeddingResult> {
+            let embeddings = texts
+                .iter()
+                .map(|text| {
+                    if text.contains("lives in") {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0]
+                    }
+                })
+                .collect();
+            Ok(clawhive_memory::embedding::EmbeddingResult {
+                embeddings,
+                model: "keyword".to_string(),
+                dimensions: 2,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "keyword"
+        }
+
+        fn dimensions(&self) -> usize {
+            2
+        }
     }
 
     struct StubEmbeddingProvider;

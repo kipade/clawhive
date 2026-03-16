@@ -1,0 +1,451 @@
+use std::sync::{Arc, Mutex};
+
+use anyhow::{anyhow, Result};
+use chrono::Utc;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::task;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Fact {
+    pub id: String,
+    pub agent_id: String,
+    pub content: String,
+    pub fact_type: String,
+    pub importance: f64,
+    pub confidence: f64,
+    pub status: String,
+    pub occurred_at: Option<String>,
+    pub recorded_at: String,
+    pub source_type: String,
+    pub source_session: Option<String>,
+    pub access_count: i64,
+    pub last_accessed: Option<String>,
+    pub superseded_by: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactHistory {
+    pub id: String,
+    pub fact_id: String,
+    pub event: String,
+    pub old_content: Option<String>,
+    pub new_content: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: String,
+}
+
+pub fn generate_fact_id(agent_id: &str, content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(agent_id.as_bytes());
+    hasher.update(content.as_bytes());
+    let hash = hasher.finalize();
+    let hash_bytes: [u8; 16] = hash[..16].try_into().unwrap_or([0u8; 16]);
+    Uuid::from_bytes(hash_bytes).to_string()
+}
+
+#[derive(Clone)]
+pub struct FactStore {
+    db: Arc<Mutex<Connection>>,
+}
+
+impl FactStore {
+    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+        Self { db }
+    }
+
+    pub async fn insert_fact(&self, fact: &Fact) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        let fact = fact.clone();
+        task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
+            conn.execute(
+                r#"
+                INSERT INTO facts (
+                    id, agent_id, content, fact_type, importance, confidence,
+                    status, occurred_at, recorded_at, source_type, source_session,
+                    access_count, last_accessed, superseded_by, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                "#,
+                params![
+                    fact.id,
+                    fact.agent_id,
+                    fact.content,
+                    fact.fact_type,
+                    fact.importance,
+                    fact.confidence,
+                    fact.status,
+                    fact.occurred_at,
+                    fact.recorded_at,
+                    fact.source_type,
+                    fact.source_session,
+                    fact.access_count,
+                    fact.last_accessed,
+                    fact.superseded_by,
+                    fact.created_at,
+                    fact.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    pub async fn get_active_facts(&self, agent_id: &str) -> Result<Vec<Fact>> {
+        let db = Arc::clone(&self.db);
+        let agent_id = agent_id.to_owned();
+        task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
+            let mut stmt = conn.prepare(
+                "SELECT id, agent_id, content, fact_type, importance, confidence, status, \
+                 occurred_at, recorded_at, source_type, source_session, access_count, \
+                 last_accessed, superseded_by, created_at, updated_at \
+                 FROM facts WHERE agent_id = ?1 AND status = 'active' \
+                 ORDER BY importance DESC, updated_at DESC",
+            )?;
+            let rows = stmt.query_map(params![agent_id], row_to_fact)?;
+            let mut facts = Vec::new();
+            for row in rows {
+                facts.push(row?);
+            }
+            Ok(facts)
+        })
+        .await?
+    }
+
+    pub async fn find_by_content(&self, agent_id: &str, content: &str) -> Result<Option<Fact>> {
+        let id = generate_fact_id(agent_id, content);
+        let db = Arc::clone(&self.db);
+        task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
+            let result = conn.query_row(
+                "SELECT id, agent_id, content, fact_type, importance, confidence, status, \
+                 occurred_at, recorded_at, source_type, source_session, access_count, \
+                 last_accessed, superseded_by, created_at, updated_at \
+                 FROM facts WHERE id = ?1",
+                params![id],
+                row_to_fact,
+            );
+            match result {
+                Ok(fact) => Ok(Some(fact)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await?
+    }
+
+    pub async fn supersede(&self, old_fact_id: &str, new_fact: &Fact, reason: &str) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        let old_id = old_fact_id.to_owned();
+        let new_fact = new_fact.clone();
+        let reason = reason.to_owned();
+        let now = Utc::now().to_rfc3339();
+        task::spawn_blocking(move || {
+            let mut conn = db
+                .lock()
+                .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
+
+            let tx = conn.transaction()?;
+
+            let old_content: Option<String> = tx
+                .query_row(
+                    "SELECT content FROM facts WHERE id = ?1",
+                    params![old_id],
+                    |r| r.get(0),
+                )
+                .ok();
+
+            let updated = tx.execute(
+                "UPDATE facts SET status = 'superseded', superseded_by = ?1, updated_at = ?2 WHERE id = ?3",
+                params![new_fact.id, now, old_id],
+            )?;
+            if updated == 0 {
+                return Err(anyhow!("fact not found: {old_id}"));
+            }
+
+            tx.execute(
+                r#"
+                INSERT INTO facts (
+                    id, agent_id, content, fact_type, importance, confidence,
+                    status, occurred_at, recorded_at, source_type, source_session,
+                    access_count, last_accessed, superseded_by, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                "#,
+                params![
+                    new_fact.id,
+                    new_fact.agent_id,
+                    new_fact.content,
+                    new_fact.fact_type,
+                    new_fact.importance,
+                    new_fact.confidence,
+                    new_fact.status,
+                    new_fact.occurred_at,
+                    new_fact.recorded_at,
+                    new_fact.source_type,
+                    new_fact.source_session,
+                    new_fact.access_count,
+                    new_fact.last_accessed,
+                    new_fact.superseded_by,
+                    new_fact.created_at,
+                    new_fact.updated_at,
+                ],
+            )?;
+
+            tx.execute(
+                "INSERT INTO fact_history (id, fact_id, event, old_content, new_content, reason, created_at) \
+                 VALUES (?1, ?2, 'SUPERSEDE', ?3, ?4, ?5, ?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    old_id,
+                    old_content,
+                    new_fact.content,
+                    reason,
+                    now,
+                ],
+            )?;
+
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
+    pub async fn update_status(&self, fact_id: &str, new_status: &str, reason: &str) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        let fact_id = fact_id.to_owned();
+        let new_status = new_status.to_owned();
+        let reason = reason.to_owned();
+        let now = Utc::now().to_rfc3339();
+        task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
+
+            let old_status: String = conn.query_row(
+                "SELECT status FROM facts WHERE id = ?1",
+                params![fact_id],
+                |r| r.get(0),
+            )?;
+
+            let event = match new_status.as_str() {
+                "retracted" => "RETRACT",
+                "expired" => "EXPIRE",
+                "deleted" => "DELETE",
+                _ => "UPDATE",
+            };
+
+            conn.execute(
+                "UPDATE facts SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![new_status, now, fact_id],
+            )?;
+
+            conn.execute(
+                "INSERT INTO fact_history (id, fact_id, event, old_content, new_content, reason, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    fact_id,
+                    event,
+                    old_status,
+                    reason,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    pub async fn record_add(&self, fact: &Fact) -> Result<()> {
+        let db = Arc::clone(&self.db);
+        let fact_id = fact.id.clone();
+        let content = fact.content.clone();
+        let now = Utc::now().to_rfc3339();
+        task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
+            conn.execute(
+                "INSERT INTO fact_history (id, fact_id, event, old_content, new_content, reason, created_at) \
+                 VALUES (?1, ?2, 'ADD', NULL, ?3, NULL, ?4)",
+                params![Uuid::new_v4().to_string(), fact_id, content, now],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    pub async fn get_history(&self, fact_id: &str) -> Result<Vec<FactHistory>> {
+        let db = Arc::clone(&self.db);
+        let fact_id = fact_id.to_owned();
+        task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
+            let mut stmt = conn.prepare(
+                "SELECT id, fact_id, event, old_content, new_content, reason, created_at \
+                 FROM fact_history WHERE fact_id = ?1 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt.query_map(params![fact_id], |r| {
+                Ok(FactHistory {
+                    id: r.get(0)?,
+                    fact_id: r.get(1)?,
+                    event: r.get(2)?,
+                    old_content: r.get(3)?,
+                    new_content: r.get(4)?,
+                    reason: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            })?;
+            let mut history = Vec::new();
+            for row in rows {
+                history.push(row?);
+            }
+            Ok(history)
+        })
+        .await?
+    }
+}
+
+fn row_to_fact(r: &rusqlite::Row) -> rusqlite::Result<Fact> {
+    Ok(Fact {
+        id: r.get(0)?,
+        agent_id: r.get(1)?,
+        content: r.get(2)?,
+        fact_type: r.get(3)?,
+        importance: r.get(4)?,
+        confidence: r.get(5)?,
+        status: r.get(6)?,
+        occurred_at: r.get(7)?,
+        recorded_at: r.get(8)?,
+        source_type: r.get(9)?,
+        source_session: r.get(10)?,
+        access_count: r.get(11)?,
+        last_accessed: r.get(12)?,
+        superseded_by: r.get(13)?,
+        created_at: r.get(14)?,
+        updated_at: r.get(15)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryStore;
+
+    fn make_fact(agent_id: &str, content: &str, fact_type: &str) -> Fact {
+        let now = Utc::now().to_rfc3339();
+        Fact {
+            id: generate_fact_id(agent_id, content),
+            agent_id: agent_id.to_owned(),
+            content: content.to_owned(),
+            fact_type: fact_type.to_owned(),
+            importance: 0.5,
+            confidence: 1.0,
+            status: "active".to_owned(),
+            occurred_at: None,
+            recorded_at: now.clone(),
+            source_type: "consolidation".to_owned(),
+            source_session: None,
+            access_count: 0,
+            last_accessed: None,
+            superseded_by: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_and_get_active_facts() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let fact_store = FactStore::new(store.db());
+
+        let fact = make_fact("agent-1", "User prefers Rust", "preference");
+        fact_store.insert_fact(&fact).await.unwrap();
+        fact_store.record_add(&fact).await.unwrap();
+
+        let facts = fact_store.get_active_facts("agent-1").await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "User prefers Rust");
+
+        let empty = fact_store.get_active_facts("agent-2").await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_by_content() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let fact_store = FactStore::new(store.db());
+
+        let fact = make_fact("agent-1", "User lives in Tokyo", "event");
+        fact_store.insert_fact(&fact).await.unwrap();
+
+        let found = fact_store
+            .find_by_content("agent-1", "User lives in Tokyo")
+            .await
+            .unwrap();
+        assert!(found.is_some());
+
+        let not_found = fact_store
+            .find_by_content("agent-1", "User lives in Berlin")
+            .await
+            .unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[tokio::test]
+    async fn supersede_old_fact() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let fact_store = FactStore::new(store.db());
+
+        let old = make_fact("agent-1", "User lives in Berlin", "event");
+        fact_store.insert_fact(&old).await.unwrap();
+        fact_store.record_add(&old).await.unwrap();
+
+        let new = make_fact("agent-1", "User lives in Tokyo", "event");
+        fact_store
+            .supersede(&old.id, &new, "User moved to Tokyo")
+            .await
+            .unwrap();
+
+        let active = fact_store.get_active_facts("agent-1").await.unwrap();
+        let contents: Vec<&str> = active.iter().map(|f| f.content.as_str()).collect();
+        assert_eq!(contents, vec!["User lives in Tokyo"]);
+
+        let history = fact_store.get_history(&old.id).await.unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].event, "SUPERSEDE");
+        assert_eq!(history[1].event, "ADD");
+    }
+
+    #[tokio::test]
+    async fn retract_fact() {
+        let store = MemoryStore::open_in_memory().unwrap();
+        let fact_store = FactStore::new(store.db());
+
+        let fact = make_fact("agent-1", "Wrong info", "event");
+        fact_store.insert_fact(&fact).await.unwrap();
+
+        fact_store
+            .update_status(&fact.id, "retracted", "User corrected this")
+            .await
+            .unwrap();
+
+        let active = fact_store.get_active_facts("agent-1").await.unwrap();
+        assert!(active.is_empty());
+
+        let history = fact_store.get_history(&fact.id).await.unwrap();
+        assert_eq!(history[0].event, "RETRACT");
+    }
+}

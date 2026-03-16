@@ -1135,6 +1135,7 @@ mod tests {
         let tool_registry = build_tool_registry(
             &file_store,
             &search_index,
+            &memory,
             &embedding_provider,
             tmp.path(),
             tmp.path(),
@@ -1228,6 +1229,7 @@ mod tests {
         let tool_registry = build_tool_registry(
             &file_store,
             &search_index,
+            &memory,
             &embedding_provider,
             tmp.path(),
             tmp.path(),

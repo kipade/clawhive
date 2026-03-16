@@ -452,6 +452,7 @@ pub(crate) async fn bootstrap(
     let tool_registry = build_tool_registry(
         &file_store,
         &search_index,
+        &memory,
         &embedding_provider,
         workspace_dir.as_path(),
         workspace_dir.as_path(),

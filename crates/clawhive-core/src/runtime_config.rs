@@ -671,6 +671,7 @@ pub async fn build_config_view(
     let tool_registry = build_tool_registry(
         &file_store,
         &search_index,
+        memory,
         &embedding_provider,
         root,
         root,

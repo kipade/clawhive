@@ -145,6 +145,45 @@ fn migrations() -> Vec<Migration> {
             ALTER TABLE chunks ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0;
             "#,
         ),
+        (
+            7,
+            r#"
+            CREATE TABLE IF NOT EXISTS facts (
+                id             TEXT PRIMARY KEY,
+                agent_id       TEXT NOT NULL,
+                content        TEXT NOT NULL,
+                fact_type      TEXT NOT NULL,
+                importance     REAL NOT NULL DEFAULT 0.5,
+                confidence     REAL NOT NULL DEFAULT 1.0,
+                status         TEXT NOT NULL DEFAULT 'active',
+                occurred_at    TEXT,
+                recorded_at    TEXT NOT NULL,
+                source_type    TEXT NOT NULL,
+                source_session TEXT,
+                access_count   INTEGER NOT NULL DEFAULT 0,
+                last_accessed  TEXT,
+                superseded_by  TEXT,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_facts_agent ON facts(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_facts_agent_status ON facts(agent_id, status);
+            CREATE INDEX IF NOT EXISTS idx_facts_type ON facts(agent_id, fact_type);
+
+            CREATE TABLE IF NOT EXISTS fact_history (
+                id             TEXT PRIMARY KEY,
+                fact_id        TEXT NOT NULL,
+                event          TEXT NOT NULL,
+                old_content    TEXT,
+                new_content    TEXT,
+                reason         TEXT,
+                created_at     TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fact_history_fact ON fact_history(fact_id);
+            "#,
+        ),
     ]
 }
 

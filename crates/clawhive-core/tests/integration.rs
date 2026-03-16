@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use clawhive_bus::EventBus;
 use clawhive_core::*;
 use clawhive_memory::embedding::{EmbeddingProvider, StubEmbeddingProvider};
+use clawhive_memory::fact_store::{generate_fact_id, Fact, FactStore};
 use clawhive_memory::search_index::SearchIndex;
 use clawhive_memory::MemoryStore;
 use clawhive_memory::{file_store::MemoryFileStore, SessionReader, SessionWriter};
@@ -177,6 +178,7 @@ struct TestToolDeps<'a> {
     publisher: &'a clawhive_bus::BusPublisher,
     workspace_root: &'a std::path::Path,
     schedule_manager: Arc<ScheduleManager>,
+    memory: &'a Arc<MemoryStore>,
     file_store: &'a MemoryFileStore,
     search_index: &'a SearchIndex,
     embedding_provider: Arc<dyn EmbeddingProvider>,
@@ -195,6 +197,7 @@ fn build_test_config_view(
     let tool_registry = build_tool_registry(
         deps.file_store,
         deps.search_index,
+        deps.memory,
         &deps.embedding_provider,
         deps.workspace_root,
         deps.workspace_root,
@@ -249,6 +252,7 @@ async fn make_orchestrator(
             publisher: &publisher,
             workspace_root: tmp.path(),
             schedule_manager: Arc::clone(&schedule_manager),
+            memory: &memory,
             file_store: &file_store,
             search_index: &search_index,
             embedding_provider,
@@ -313,6 +317,7 @@ async fn orchestrator_uses_search_index_for_memory_context() {
             publisher: &bus.publisher(),
             workspace_root: tmp.path(),
             schedule_manager: Arc::clone(&schedule_manager),
+            memory: &memory,
             file_store: &file_store,
             search_index: &search_index,
             embedding_provider: Arc::clone(&embedding_provider),
@@ -339,6 +344,90 @@ async fn orchestrator_uses_search_index_for_memory_context() {
         .unwrap();
     assert!(out.text.contains("## Relevant Memory"));
     assert!(out.text.contains("MEMORY.md (score:"));
+}
+
+#[tokio::test]
+async fn orchestrator_injects_active_facts_into_memory_context() {
+    let mut registry = ProviderRegistry::new();
+    registry.register("trace", Arc::new(TranscriptProvider));
+    let aliases = HashMap::from([("trace".to_string(), "trace/model".to_string())]);
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
+    let bus = EventBus::new(16);
+    let router = LlmRouter::new(registry, aliases, vec![]);
+    let agents = vec![test_full_agent("clawhive-main", "trace", vec![])];
+    let file_store = MemoryFileStore::new(tmp.path());
+    let session_writer = SessionWriter::new(tmp.path());
+    let session_reader = SessionReader::new(tmp.path());
+    let search_index = SearchIndex::new(memory.db());
+    let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
+    let schedule_manager = Arc::new(
+        ScheduleManager::new(
+            SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
+            Arc::new(EventBus::new(16)),
+        )
+        .await
+        .unwrap(),
+    );
+    let fact_store = FactStore::new(memory.db());
+    let now = chrono::Utc::now().to_rfc3339();
+    let fact = Fact {
+        id: generate_fact_id("clawhive-main", "User prefers dark mode"),
+        agent_id: "clawhive-main".to_string(),
+        content: "User prefers dark mode".to_string(),
+        fact_type: "preference".to_string(),
+        importance: 0.8,
+        confidence: 1.0,
+        status: "active".to_string(),
+        occurred_at: None,
+        recorded_at: now.clone(),
+        source_type: "test".to_string(),
+        source_session: None,
+        access_count: 0,
+        last_accessed: None,
+        superseded_by: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    fact_store.insert_fact(&fact).await.unwrap();
+    fact_store.record_add(&fact).await.unwrap();
+
+    let config_view = build_test_config_view(
+        agents,
+        router,
+        TestToolDeps {
+            publisher: &bus.publisher(),
+            workspace_root: tmp.path(),
+            schedule_manager: Arc::clone(&schedule_manager),
+            memory: &memory,
+            file_store: &file_store,
+            search_index: &search_index,
+            embedding_provider: Arc::clone(&embedding_provider),
+        },
+    );
+
+    let orch = OrchestratorBuilder::new(
+        config_view,
+        bus.publisher(),
+        memory,
+        Arc::new(NativeExecutor),
+        tmp.path().to_path_buf(),
+        schedule_manager,
+    )
+    .file_store(file_store)
+    .session_writer(session_writer)
+    .session_reader(session_reader)
+    .search_index(search_index)
+    .build();
+
+    let out = orch
+        .handle_inbound(test_inbound("what do you know about me?"), "clawhive-main")
+        .await
+        .unwrap();
+
+    assert!(out.text.contains("## Known Facts"));
+    assert!(out.text.contains("- [preference] User prefers dark mode"));
 }
 
 #[tokio::test]
@@ -380,6 +469,7 @@ async fn fallback_summary_appends_for_multiple_expired_sessions_on_same_day() {
             publisher: &bus.publisher(),
             workspace_root: tmp.path(),
             schedule_manager: Arc::clone(&schedule_manager),
+            memory: &memory,
             file_store: &file_store,
             search_index: &search_index,
             embedding_provider: Arc::clone(&embedding_provider),
@@ -577,6 +667,7 @@ async fn orchestrator_creates_session() {
             publisher: &bus.publisher(),
             workspace_root: tmp.path(),
             schedule_manager: Arc::clone(&schedule_manager),
+            memory: &memory,
             file_store: &file_store,
             search_index: &search_index,
             embedding_provider,
@@ -662,6 +753,7 @@ async fn orchestrator_publishes_reply_ready() {
             publisher: &bus.publisher(),
             workspace_root: tmp.path(),
             schedule_manager: Arc::clone(&schedule_manager),
+            memory: &memory,
             file_store: &file_store,
             search_index: &search_index,
             embedding_provider,

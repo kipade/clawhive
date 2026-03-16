@@ -11,13 +11,21 @@ pub(crate) async fn run(root: &Path) -> Result<()> {
     let (_bus, memory, _gateway, config, _schedule_manager, _wait_manager, _approval_registry) =
         bootstrap(root, None).await?;
 
-    let workspace_dir = root.to_path_buf();
+    let consolidation_agent_id = config.routing.default_agent_id.clone();
+    let consolidation_workspace = config
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == consolidation_agent_id)
+        .map(|agent| Workspace::resolve(root, &agent.agent_id, agent.workspace.as_deref()))
+        .unwrap_or_else(|| Workspace::resolve(root, &consolidation_agent_id, None));
+    let workspace_dir = consolidation_workspace.root().to_path_buf();
     let file_store = clawhive_memory::file_store::MemoryFileStore::new(&workspace_dir);
     let session_reader = clawhive_memory::session::SessionReader::new(&workspace_dir);
     let consolidation_search_index = clawhive_memory::search_index::SearchIndex::new(memory.db());
     let consolidation_embedding_provider = build_embedding_provider(&config).await;
     let consolidator = Arc::new(
         HippocampusConsolidator::new(
+            consolidation_agent_id,
             file_store.clone(),
             Arc::new(build_router_from_config(&config).await),
             "sonnet".to_string(),
@@ -38,6 +46,7 @@ pub(crate) async fn run(root: &Path) -> Result<()> {
     println!("  Daily files read: {}", report.daily_files_read);
     println!("  Memory updated: {}", report.memory_updated);
     println!("  Reindexed: {}", report.reindexed);
+    println!("  Facts extracted: {}", report.facts_extracted);
     println!("  Summary: {}", report.summary);
     Ok(())
 }

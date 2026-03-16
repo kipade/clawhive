@@ -82,6 +82,7 @@ async fn make_orchestrator(
     let tool_registry = build_tool_registry(
         &file_store,
         &search_index,
+        &memory,
         &embedding_provider,
         tmp.path(),
         tmp.path(),

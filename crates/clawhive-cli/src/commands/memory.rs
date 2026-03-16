@@ -18,6 +18,13 @@ pub enum MemoryCommands {
     },
     #[command(about = "Rebuild search index from memory files")]
     RebuildIndex,
+    #[command(about = "Export all memory for an agent (facts, MEMORY.md, daily files)")]
+    Export {
+        #[arg(help = "Agent ID to export")]
+        agent_id: String,
+        #[arg(long, help = "Export format: json or markdown (default: json)")]
+        format: Option<String>,
+    },
 }
 
 pub async fn run(cmd: MemoryCommands, root: &Path) -> Result<()> {
@@ -117,6 +124,52 @@ pub async fn run(cmd: MemoryCommands, root: &Path) -> Result<()> {
                 .index_all(&file_store, &session_reader, embedding_provider.as_ref())
                 .await?;
             println!("Done. Indexed {count} chunks.");
+
+            Ok(())
+        }
+        MemoryCommands::Export { agent_id, format } => {
+            let fact_store = clawhive_memory::fact_store::FactStore::new(memory.db());
+            let facts = fact_store.get_active_facts(&agent_id).await?;
+
+            let workspace_dir = root.join("workspaces").join(&agent_id);
+            let file_store = clawhive_memory::file_store::MemoryFileStore::new(&workspace_dir);
+            let long_term = file_store.read_long_term().await.unwrap_or_default();
+            let daily_files = file_store.read_recent_daily(30).await.unwrap_or_default();
+
+            let is_json = format.as_deref() != Some("markdown");
+
+            if is_json {
+                let export = serde_json::json!({
+                    "agent_id": agent_id,
+                    "facts": facts,
+                    "long_term_memory": long_term,
+                    "daily_files": daily_files.iter().map(|(date, content)| {
+                        serde_json::json!({
+                            "date": date.format("%Y-%m-%d").to_string(),
+                            "content": content,
+                        })
+                    }).collect::<Vec<_>>(),
+                });
+                println!("{}", serde_json::to_string_pretty(&export)?);
+            } else {
+                println!("# Memory Export: {agent_id}\n");
+                if !facts.is_empty() {
+                    println!("## Facts ({} active)\n", facts.len());
+                    for f in &facts {
+                        println!(
+                            "- [{}] {} (confidence: {:.1})",
+                            f.fact_type, f.content, f.confidence
+                        );
+                    }
+                    println!();
+                }
+                if !long_term.is_empty() {
+                    println!("## MEMORY.md\n\n{long_term}\n");
+                }
+                for (date, content) in &daily_files {
+                    println!("## {}\n\n{content}\n", date.format("%Y-%m-%d"));
+                }
+            }
 
             Ok(())
         }

@@ -28,7 +28,7 @@ use super::config::{ExecSecurityConfig, FullAgentConfig, SandboxPolicyConfig, Se
 use super::context::ContextCheckResult;
 use super::file_tools::{EditFileTool, ReadFileTool, WriteFileTool};
 use super::image_tool::ImageTool;
-use super::memory_tools::{MemoryGetTool, MemorySearchTool};
+use super::memory_tools::{MemoryForgetTool, MemoryGetTool, MemorySearchTool, MemoryWriteTool};
 use super::persona::Persona;
 use super::router::LlmRouter;
 use super::schedule_tool::ScheduleTool;
@@ -2188,6 +2188,15 @@ impl Orchestrator {
             .map(|policy| policy.max_injected_chars)
             .unwrap_or(6000);
 
+        let fact_store = clawhive_memory::fact_store::FactStore::new(self.memory.db());
+        let facts = fact_store
+            .get_active_facts(agent_id)
+            .await
+            .unwrap_or_default();
+        let facts_section = build_known_facts_section(&facts, budget);
+        let facts_chars = facts_section.chars().count();
+        let remaining_budget = budget.saturating_sub(facts_chars);
+
         let search_start = std::time::Instant::now();
         let results = self
             .search_index_for(agent_id)
@@ -2197,7 +2206,8 @@ impl Orchestrator {
 
         match results {
             Ok(results) if !results.is_empty() => {
-                let context = clamp_to_budget(&results, budget);
+                let search_context = clamp_to_budget(&results, remaining_budget);
+                let context = format!("{facts_section}{search_context}");
                 self.memory.record_trace(
                     agent_id,
                     "search",
@@ -2225,12 +2235,8 @@ impl Orchestrator {
             }
             _ => {
                 let fallback = self.file_store_for(agent_id).build_memory_context().await?;
-                let context = if fallback.len() > budget {
-                    let truncated: String = fallback.chars().take(budget).collect();
-                    format!("{truncated}\n...[truncated]")
-                } else {
-                    fallback
-                };
+                let context_body = truncate_text_to_budget(&fallback, remaining_budget);
+                let context = format!("{facts_section}{context_body}");
                 self.memory
                     .record_trace(
                         agent_id,
@@ -2254,6 +2260,7 @@ impl Orchestrator {
 pub fn build_tool_registry(
     file_store: &MemoryFileStore,
     search_index: &SearchIndex,
+    memory: &Arc<MemoryStore>,
     embedding_provider: &Arc<dyn EmbeddingProvider>,
     workspace_root: &std::path::Path,
     default_root: &std::path::Path,
@@ -2283,6 +2290,15 @@ pub fn build_tool_registry(
         embedding_provider.clone(),
     )));
     registry.register(Box::new(MemoryGetTool::new(file_store.clone())));
+    let fact_store = clawhive_memory::fact_store::FactStore::new(memory.db());
+    registry.register(Box::new(MemoryWriteTool::new(
+        fact_store.clone(),
+        "default".to_string(),
+    )));
+    registry.register(Box::new(MemoryForgetTool::new(
+        fact_store,
+        "default".to_string(),
+    )));
     let sub_agent_runner = Arc::new(super::subagent::SubAgentRunner::new(
         Arc::new(router.clone()),
         agents_map,
@@ -2755,12 +2771,51 @@ fn clamp_to_budget(
     context
 }
 
+fn truncate_text_to_budget(text: &str, budget: usize) -> String {
+    const TRUNCATED: &str = "\n...[truncated]";
+
+    if budget == 0 {
+        return String::new();
+    }
+
+    if text.chars().count() <= budget {
+        return text.to_string();
+    }
+
+    let truncated_chars = TRUNCATED.chars().count();
+    if budget <= truncated_chars {
+        return text.chars().take(budget).collect();
+    }
+
+    let available_chars = budget.saturating_sub(truncated_chars);
+    let truncated: String = text.chars().take(available_chars).collect();
+    format!("{truncated}{TRUNCATED}")
+}
+
+fn build_known_facts_section(facts: &[clawhive_memory::fact_store::Fact], budget: usize) -> String {
+    if facts.is_empty() || budget == 0 {
+        return String::new();
+    }
+
+    let mut section = String::from("## Known Facts\n\n");
+    for fact in facts {
+        section.push_str(&format!("- [{}] {}\n", fact.fact_type, fact.content));
+    }
+    section.push('\n');
+
+    truncate_text_to_budget(&section, budget)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone, Utc};
+    use clawhive_bus::EventBus;
+    use clawhive_memory::embedding::StubEmbeddingProvider;
+    use clawhive_memory::file_store::MemoryFileStore;
     use clawhive_memory::search_index::SearchResult;
-    use clawhive_memory::SessionMessage;
+    use clawhive_memory::{MemoryStore, SessionMessage};
+    use clawhive_scheduler::{ScheduleManager, SqliteStore};
     use serde_json::json;
 
     fn agent_with_memory_policy(
@@ -2868,6 +2923,56 @@ mod tests {
         let results = vec![make_result("memory/a.md", "first chunk", 0.91)];
 
         assert_eq!(clamp_to_budget(&results, 0), "");
+    }
+
+    #[tokio::test]
+    async fn build_tool_registry_registers_memory_fact_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
+        let file_store = MemoryFileStore::new(dir.path());
+        let search_index = SearchIndex::new(memory.db());
+        let embedding_provider: Arc<dyn EmbeddingProvider> =
+            Arc::new(StubEmbeddingProvider::new(8));
+        let router = LlmRouter::new(
+            clawhive_provider::ProviderRegistry::new(),
+            HashMap::new(),
+            vec![],
+        );
+        let bus = EventBus::new(16);
+        let schedule_manager = Arc::new(
+            ScheduleManager::new(
+                SqliteStore::open(&dir.path().join("data/scheduler.db")).unwrap(),
+                Arc::new(EventBus::new(16)),
+            )
+            .await
+            .unwrap(),
+        );
+        let agents = vec![agent_with_memory_policy(None)];
+        let personas = HashMap::new();
+
+        let registry = build_tool_registry(
+            &file_store,
+            &search_index,
+            &memory,
+            &embedding_provider,
+            dir.path(),
+            dir.path(),
+            &None,
+            &bus.publisher(),
+            schedule_manager,
+            None,
+            &router,
+            &agents,
+            &personas,
+        );
+        let tool_names: Vec<String> = registry
+            .tool_defs()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert!(tool_names.iter().any(|name| name == "memory_write"));
+        assert!(tool_names.iter().any(|name| name == "memory_forget"));
     }
 
     #[test]

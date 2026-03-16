@@ -505,7 +505,14 @@ async fn start_bot(
     let (bus, memory, gateway, config, schedule_manager, wait_task_manager, approval_registry) =
         bootstrap(root, security_override).await?;
 
-    let workspace_dir = root.to_path_buf();
+    let consolidation_agent_id = config.routing.default_agent_id.clone();
+    let consolidation_workspace = config
+        .agents
+        .iter()
+        .find(|agent| agent.agent_id == consolidation_agent_id)
+        .map(|agent| Workspace::resolve(root, &agent.agent_id, agent.workspace.as_deref()))
+        .unwrap_or_else(|| Workspace::resolve(root, &consolidation_agent_id, None));
+    let workspace_dir = consolidation_workspace.root().to_path_buf();
     let file_store_for_consolidation =
         clawhive_memory::file_store::MemoryFileStore::new(&workspace_dir);
     let session_reader_for_consolidation =
@@ -539,6 +546,7 @@ async fn start_bot(
 
     let consolidator = Arc::new(
         HippocampusConsolidator::new(
+            consolidation_agent_id,
             file_store_for_consolidation.clone(),
             Arc::new(build_router_from_config(&config).await),
             "sonnet".to_string(),

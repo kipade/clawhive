@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod embedding;
+pub mod fact_store;
 pub mod file_store;
 pub mod migrations;
 pub mod models;
