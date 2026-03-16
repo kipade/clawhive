@@ -599,8 +599,10 @@ impl<P: EmbeddingProvider + 'static> EmbeddingProvider for CachedEmbeddingProvid
         // Unwrap all results
         let embeddings: Vec<Vec<f32>> = results
             .into_iter()
-            .map(|r| r.expect("all embeddings should be filled"))
-            .collect();
+            .map(|r| {
+                r.ok_or_else(|| anyhow!("embedding provider returned fewer results than expected"))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(EmbeddingResult {
             embeddings,

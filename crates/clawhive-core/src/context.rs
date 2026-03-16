@@ -308,11 +308,13 @@ impl ContextManager {
 
     /// Return a new ContextManager with config adjusted for the given context window.
     /// Used to get per-model context limits in multi-agent scenarios.
+    /// Shares the compaction semaphore so concurrent requests for the same agent
+    /// cannot trigger parallel compactions.
     pub fn for_context_window(&self, context_window: usize) -> Self {
         Self {
             config: ContextConfig::for_model(context_window),
             router: self.router.clone(),
-            compaction_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            compaction_semaphore: self.compaction_semaphore.clone(),
         }
     }
 
@@ -510,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn test_context_manager_initializes_independent_compaction_semaphores() {
+    fn test_context_manager_shares_compaction_semaphore_across_windows() {
         let router = Arc::new(LlmRouter::new(
             ProviderRegistry::new(),
             HashMap::new(),
@@ -528,6 +530,6 @@ mod tests {
             .expect("manager semaphore should have one permit");
 
         assert_eq!(manager.compaction_semaphore.available_permits(), 0);
-        assert_eq!(adjusted.compaction_semaphore.available_permits(), 1);
+        assert_eq!(adjusted.compaction_semaphore.available_permits(), 0);
     }
 }
