@@ -25,6 +25,7 @@ use super::language_prefs::{
 use super::access_gate::{AccessGate, GrantAccessTool, ListAccessTool, RevokeAccessTool};
 use super::approval::ApprovalRegistry;
 use super::config::{ExecSecurityConfig, FullAgentConfig, SandboxPolicyConfig, SecurityMode};
+use super::context::ContextCheckResult;
 use super::file_tools::{EditFileTool, ReadFileTool, WriteFileTool};
 use super::image_tool::ImageTool;
 use super::memory_tools::{MemoryGetTool, MemorySearchTool};
@@ -1013,9 +1014,10 @@ impl Orchestrator {
         };
 
         let workspace = self.workspace_state_for(agent_id);
+        let history_limit = history_message_limit(agent);
         let history_messages = match workspace
             .session_reader
-            .load_recent_messages(&session_key.0, 10)
+            .load_recent_messages(&session_key.0, history_limit)
             .await
         {
             Ok(msgs) => msgs,
@@ -1298,9 +1300,10 @@ impl Orchestrator {
         };
 
         let workspace = self.workspace_state_for(agent_id);
+        let history_limit = history_message_limit(agent);
         let history_messages = match workspace
             .session_reader
-            .load_recent_messages(&session_key.0, 10)
+            .load_recent_messages(&session_key.0, history_limit)
             .await
         {
             Ok(msgs) => msgs,
@@ -1504,6 +1507,7 @@ impl Orchestrator {
         let max_iterations = 25;
         let mut web_search_reminder_injected = false;
         let mut web_search_called = false;
+        let mut memory_flush_triggered = false;
         let loop_started = std::time::Instant::now();
         let mut scheduled_task_retries: u32 = 0;
         let mut total_tool_calls: usize = 0;
@@ -1518,6 +1522,8 @@ impl Orchestrator {
                 tool_def_count = tool_defs.len(),
                 "tool_use_loop: iteration start"
             );
+
+            repair_tool_pairing(&mut messages);
 
             // Resolve per-model context manager so each agent uses its own context window
             let ctx_mgr = {
@@ -1535,6 +1541,27 @@ impl Orchestrator {
                     self.context_manager.clone()
                 }
             };
+
+            let check_result = ctx_mgr.check_context(&messages);
+            if let ContextCheckResult::NeedsMemoryFlush {
+                system_prompt: flush_system,
+                prompt: flush_prompt,
+            } = check_result
+            {
+                if !memory_flush_triggered {
+                    memory_flush_triggered = true;
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        iteration = iteration_no,
+                        "tool_use_loop: triggering memory flush before compaction"
+                    );
+                    messages.push(LlmMessage::user(format!(
+                        "[SYSTEM: {flush_system}]\n{flush_prompt}"
+                    )));
+                    continue;
+                }
+            }
+
             let (compacted_messages, compaction_result) =
                 ctx_mgr.ensure_within_limits(primary, messages).await?;
             messages = compacted_messages;
@@ -2070,9 +2097,10 @@ impl Orchestrator {
         agent: &FullAgentConfig,
     ) {
         let workspace = self.workspace_state_for(agent_id);
+        let history_limit = history_message_limit(agent).max(20);
         let messages = match workspace
             .session_reader
-            .load_recent_messages(&session_key.0, 20)
+            .load_recent_messages(&session_key.0, history_limit)
             .await
         {
             Ok(msgs) if !msgs.is_empty() => msgs,
@@ -2080,9 +2108,6 @@ impl Orchestrator {
         };
 
         let today = chrono::Utc::now().date_naive();
-        if let Ok(Some(_)) = self.file_store_for(agent_id).read_daily(today).await {
-            return;
-        }
 
         let conversation = messages
             .iter()
@@ -2132,23 +2157,28 @@ impl Orchestrator {
         _session_key: &SessionKey,
         query: &str,
     ) -> Result<String> {
+        let budget = view
+            .agent(agent_id)
+            .and_then(|agent| agent.memory_policy.as_ref())
+            .map(|policy| policy.max_injected_chars)
+            .unwrap_or(6000);
+
         let results = self
             .search_index_for(agent_id)
             .search(query, view.embedding_provider.as_ref(), 6, 0.25)
             .await;
 
         match results {
-            Ok(results) if !results.is_empty() => {
-                let mut context = String::from("## Relevant Memory\n\n");
-                for result in &results {
-                    context.push_str(&format!(
-                        "### {} (score: {:.2})\n{}\n\n",
-                        result.path, result.score, result.text
-                    ));
+            Ok(results) if !results.is_empty() => Ok(clamp_to_budget(&results, budget)),
+            _ => {
+                let fallback = self.file_store_for(agent_id).build_memory_context().await?;
+                if fallback.len() > budget {
+                    let truncated: String = fallback.chars().take(budget).collect();
+                    Ok(format!("{truncated}\n...[truncated]"))
+                } else {
+                    Ok(fallback)
                 }
-                Ok(context)
             }
-            _ => self.file_store_for(agent_id).build_memory_context().await,
         }
     }
 }
@@ -2407,6 +2437,15 @@ fn is_slow_latency_ms(duration_ms: u64, threshold_ms: u64) -> bool {
     duration_ms >= threshold_ms
 }
 
+fn history_message_limit(agent: &FullAgentConfig) -> usize {
+    agent
+        .memory_policy
+        .as_ref()
+        .and_then(|policy| policy.limit_history_turns)
+        .map(|turns| (turns as usize) * 2)
+        .unwrap_or(10)
+}
+
 fn is_explicit_web_search_request(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -2535,11 +2574,299 @@ fn collect_recent_messages(messages: &[LlmMessage], limit: usize) -> Vec<Convers
     collected
 }
 
+fn repair_tool_pairing(messages: &mut Vec<LlmMessage>) {
+    if messages.is_empty() {
+        return;
+    }
+
+    let assistant_idx = messages
+        .iter()
+        .rposition(|message| message.role == "assistant");
+    let Some(assistant_idx) = assistant_idx else {
+        return;
+    };
+
+    let assistant_message = &messages[assistant_idx];
+    let tool_use_ids: Vec<&str> = assistant_message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    if tool_use_ids.is_empty() {
+        return;
+    }
+
+    let Some(next_message) = messages.get(assistant_idx + 1) else {
+        tracing::warn!(
+            unpaired_tool_uses = ?tool_use_ids,
+            "repair_tool_pairing: removing dangling assistant tool_use message"
+        );
+        messages.truncate(assistant_idx);
+        return;
+    };
+
+    if next_message.role != "user" {
+        tracing::warn!(
+            unpaired_tool_uses = ?tool_use_ids,
+            next_role = %next_message.role,
+            "repair_tool_pairing: removing assistant tool_use message without user tool results"
+        );
+        messages.truncate(assistant_idx);
+        return;
+    }
+
+    let tool_result_ids: Vec<&str> = next_message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let all_paired = tool_use_ids
+        .iter()
+        .all(|tool_use_id| tool_result_ids.contains(tool_use_id));
+
+    if !all_paired {
+        tracing::warn!(
+            unpaired_tool_uses = ?tool_use_ids,
+            tool_result_ids = ?tool_result_ids,
+            "repair_tool_pairing: removing unpaired assistant+tool messages"
+        );
+        messages.truncate(assistant_idx);
+    }
+}
+
+fn clamp_to_budget(
+    results: &[clawhive_memory::search_index::SearchResult],
+    budget: usize,
+) -> String {
+    const HEADER: &str = "## Relevant Memory\n\n";
+    const TRUNCATED: &str = "\n...[truncated]";
+
+    if results.is_empty() || budget == 0 {
+        return String::new();
+    }
+
+    let header_chars = HEADER.chars().count();
+    if budget <= header_chars {
+        return HEADER.chars().take(budget).collect();
+    }
+
+    let mut context = String::from(HEADER);
+    let mut used_chars = header_chars;
+
+    for result in results {
+        let entry = format!(
+            "### {} (score: {:.2})\n{}\n\n",
+            result.path, result.score, result.text
+        );
+        let entry_chars = entry.chars().count();
+
+        if used_chars + entry_chars > budget {
+            if used_chars == header_chars {
+                let truncated_chars = TRUNCATED.chars().count();
+                let available_chars = budget.saturating_sub(used_chars + truncated_chars);
+                let truncated: String = entry.chars().take(available_chars).collect();
+                context.push_str(&truncated);
+                if used_chars + truncated.chars().count() + truncated_chars <= budget {
+                    context.push_str(TRUNCATED);
+                }
+            }
+            break;
+        }
+
+        context.push_str(&entry);
+        used_chars += entry_chars;
+    }
+
+    context
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{Duration, TimeZone, Utc};
+    use clawhive_memory::search_index::SearchResult;
     use clawhive_memory::SessionMessage;
+    use serde_json::json;
+
+    fn agent_with_memory_policy(
+        memory_policy: Option<crate::config::MemoryPolicyConfig>,
+    ) -> FullAgentConfig {
+        FullAgentConfig {
+            agent_id: "test-agent".to_string(),
+            enabled: true,
+            security: SecurityMode::default(),
+            workspace: None,
+            identity: None,
+            model_policy: crate::ModelPolicy {
+                primary: "openai/gpt-4.1".to_string(),
+                fallbacks: vec![],
+                thinking_level: None,
+                context_window: None,
+            },
+            tool_policy: None,
+            memory_policy,
+            sub_agent: None,
+            heartbeat: None,
+            exec_security: None,
+            sandbox: None,
+        }
+    }
+
+    fn assistant_with_tool_use(id: &str) -> LlmMessage {
+        LlmMessage {
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::ToolUse {
+                id: id.to_string(),
+                name: "read_file".to_string(),
+                input: json!({"filePath": "/tmp/demo"}),
+            }],
+        }
+    }
+
+    fn user_with_tool_result(id: &str) -> LlmMessage {
+        LlmMessage {
+            role: "user".to_string(),
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: "ok".to_string(),
+                is_error: false,
+            }],
+        }
+    }
+
+    fn message_roles(messages: &[LlmMessage]) -> Vec<&str> {
+        messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect()
+    }
+
+    fn make_result(path: &str, text: &str, score: f64) -> SearchResult {
+        SearchResult {
+            chunk_id: format!("{}:0-1:abc", path),
+            path: path.to_string(),
+            source: "test".to_string(),
+            start_line: 0,
+            end_line: 1,
+            text: text.to_string(),
+            score,
+        }
+    }
+
+    #[test]
+    fn test_clamp_to_budget_empty_results() {
+        assert_eq!(clamp_to_budget(&[], 100), "");
+    }
+
+    #[test]
+    fn test_clamp_to_budget_within_limit() {
+        let results = vec![
+            make_result("memory/a.md", "first chunk", 0.91),
+            make_result("memory/b.md", "second chunk", 0.83),
+        ];
+
+        let context = clamp_to_budget(&results, 1_000);
+
+        assert!(context.starts_with("## Relevant Memory\n\n"));
+        assert!(context.contains("### memory/a.md (score: 0.91)\nfirst chunk\n\n"));
+        assert!(context.contains("### memory/b.md (score: 0.83)\nsecond chunk\n\n"));
+    }
+
+    #[test]
+    fn test_clamp_to_budget_exceeds_limit() {
+        let results = vec![make_result(
+            "memory/a.md",
+            "abcdefghijklmnopqrstuvwxyz",
+            0.91,
+        )];
+
+        let context = clamp_to_budget(&results, 40);
+
+        assert!(context.starts_with("## Relevant Memory\n\n"));
+        assert!(context.contains("...[truncated]"));
+        assert!(!context.contains("abcdefghijklmnopqrstuvwxyz"));
+        assert!(!context.is_empty());
+    }
+
+    #[test]
+    fn test_clamp_to_budget_zero_budget() {
+        let results = vec![make_result("memory/a.md", "first chunk", 0.91)];
+
+        assert_eq!(clamp_to_budget(&results, 0), "");
+    }
+
+    #[test]
+    fn repair_tool_pairing_removes_unpaired_tool_use_messages() {
+        let mut messages = vec![
+            LlmMessage::user("question"),
+            assistant_with_tool_use("tool-1"),
+            LlmMessage::user("ordinary follow-up"),
+        ];
+
+        repair_tool_pairing(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+    }
+
+    #[test]
+    fn repair_tool_pairing_removes_dangling_last_assistant_tool_use() {
+        let mut messages = vec![
+            LlmMessage::user("question"),
+            assistant_with_tool_use("tool-1"),
+        ];
+
+        repair_tool_pairing(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+    }
+
+    #[test]
+    fn repair_tool_pairing_keeps_properly_paired_messages() {
+        let expected = vec![
+            LlmMessage::user("question"),
+            assistant_with_tool_use("tool-1"),
+            user_with_tool_result("tool-1"),
+        ];
+        let mut messages = expected.clone();
+
+        repair_tool_pairing(&mut messages);
+
+        assert_eq!(message_roles(&messages), message_roles(&expected));
+        assert_eq!(messages.len(), expected.len());
+    }
+
+    #[test]
+    fn repair_tool_pairing_handles_empty_messages() {
+        let mut messages = Vec::new();
+
+        repair_tool_pairing(&mut messages);
+
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn repair_tool_pairing_ignores_messages_without_tool_use() {
+        let expected = vec![
+            LlmMessage::user("question"),
+            LlmMessage::assistant("answer"),
+        ];
+        let mut messages = expected.clone();
+
+        repair_tool_pairing(&mut messages);
+
+        assert_eq!(message_roles(&messages), message_roles(&expected));
+        assert_eq!(messages.len(), expected.len());
+    }
 
     #[test]
     fn compute_merged_permissions_merges_all_when_no_forced() {
@@ -2581,6 +2908,25 @@ Body"#,
         let perms = merged.expect("compute_merged_permissions returns Some when skills have perms");
         assert!(perms.network.allow.contains(&"api.a.com:443".to_string()));
         assert!(perms.network.allow.contains(&"api.b.com:443".to_string()));
+    }
+
+    #[test]
+    fn history_message_limit_defaults_to_10() {
+        let agent = agent_with_memory_policy(None);
+
+        assert_eq!(history_message_limit(&agent), 10);
+    }
+
+    #[test]
+    fn history_message_limit_converts_turns() {
+        let agent = agent_with_memory_policy(Some(crate::config::MemoryPolicyConfig {
+            mode: "session".to_string(),
+            write_scope: "session".to_string(),
+            limit_history_turns: Some(7),
+            max_injected_chars: 6000,
+        }));
+
+        assert_eq!(history_message_limit(&agent), 14);
     }
 
     #[test]

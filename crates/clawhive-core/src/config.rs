@@ -312,6 +312,10 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_consolidation_interval_hours() -> u64 {
+    24
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MainConfig {
     pub app: AppConfig,
@@ -322,6 +326,8 @@ pub struct MainConfig {
     pub embedding: EmbeddingConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    #[serde(default = "default_consolidation_interval_hours")]
+    pub consolidation_interval_hours: u64,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,6 +360,7 @@ impl Default for MainConfig {
             },
             embedding: EmbeddingConfig::default(),
             tools: ToolsConfig::default(),
+            consolidation_interval_hours: default_consolidation_interval_hours(),
             log_level: default_log_level(),
             web_password_hash: None,
         }
@@ -625,6 +632,14 @@ impl Default for SandboxPolicyConfig {
 pub struct MemoryPolicyConfig {
     pub mode: String,
     pub write_scope: String,
+    #[serde(default)]
+    pub limit_history_turns: Option<u32>,
+    #[serde(default = "default_max_injected_chars")]
+    pub max_injected_chars: usize,
+}
+
+fn default_max_injected_chars() -> usize {
+    6000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1001,6 +1016,7 @@ mod tests {
         let (_tmp, root) = make_temp_config();
         let config = load_config(&root).unwrap();
         assert_eq!(config.main.app.name, "clawhive");
+        assert_eq!(config.main.consolidation_interval_hours, 24);
         assert_eq!(config.routing.default_agent_id, "main-agent");
         assert_eq!(config.providers.len(), 1);
         assert_eq!(config.agents.len(), 1);
@@ -1021,7 +1037,19 @@ features:
 channels: {}
 "#;
         let config: MainConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.consolidation_interval_hours, 24);
         assert_eq!(config.log_level, "info");
+    }
+
+    #[test]
+    fn memory_policy_config_defaults_max_injected_chars() {
+        let yaml = r#"
+mode: session
+write_scope: session
+"#;
+        let config: MemoryPolicyConfig = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(config.max_injected_chars, 6000);
     }
 
     #[test]
@@ -1195,6 +1223,7 @@ auth:
                 },
                 embedding: EmbeddingConfig::default(),
                 tools: ToolsConfig::default(),
+                consolidation_interval_hours: 24,
                 log_level: default_log_level(),
                 web_password_hash: None,
             },

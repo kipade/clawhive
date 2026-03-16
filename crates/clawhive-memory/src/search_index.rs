@@ -7,6 +7,7 @@ use tokio::task;
 
 use crate::chunker::{chunk_markdown, ChunkerConfig};
 use crate::embedding::EmbeddingProvider;
+use crate::session::{SessionEntry, SessionReader};
 
 #[derive(Clone)]
 pub struct SearchIndex {
@@ -70,17 +71,29 @@ impl SearchIndex {
         source: &str,
         provider: &dyn EmbeddingProvider,
     ) -> Result<usize> {
-        self.ensure_vec_table(provider.dimensions())?;
-
         let file_hash = {
             let mut hasher = Sha256::new();
             hasher.update(content.as_bytes());
             format!("{:x}", hasher.finalize())
         };
 
+        self.index_content(path, content, source, &file_hash, provider)
+            .await
+    }
+
+    async fn index_content(
+        &self,
+        path: &str,
+        content: &str,
+        source: &str,
+        change_hash: &str,
+        provider: &dyn EmbeddingProvider,
+    ) -> Result<usize> {
+        self.ensure_vec_table(provider.dimensions())?;
+
         let db = Arc::clone(&self.db);
         let path_owned = path.to_owned();
-        let file_hash_for_check = file_hash.clone();
+        let file_hash_for_check = change_hash.to_owned();
         let unchanged = task::spawn_blocking(move || {
             let conn = db
                 .lock()
@@ -105,7 +118,7 @@ impl SearchIndex {
             let db = Arc::clone(&self.db);
             let path_owned = path.to_owned();
             let source_owned = source.to_owned();
-            let file_hash_for_write = file_hash.clone();
+            let file_hash_for_write = change_hash.to_owned();
             let now_ts = chrono::Utc::now().timestamp();
             let size = content.len() as i64;
             let model_id = provider.model_id().to_owned();
@@ -161,12 +174,13 @@ impl SearchIndex {
             .map(|chunk| chunk.hash.clone())
             .collect::<Vec<String>>();
         let db = Arc::clone(&self.db);
+        let model_id_for_reuse = provider.model_id().to_owned();
         let reused = task::spawn_blocking(move || {
             let conn = db
                 .lock()
                 .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
             let mut stmt = conn.prepare(
-                "SELECT embedding, model FROM chunks WHERE hash = ?1 AND embedding <> '' LIMIT 1",
+                "SELECT embedding, model FROM chunks WHERE hash = ?1 AND model = ?2 AND embedding <> '' LIMIT 1",
             )?;
             let mut map = std::collections::HashMap::new();
             for hash in hash_list {
@@ -174,7 +188,7 @@ impl SearchIndex {
                     continue;
                 }
                 let row = stmt
-                    .query_row(params![hash.clone()], |r| {
+                    .query_row(params![hash.clone(), model_id_for_reuse.as_str()], |r| {
                         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                     })
                     .optional()?;
@@ -243,7 +257,7 @@ impl SearchIndex {
         let db = Arc::clone(&self.db);
         let path_owned = path.to_owned();
         let source_owned = source.to_owned();
-        let file_hash_for_write = file_hash.clone();
+        let file_hash_for_write = change_hash.to_owned();
         let model_id = provider.model_id().to_owned();
         task::spawn_blocking(move || {
             let conn = db
@@ -334,9 +348,117 @@ impl SearchIndex {
         Ok(text_chunks.len())
     }
 
+    pub async fn index_session(
+        &self,
+        session_id: &str,
+        reader: &SessionReader,
+        provider: &dyn EmbeddingProvider,
+    ) -> Result<usize> {
+        let entries = reader.load_all_entries(session_id).await?;
+        let mut last_timestamp = None;
+        let mut messages = Vec::new();
+
+        for entry in entries {
+            match entry {
+                SessionEntry::Session { timestamp, .. } => {
+                    last_timestamp = Some(timestamp);
+                }
+                SessionEntry::Message {
+                    timestamp, message, ..
+                } => {
+                    last_timestamp = Some(timestamp);
+                    if matches!(message.role.as_str(), "user" | "assistant") {
+                        messages.push(format!("{}: {}", message.role, message.content));
+                    }
+                }
+                SessionEntry::ToolCall { timestamp, .. }
+                | SessionEntry::ToolResult { timestamp, .. }
+                | SessionEntry::Compaction { timestamp, .. }
+                | SessionEntry::ModelChange { timestamp, .. } => {
+                    last_timestamp = Some(timestamp);
+                }
+            }
+        }
+
+        if messages.is_empty() {
+            return Ok(0);
+        }
+
+        let content = messages.join("\n");
+        let content_len = content.len();
+        let change_hash = format!(
+            "session:{}:{}:{}",
+            messages.len(),
+            content_len,
+            last_timestamp.map_or(0, |timestamp| timestamp.timestamp_millis())
+        );
+        let path = format!("sessions/{session_id}");
+
+        self.index_content(&path, &content, "session", &change_hash, provider)
+            .await
+    }
+
+    pub async fn index_sessions(
+        &self,
+        reader: &SessionReader,
+        provider: &dyn EmbeddingProvider,
+    ) -> Result<usize> {
+        let sessions = reader.list_sessions().await?;
+        let mut total = 0;
+
+        for session_id in &sessions {
+            match self.index_session(session_id, reader, provider).await {
+                Ok(count) => total += count,
+                Err(error) => {
+                    tracing::warn!(session_id = %session_id, %error, "failed to index session");
+                }
+            }
+        }
+
+        // Remove stale session entries that no longer have backing JSONL files.
+        // This handles /new (reset) and manual session deletions.
+        let active_paths: std::collections::HashSet<String> =
+            sessions.iter().map(|id| format!("sessions/{id}")).collect();
+
+        let db = Arc::clone(&self.db);
+        task::spawn_blocking(move || {
+            let conn = db
+                .lock()
+                .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
+
+            let mut stmt =
+                conn.prepare("SELECT path FROM files WHERE source = 'session'")?;
+            let indexed_paths: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for path in indexed_paths {
+                if !active_paths.contains(&path) {
+                    tracing::info!(path = %path, "removing stale session index");
+                    let tx = conn.unchecked_transaction()?;
+                    tx.execute("DELETE FROM chunks_fts WHERE path = ?1", params![&path])?;
+                    tx.execute(
+                        "DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?1)",
+                        params![&path],
+                    )?;
+                    tx.execute("DELETE FROM chunks WHERE path = ?1", params![&path])?;
+                    tx.execute("DELETE FROM files WHERE path = ?1", params![&path])?;
+                    tx.commit()?;
+                }
+            }
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+
+        Ok(total)
+    }
+
     pub async fn index_all(
         &self,
         file_store: &crate::file_store::MemoryFileStore,
+        reader: &SessionReader,
         provider: &dyn EmbeddingProvider,
     ) -> Result<usize> {
         let mut total = 0;
@@ -353,6 +475,8 @@ impl SearchIndex {
                 total += self.index_file(&path, &content, "daily", provider).await?;
             }
         }
+
+        total += self.index_sessions(reader, provider).await?;
 
         Ok(total)
     }
@@ -494,49 +618,54 @@ impl SearchIndex {
             }
         } // end if use_vectors
 
-        let db = Arc::clone(&self.db);
-        let query_owned = query.to_owned();
-        let mut bm25_candidates = match task::spawn_blocking(move || {
-            let conn = db
-                .lock()
-                .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
-            let mut stmt = conn.prepare(
-                r#"
-                SELECT id, path, source, start_line, end_line, text, bm25(chunks_fts) AS rank
-                FROM chunks_fts
-                WHERE chunks_fts MATCH ?1
-                ORDER BY rank
-                LIMIT ?2
-                "#,
-            )?;
-            let rows = stmt.query_map(params![query_owned, candidate_limit as i64], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, f64>(6)?,
-                ))
-            })?;
+        let safe_fts_query = build_safe_fts_query(query);
+        let mut bm25_candidates = if safe_fts_query.is_empty() {
+            Vec::new()
+        } else {
+            let db = Arc::clone(&self.db);
+            match task::spawn_blocking(move || {
+                let conn = db
+                    .lock()
+                    .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT id, path, source, start_line, end_line, text, bm25(chunks_fts) AS rank
+                    FROM chunks_fts
+                    WHERE chunks_fts MATCH ?1
+                    ORDER BY rank
+                    LIMIT ?2
+                    "#,
+                )?;
+                let rows =
+                    stmt.query_map(params![safe_fts_query, candidate_limit as i64], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, String>(5)?,
+                            r.get::<_, f64>(6)?,
+                        ))
+                    })?;
 
-            let mut out = Vec::new();
-            for row in rows {
-                let (chunk_id, path, source, start_line, end_line, text, rank) = row?;
-                let bm25_score = 1.0_f64 / (1.0_f64 + (-rank).max(0.0_f64));
-                out.push((
-                    chunk_id, path, source, start_line, end_line, text, bm25_score,
-                ));
-            }
-            Ok::<Vec<(String, String, String, i64, i64, String, f64)>, anyhow::Error>(out)
-        })
-        .await?
-        {
-            Ok(candidates) => candidates,
-            Err(e) => {
-                tracing::debug!("BM25 search failed (falling back to vector-only): {e}");
-                Vec::new()
+                let mut out = Vec::new();
+                for row in rows {
+                    let (chunk_id, path, source, start_line, end_line, text, rank) = row?;
+                    let bm25_score = 1.0_f64 / (1.0_f64 + (-rank).max(0.0_f64));
+                    out.push((
+                        chunk_id, path, source, start_line, end_line, text, bm25_score,
+                    ));
+                }
+                Ok::<Vec<(String, String, String, i64, i64, String, f64)>, anyhow::Error>(out)
+            })
+            .await?
+            {
+                Ok(candidates) => candidates,
+                Err(e) => {
+                    tracing::debug!("BM25 search failed (falling back to vector-only): {e}");
+                    Vec::new()
+                }
             }
         };
 
@@ -658,6 +787,25 @@ fn extract_date_from_path(path: &str) -> Option<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(re_pattern, "%Y-%m-%d").ok()
 }
 
+fn build_safe_fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter_map(|raw_token| {
+            let token = raw_token.trim_matches('"').replace(['"', '*', '^'], "");
+
+            if token.is_empty() {
+                return None;
+            }
+
+            match token.to_ascii_uppercase().as_str() {
+                "AND" | "OR" | "NOT" | "NEAR" => None,
+                _ => Some(format!("\"{token}\"")),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Jaccard similarity between two texts (tokenized by whitespace)
 fn jaccard_similarity(a: &str, b: &str) -> f64 {
     let tokens_a: std::collections::HashSet<&str> = a.split_whitespace().collect();
@@ -755,12 +903,54 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use anyhow::Result;
+    use async_trait::async_trait;
     use rusqlite::Connection;
     use tempfile::TempDir;
 
-    use crate::embedding::StubEmbeddingProvider;
+    use crate::embedding::{EmbeddingProvider, EmbeddingResult, StubEmbeddingProvider};
     use crate::file_store::MemoryFileStore;
     use crate::migrations::run_migrations;
+    use crate::session::{SessionEntry, SessionReader, SessionWriter};
+
+    #[derive(Clone)]
+    struct NamedStubEmbeddingProvider {
+        dims: usize,
+        model: String,
+        value: f32,
+    }
+
+    impl NamedStubEmbeddingProvider {
+        fn new(dims: usize, model: &str, value: f32) -> Self {
+            Self {
+                dims,
+                model: model.to_string(),
+                value,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for NamedStubEmbeddingProvider {
+        async fn embed(&self, texts: &[String]) -> Result<EmbeddingResult> {
+            Ok(EmbeddingResult {
+                embeddings: texts.iter().map(|_| vec![self.value; self.dims]).collect(),
+                model: self.model.clone(),
+                dimensions: self.dims,
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+    }
 
     fn init_sqlite_vec() {
         use rusqlite::ffi::{sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
@@ -905,6 +1095,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reuse_ignores_different_model_embeddings() -> Result<()> {
+        let db = test_db()?;
+        let index = SearchIndex::new(Arc::clone(&db));
+        let first_provider = NamedStubEmbeddingProvider::new(8, "stub-a", 1.0);
+        let second_provider = NamedStubEmbeddingProvider::new(8, "stub-b", 2.0);
+        let content = "# Shared\n\nchunk text reused across models";
+
+        index
+            .index_file("MEMORY.md", content, "long_term", &first_provider)
+            .await?;
+
+        {
+            let conn = db.lock().expect("lock");
+            let original_models: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM chunks WHERE path = 'MEMORY.md' AND model = 'stub-a'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert!(original_models > 0);
+            conn.execute(
+                "UPDATE files SET hash = 'force-reindex' WHERE path = 'MEMORY.md'",
+                [],
+            )?;
+        }
+
+        index
+            .index_file("MEMORY.md", content, "long_term", &second_provider)
+            .await?;
+
+        let conn = db.lock().expect("lock");
+        let reused_old_model: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE path = 'MEMORY.md' AND model = 'stub-a'",
+            [],
+            |r| r.get(0),
+        )?;
+        let new_model_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE path = 'MEMORY.md' AND model = 'stub-b'",
+            [],
+            |r| r.get(0),
+        )?;
+        let embedding: String = conn.query_row(
+            "SELECT embedding FROM chunks WHERE path = 'MEMORY.md' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )?;
+
+        assert_eq!(reused_old_model, 0);
+        assert!(new_model_count > 0);
+        assert_eq!(embedding, embedding_to_json(&[2.0; 8]));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn search_bm25_only() -> Result<()> {
         let db = test_db()?;
         let index = SearchIndex::new(db);
@@ -1030,6 +1273,45 @@ mod tests {
     }
 
     #[test]
+    fn test_build_safe_fts_query_strips_operators() {
+        assert_eq!(
+            build_safe_fts_query("hello OR world AND NOT bad"),
+            r#""hello" "world" "bad""#
+        );
+    }
+
+    #[test]
+    fn test_build_safe_fts_query_escapes_quotes() {
+        assert_eq!(build_safe_fts_query(r#""test*""#), r#""test""#);
+    }
+
+    #[test]
+    fn test_build_safe_fts_query_empty_input() {
+        assert_eq!(build_safe_fts_query(""), "");
+        assert_eq!(build_safe_fts_query("OR AND NOT"), "");
+    }
+
+    #[tokio::test]
+    async fn test_search_with_fts_special_chars() -> Result<()> {
+        let db = test_db()?;
+        let index = SearchIndex::new(db);
+        let provider = StubEmbeddingProvider::new(8);
+
+        index
+            .index_file(
+                "MEMORY.md",
+                "# Title\n\nhello world",
+                "long_term",
+                &provider,
+            )
+            .await?;
+
+        let results = index.search("hello OR world*", &provider, 6, 0.0).await?;
+        assert!(!results.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn cosine_similarity_identical() {
         let a = vec![1.0_f32, 2.0, 3.0];
         let score = cosine_similarity(&a, &a);
@@ -1078,6 +1360,8 @@ mod tests {
     async fn index_all_indexes_files() -> Result<()> {
         let dir = TempDir::new()?;
         let file_store = MemoryFileStore::new(dir.path());
+        let session_writer = SessionWriter::new(dir.path());
+        let session_reader = SessionReader::new(dir.path());
         file_store
             .write_long_term("# Long\n\nlong term facts")
             .await?;
@@ -1087,17 +1371,216 @@ mod tests {
                 "# Daily\n\ndaily notes",
             )
             .await?;
+        session_writer.start_session("s1", "main").await?;
+        session_writer
+            .append_message("s1", "user", "session note")
+            .await?;
 
         let db = test_db()?;
         let index = SearchIndex::new(Arc::clone(&db));
         let provider = StubEmbeddingProvider::new(8);
 
-        let total = index.index_all(&file_store, &provider).await?;
+        let total = index
+            .index_all(&file_store, &session_reader, &provider)
+            .await?;
         assert!(total > 0);
 
         let conn = db.lock().expect("lock");
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
         assert!(count > 0);
+        let session_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE source = 'session' AND path = 'sessions/s1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(session_count > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_index_session_creates_chunks() -> Result<()> {
+        let dir = TempDir::new()?;
+        let writer = SessionWriter::new(dir.path());
+        let reader = SessionReader::new(dir.path());
+        writer.start_session("s1", "main").await?;
+        writer.append_message("s1", "user", "hello").await?;
+        writer.append_message("s1", "assistant", "hi").await?;
+        writer
+            .append(
+                "s1",
+                SessionEntry::ToolCall {
+                    id: "tool-1".to_owned(),
+                    timestamp: chrono::Utc::now(),
+                    tool: "bash".to_owned(),
+                    input: serde_json::json!({"command": "pwd"}),
+                },
+            )
+            .await?;
+
+        let db = test_db()?;
+        let index = SearchIndex::new(Arc::clone(&db));
+        let provider = StubEmbeddingProvider::new(8);
+
+        let count = index.index_session("s1", &reader, &provider).await?;
+
+        assert!(count > 0);
+        let conn = db.lock().expect("lock");
+        let row: (String, String, String) = conn.query_row(
+            "SELECT path, source, text FROM chunks WHERE path = 'sessions/s1' LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        assert_eq!(row.0, "sessions/s1");
+        assert_eq!(row.1, "session");
+        assert!(row.2.contains("user: hello"));
+        assert!(row.2.contains("assistant: hi"));
+        assert!(!row.2.contains("pwd"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_index_session_skips_tool_entries() -> Result<()> {
+        let dir = TempDir::new()?;
+        let writer = SessionWriter::new(dir.path());
+        let reader = SessionReader::new(dir.path());
+        writer.start_session("s1", "main").await?;
+        writer
+            .append(
+                "s1",
+                SessionEntry::ToolCall {
+                    id: "tool-call".to_owned(),
+                    timestamp: chrono::Utc::now(),
+                    tool: "read".to_owned(),
+                    input: serde_json::json!({"file": "/tmp/secret.txt"}),
+                },
+            )
+            .await?;
+        writer
+            .append(
+                "s1",
+                SessionEntry::ToolResult {
+                    id: "tool-result".to_owned(),
+                    timestamp: chrono::Utc::now(),
+                    tool: "read".to_owned(),
+                    output: serde_json::json!({"content": "secret"}),
+                },
+            )
+            .await?;
+        writer
+            .append(
+                "s1",
+                SessionEntry::Compaction {
+                    id: "compact-1".to_owned(),
+                    timestamp: chrono::Utc::now(),
+                    summary: "summary".to_owned(),
+                    dropped_before: "m1".to_owned(),
+                },
+            )
+            .await?;
+        writer
+            .append(
+                "s1",
+                SessionEntry::ModelChange {
+                    id: "model-1".to_owned(),
+                    timestamp: chrono::Utc::now(),
+                    model: "gpt-5".to_owned(),
+                },
+            )
+            .await?;
+        writer.append_message("s1", "user", "keep this").await?;
+
+        let db = test_db()?;
+        let index = SearchIndex::new(Arc::clone(&db));
+        let provider = StubEmbeddingProvider::new(8);
+
+        index.index_session("s1", &reader, &provider).await?;
+
+        let conn = db.lock().expect("lock");
+        let text: String = conn.query_row(
+            "SELECT GROUP_CONCAT(text, ' ') FROM chunks WHERE path = 'sessions/s1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(text.contains("user: keep this"));
+        assert!(!text.contains("/tmp/secret.txt"));
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("summary"));
+        assert!(!text.contains("gpt-5"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_index_sessions_multiple() -> Result<()> {
+        let dir = TempDir::new()?;
+        let writer = SessionWriter::new(dir.path());
+        let reader = SessionReader::new(dir.path());
+        writer.start_session("s1", "main").await?;
+        writer.append_message("s1", "user", "alpha").await?;
+        writer.start_session("s2", "main").await?;
+        writer.append_message("s2", "assistant", "beta").await?;
+
+        let db = test_db()?;
+        let index = SearchIndex::new(Arc::clone(&db));
+        let provider = StubEmbeddingProvider::new(8);
+
+        let total = index.index_sessions(&reader, &provider).await?;
+
+        assert!(total > 0);
+        let conn = db.lock().expect("lock");
+        let indexed_paths: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT path) FROM chunks WHERE source = 'session'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(indexed_paths, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_index_sessions_removes_stale_entries() -> Result<()> {
+        let dir = TempDir::new()?;
+        let writer = SessionWriter::new(dir.path());
+        let reader = SessionReader::new(dir.path());
+        writer.start_session("s1", "main").await?;
+        writer.append_message("s1", "user", "alpha").await?;
+        writer.start_session("s2", "main").await?;
+        writer.append_message("s2", "user", "beta").await?;
+
+        let db = test_db()?;
+        let index = SearchIndex::new(Arc::clone(&db));
+        let provider = StubEmbeddingProvider::new(8);
+
+        index.index_sessions(&reader, &provider).await?;
+        {
+            let conn = db.lock().expect("lock");
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT path) FROM chunks WHERE source = 'session'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(count, 2);
+        }
+
+        let s2_path = dir.path().join("sessions").join("s2.jsonl");
+        std::fs::remove_file(&s2_path).expect("remove s2 file");
+
+        index.index_sessions(&reader, &provider).await?;
+        {
+            let conn = db.lock().expect("lock");
+            let remaining: i64 = conn.query_row(
+                "SELECT COUNT(DISTINCT path) FROM chunks WHERE source = 'session'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(remaining, 1);
+
+            let stale_files: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE path = 'sessions/s2'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(stale_files, 0);
+        }
         Ok(())
     }
 
