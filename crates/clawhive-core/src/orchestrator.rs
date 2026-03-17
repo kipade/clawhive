@@ -1039,27 +1039,13 @@ impl Orchestrator {
         let mut messages = build_messages_from_history(&history_messages);
         {
             let preprocessed = self.runtime.preprocess_input(&inbound.text).await?;
-            let image_blocks: Vec<ContentBlock> = inbound
-                .attachments
-                .iter()
-                .filter(|a| a.kind == clawhive_schema::AttachmentKind::Image)
-                .map(|a| {
-                    let media_type = a
-                        .mime_type
-                        .clone()
-                        .unwrap_or_else(|| "image/jpeg".to_string());
-                    ContentBlock::Image {
-                        data: a.url.clone(),
-                        media_type,
-                    }
-                })
-                .collect();
+            let attachment_blocks = build_attachment_blocks(&inbound.attachments);
 
-            if image_blocks.is_empty() {
+            if attachment_blocks.is_empty() {
                 messages.push(LlmMessage::user(preprocessed));
             } else {
                 let mut content = vec![ContentBlock::Text { text: preprocessed }];
-                content.extend(image_blocks);
+                content.extend(attachment_blocks);
                 messages.push(LlmMessage {
                     role: "user".into(),
                     content,
@@ -1363,31 +1349,16 @@ impl Orchestrator {
             .resolve_target_language(&inbound, &history_messages);
         apply_language_policy_prompt(&mut system_prompt, target_language);
 
-        // Build messages from history (no fake memory dialogue, stream variant)
         let mut messages = build_messages_from_history(&history_messages);
         {
             let preprocessed = self.runtime.preprocess_input(&inbound.text).await?;
-            let image_blocks: Vec<ContentBlock> = inbound
-                .attachments
-                .iter()
-                .filter(|a| a.kind == clawhive_schema::AttachmentKind::Image)
-                .map(|a| {
-                    let media_type = a
-                        .mime_type
-                        .clone()
-                        .unwrap_or_else(|| "image/jpeg".to_string());
-                    ContentBlock::Image {
-                        data: a.url.clone(),
-                        media_type,
-                    }
-                })
-                .collect();
+            let attachment_blocks = build_attachment_blocks(&inbound.attachments);
 
-            if image_blocks.is_empty() {
+            if attachment_blocks.is_empty() {
                 messages.push(LlmMessage::user(preprocessed));
             } else {
                 let mut content = vec![ContentBlock::Text { text: preprocessed }];
-                content.extend(image_blocks);
+                content.extend(attachment_blocks);
                 messages.push(LlmMessage {
                     role: "user".into(),
                     content,
@@ -2521,6 +2492,53 @@ pub fn build_tool_registry(
         }
     }
     registry
+}
+
+fn is_text_mime(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || mime == "application/json"
+        || mime == "application/xml"
+        || mime == "application/javascript"
+        || mime == "application/x-yaml"
+        || mime == "application/yaml"
+        || mime == "application/toml"
+        || mime == "application/x-sh"
+}
+
+fn build_attachment_blocks(attachments: &[clawhive_schema::Attachment]) -> Vec<ContentBlock> {
+    use base64::Engine;
+
+    let mut blocks = Vec::new();
+    for a in attachments {
+        match a.kind {
+            clawhive_schema::AttachmentKind::Image => {
+                let media_type = a
+                    .mime_type
+                    .clone()
+                    .unwrap_or_else(|| "image/jpeg".to_string());
+                blocks.push(ContentBlock::Image {
+                    data: a.url.clone(),
+                    media_type,
+                });
+            }
+            _ => {
+                let mime = a.mime_type.as_deref().unwrap_or("application/octet-stream");
+                if is_text_mime(mime) {
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&a.url) {
+                        if let Ok(text) = String::from_utf8(bytes) {
+                            let label = a.file_name.as_deref().unwrap_or("attachment");
+                            blocks.push(ContentBlock::Text {
+                                text: format!(
+                                    "<attachment name=\"{label}\" type=\"{mime}\">\n{text}\n</attachment>"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    blocks
 }
 
 fn build_messages_from_history(history_messages: &[SessionMessage]) -> Vec<LlmMessage> {
