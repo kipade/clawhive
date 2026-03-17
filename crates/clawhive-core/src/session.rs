@@ -12,6 +12,7 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
     pub ttl_seconds: i64,
+    pub interaction_count: u64,
 }
 
 impl Session {
@@ -22,6 +23,10 @@ impl Session {
 
     pub fn touch(&mut self) {
         self.last_active = Utc::now();
+    }
+
+    pub fn increment_interaction(&mut self) {
+        self.interaction_count += 1;
     }
 }
 
@@ -34,6 +39,7 @@ pub struct SessionResult {
     pub expired_previous: bool,
 }
 
+#[derive(Clone)]
 pub struct SessionManager {
     store: Arc<MemoryStore>,
     default_ttl: i64,
@@ -52,11 +58,12 @@ impl SessionManager {
                 created_at: record.created_at,
                 last_active: record.last_active,
                 ttl_seconds: record.ttl_seconds,
+                interaction_count: record.interaction_count,
             };
 
             if session.is_expired() {
                 let new_session = self.create_new(key, agent_id);
-                self.persist(&new_session).await?;
+                self.persist_session(&new_session).await?;
                 return Ok(SessionResult {
                     session: new_session,
                     expired_previous: true,
@@ -64,14 +71,14 @@ impl SessionManager {
             }
 
             session.touch();
-            self.persist(&session).await?;
+            self.persist_session(&session).await?;
             Ok(SessionResult {
                 session,
                 expired_previous: false,
             })
         } else {
             let session = self.create_new(key, agent_id);
-            self.persist(&session).await?;
+            self.persist_session(&session).await?;
             Ok(SessionResult {
                 session,
                 expired_previous: false,
@@ -91,16 +98,18 @@ impl SessionManager {
             created_at: now,
             last_active: now,
             ttl_seconds: self.default_ttl,
+            interaction_count: 0,
         }
     }
 
-    async fn persist(&self, session: &Session) -> Result<()> {
+    pub async fn persist_session(&self, session: &Session) -> Result<()> {
         let record = clawhive_memory::SessionRecord {
             session_key: session.session_key.0.clone(),
             agent_id: session.agent_id.clone(),
             created_at: session.created_at,
             last_active: session.last_active,
             ttl_seconds: session.ttl_seconds,
+            interaction_count: session.interaction_count,
         };
         self.store.upsert_session(record).await
     }
@@ -124,6 +133,7 @@ mod tests {
             .unwrap();
         assert_eq!(result.session.agent_id, "clawhive-main");
         assert_eq!(result.session.ttl_seconds, 1800);
+        assert_eq!(result.session.interaction_count, 0);
         assert!(!result.expired_previous);
     }
 
@@ -189,9 +199,26 @@ mod tests {
             created_at: Utc::now(),
             last_active: Utc::now() - chrono::TimeDelta::try_seconds(100).unwrap(),
             ttl_seconds: 50,
+            interaction_count: 0,
         };
         assert!(session.is_expired());
         session.touch();
         assert!(!session.is_expired());
+    }
+
+    #[test]
+    fn increment_interaction_increases_count() {
+        let mut session = Session {
+            session_key: test_key(),
+            agent_id: "test".to_string(),
+            created_at: Utc::now(),
+            last_active: Utc::now(),
+            ttl_seconds: 50,
+            interaction_count: 0,
+        };
+
+        session.increment_interaction();
+
+        assert_eq!(session.interaction_count, 1);
     }
 }

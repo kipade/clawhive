@@ -100,7 +100,7 @@ pub struct MemoryPatch {
 
 pub struct HippocampusConsolidator {
     agent_id: String,
-    file_store: MemoryFileStore,
+    pub(crate) file_store: MemoryFileStore,
     router: Arc<LlmRouter>,
     model_primary: String,
     model_fallbacks: Vec<String>,
@@ -172,6 +172,10 @@ impl HippocampusConsolidator {
     pub fn with_session_reader_for_reindex(mut self, reader: SessionReader) -> Self {
         self.reindex_session_reader = Some(reader);
         self
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
     }
 
     pub async fn consolidate(&self) -> Result<ConsolidationReport> {
@@ -308,7 +312,15 @@ impl HippocampusConsolidator {
             });
         }
 
-        self.file_store.write_long_term(&updated_memory).await?;
+        let deduped_memory = dedup_paragraphs(&updated_memory);
+        if deduped_memory.len() < updated_memory.len() {
+            tracing::info!(
+                original_len = updated_memory.len(),
+                deduped_len = deduped_memory.len(),
+                "Dedup reduced MEMORY.md content"
+            );
+        }
+        self.file_store.write_long_term(&deduped_memory).await?;
 
         let reindexed = if let (Some(index), Some(provider), Some(fs), Some(reader)) = (
             &self.search_index,
@@ -792,15 +804,21 @@ fn validate_consolidation_output(output: &str, existing: &str) -> Result<()> {
 }
 
 pub struct ConsolidationScheduler {
-    consolidator: Arc<HippocampusConsolidator>,
+    consolidators: Vec<Arc<HippocampusConsolidator>>,
     interval_hours: u64,
+    archive_retention_days: u64,
 }
 
 impl ConsolidationScheduler {
-    pub fn new(consolidator: Arc<HippocampusConsolidator>, interval_hours: u64) -> Self {
+    pub fn new(
+        consolidators: Vec<Arc<HippocampusConsolidator>>,
+        interval_hours: u64,
+        archive_retention_days: u64,
+    ) -> Self {
         Self {
-            consolidator,
+            consolidators,
             interval_hours,
+            archive_retention_days,
         }
     }
 
@@ -811,27 +829,141 @@ impl ConsolidationScheduler {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                tracing::info!("Running scheduled hippocampus consolidation...");
-                match self.consolidator.consolidate().await {
-                    Ok(report) => {
-                        tracing::info!(
-                            "Consolidation complete: daily_files_read={}, memory_updated={}, summary={}",
-                            report.daily_files_read,
-                            report.memory_updated,
-                            report.summary
-                        );
+                tracing::info!(
+                    agent_count = self.consolidators.len(),
+                    "Running scheduled hippocampus consolidation for all agents..."
+                );
+                for consolidator in &self.consolidators {
+                    let agent_id = consolidator.agent_id();
+                    match consolidator.consolidate().await {
+                        Ok(report) => {
+                            tracing::info!(
+                                agent_id = %agent_id,
+                                daily_files_read = report.daily_files_read,
+                                memory_updated = report.memory_updated,
+                                "Consolidation complete for agent"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::error!(agent_id = %agent_id, "Consolidation failed: {err}");
+                        }
                     }
-                    Err(err) => {
-                        tracing::error!("Consolidation failed: {err}");
+                }
+                for consolidator in &self.consolidators {
+                    let ws = consolidator.file_store.workspace_dir();
+                    let writer = clawhive_memory::session::SessionWriter::new(ws);
+                    if let Err(e) = writer.cleanup_archived(self.archive_retention_days).await {
+                        tracing::warn!(
+                            agent_id = %consolidator.agent_id(),
+                            "Archived session cleanup failed: {e}"
+                        );
                     }
                 }
             }
         })
     }
 
-    pub async fn run_once(&self) -> Result<ConsolidationReport> {
-        self.consolidator.consolidate().await
+    pub async fn run_once(&self) -> Vec<(String, Result<ConsolidationReport>)> {
+        let mut results = Vec::new();
+        for consolidator in &self.consolidators {
+            let agent_id = consolidator.agent_id().to_string();
+            let result = consolidator.consolidate().await;
+            results.push((agent_id, result));
+        }
+        results
     }
+}
+
+fn dedup_paragraphs(content: &str) -> String {
+    let paragraphs: Vec<&str> = content.split("\n\n").collect();
+    if paragraphs.len() <= 1 {
+        return content.to_string();
+    }
+
+    let mut keep = vec![true; paragraphs.len()];
+
+    for i in 0..paragraphs.len() {
+        if !keep[i] {
+            continue;
+        }
+        if paragraphs[i].trim().starts_with('#') {
+            continue;
+        }
+        let words_i = normalized_word_set(paragraphs[i]);
+        if words_i.is_empty() {
+            continue;
+        }
+
+        for j in (i + 1)..paragraphs.len() {
+            if !keep[j] {
+                continue;
+            }
+            if paragraphs[j].trim().starts_with('#') {
+                continue;
+            }
+            let words_j = normalized_word_set(paragraphs[j]);
+            if words_j.is_empty() {
+                continue;
+            }
+
+            let similarity = jaccard_similarity(&words_i, &words_j);
+            if similarity > 0.9 {
+                if paragraphs[j].len() > paragraphs[i].len() {
+                    keep[i] = false;
+                    tracing::warn!(
+                        kept = j,
+                        removed = i,
+                        similarity = format!("{:.2}", similarity),
+                        "Dedup: removed near-duplicate paragraph"
+                    );
+                    break;
+                } else {
+                    keep[j] = false;
+                    tracing::warn!(
+                        kept = i,
+                        removed = j,
+                        similarity = format!("{:.2}", similarity),
+                        "Dedup: removed near-duplicate paragraph"
+                    );
+                }
+            }
+        }
+    }
+
+    paragraphs
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| keep[*idx])
+        .map(|(_, paragraph)| *paragraph)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn normalized_word_set(text: &str) -> std::collections::HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() > 1)
+        .filter(|word| {
+            !matches!(
+                *word,
+                "an" | "and" | "all" | "for" | "in" | "of" | "on" | "the" | "their" | "to"
+            )
+        })
+        .map(|word| word.to_string())
+        .collect()
+}
+
+fn jaccard_similarity(
+    a: &std::collections::HashSet<String>,
+    b: &std::collections::HashSet<String>,
+) -> f64 {
+    let intersection = a.intersection(b).count();
+    let union = a.union(b).count();
+    if union == 0 {
+        return 0.0;
+    }
+
+    intersection as f64 / union as f64
 }
 
 #[cfg(test)]
@@ -851,9 +983,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        apply_patch, parse_patch, validate_consolidation_output, AddInstruction,
-        ConsolidationReport, ConsolidationScheduler, HippocampusConsolidator, MemoryPatch,
-        UpdateInstruction,
+        apply_patch, dedup_paragraphs, jaccard_similarity, parse_patch,
+        validate_consolidation_output, AddInstruction, ConsolidationReport, ConsolidationScheduler,
+        HippocampusConsolidator, MemoryPatch, UpdateInstruction,
     };
     use crate::router::LlmRouter;
 
@@ -933,6 +1065,71 @@ mod tests {
         let output = "# First Memory\n\nThis is the first consolidation output and it should be accepted even if there is no prior memory content.";
         let result = validate_consolidation_output(output, "");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn dedup_paragraphs_removes_near_duplicates() {
+        let input = "## Preferences\n\nUser prefers dark mode and minimal UI design for all applications.\n\nThe user prefers dark mode and minimal UI design for all of their applications.\n\n## Work\n\nUser works on Rust projects.";
+        let result = dedup_paragraphs(input);
+
+        assert!(result.contains("## Preferences"));
+        assert!(result.contains("## Work"));
+        assert!(result.contains("Rust projects"));
+
+        let dark_mode_count = result.matches("dark mode").count();
+        assert_eq!(
+            dark_mode_count, 1,
+            "Should have removed one near-duplicate paragraph"
+        );
+    }
+
+    #[test]
+    fn dedup_paragraphs_preserves_headers() {
+        let input = "## Section A\n\nContent A about specific topic.\n\n## Section A\n\nContent B about different topic.";
+        let result = dedup_paragraphs(input);
+
+        assert_eq!(result.matches("## Section A").count(), 2);
+    }
+
+    #[test]
+    fn dedup_paragraphs_no_change_when_unique() {
+        let input = "First paragraph about Rust programming language.\n\nSecond paragraph about Python scripting.\n\nThird paragraph about Go concurrency.";
+        let result = dedup_paragraphs(input);
+
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn dedup_paragraphs_single_paragraph() {
+        let result = dedup_paragraphs("Just one paragraph here.");
+
+        assert_eq!(result, "Just one paragraph here.");
+    }
+
+    #[test]
+    fn dedup_paragraphs_empty_input() {
+        let result = dedup_paragraphs("");
+
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn jaccard_similarity_identical_sets() {
+        let a: std::collections::HashSet<String> =
+            ["hello", "world"].iter().map(|s| s.to_string()).collect();
+        let b = a.clone();
+
+        assert!((jaccard_similarity(&a, &b) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn jaccard_similarity_disjoint_sets() {
+        let a: std::collections::HashSet<String> =
+            ["hello", "world"].iter().map(|s| s.to_string()).collect();
+        let b: std::collections::HashSet<String> =
+            ["foo", "bar"].iter().map(|s| s.to_string()).collect();
+
+        assert!(jaccard_similarity(&a, &b).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1147,7 +1344,7 @@ Working on Clawhive memory safety.
             vec![],
         ));
 
-        let scheduler = ConsolidationScheduler::new(Arc::clone(&consolidator), 24);
+        let scheduler = ConsolidationScheduler::new(vec![Arc::clone(&consolidator)], 24, 30);
         assert_eq!(scheduler.interval_hours, 24);
         Ok(())
     }

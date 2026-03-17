@@ -316,6 +316,10 @@ fn default_consolidation_interval_hours() -> u64 {
     24
 }
 
+fn default_archive_retention_days() -> u64 {
+    30
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MainConfig {
     pub app: AppConfig,
@@ -328,6 +332,8 @@ pub struct MainConfig {
     pub tools: ToolsConfig,
     #[serde(default = "default_consolidation_interval_hours")]
     pub consolidation_interval_hours: u64,
+    #[serde(default = "default_archive_retention_days")]
+    pub archive_retention_days: u64,
     #[serde(default = "default_log_level")]
     pub log_level: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -361,6 +367,7 @@ impl Default for MainConfig {
             embedding: EmbeddingConfig::default(),
             tools: ToolsConfig::default(),
             consolidation_interval_hours: default_consolidation_interval_hours(),
+            archive_retention_days: default_archive_retention_days(),
             log_level: default_log_level(),
             web_password_hash: None,
         }
@@ -636,10 +643,16 @@ pub struct MemoryPolicyConfig {
     pub limit_history_turns: Option<u32>,
     #[serde(default = "default_max_injected_chars")]
     pub max_injected_chars: usize,
+    #[serde(default = "default_daily_summary_interval")]
+    pub daily_summary_interval: u64,
 }
 
 fn default_max_injected_chars() -> usize {
     6000
+}
+
+fn default_daily_summary_interval() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1050,6 +1063,7 @@ write_scope: session
         let config: MemoryPolicyConfig = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(config.max_injected_chars, 6000);
+        assert_eq!(config.daily_summary_interval, 10);
     }
 
     #[test]
@@ -1224,6 +1238,7 @@ auth:
                 embedding: EmbeddingConfig::default(),
                 tools: ToolsConfig::default(),
                 consolidation_interval_hours: 24,
+                archive_retention_days: 30,
                 log_level: default_log_level(),
                 web_password_hash: None,
             },
