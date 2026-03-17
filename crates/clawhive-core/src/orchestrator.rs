@@ -1794,29 +1794,42 @@ impl Orchestrator {
                     continue;
                 }
 
-                if is_scheduled_task
-                    && tool_uses.is_empty()
-                    && resp.stop_reason.as_deref() == Some("length")
-                    && scheduled_task_retries < 2
                 {
-                    scheduled_task_retries += 1;
-                    tracing::warn!(
-                        agent_id = %agent_id,
-                        iteration = iteration_no,
-                        retry_count = scheduled_task_retries,
-                        response_len = resp.text.len(),
-                        "tool_use_loop: scheduled task output truncated (stop_reason=length), continuing"
-                    );
-                    messages.push(LlmMessage {
-                        role: "assistant".into(),
-                        content: resp.content.clone(),
-                    });
-                    messages.push(LlmMessage::user(
-                        "[SYSTEM] Your output was truncated due to length limits. \
-                         Do NOT repeat what you already wrote. Continue from where you left off \
-                         and use tools (write_file, execute_command) to complete the remaining steps.",
-                    ));
-                    continue;
+                    let max_truncation_retries: u32 = if is_scheduled_task { 2 } else { 1 };
+                    if tool_uses.is_empty()
+                        && resp.stop_reason.as_deref() == Some("length")
+                        && scheduled_task_retries < max_truncation_retries
+                    {
+                        scheduled_task_retries += 1;
+                        let task_type = if is_scheduled_task {
+                            "scheduled_task"
+                        } else {
+                            "conversation"
+                        };
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            iteration = iteration_no,
+                            retry_count = scheduled_task_retries,
+                            response_len = resp.text.len(),
+                            task_type,
+                            "tool_use_loop: output truncated (stop_reason=length), continuing"
+                        );
+                        messages.push(LlmMessage {
+                            role: "assistant".into(),
+                            content: resp.content.clone(),
+                        });
+                        let nudge = if is_scheduled_task {
+                            "[SYSTEM] Your output was truncated due to length limits. \
+                             Do NOT repeat what you already wrote. Continue from where you left off \
+                             and use tools (write_file, execute_command) to complete the remaining steps."
+                        } else {
+                            "[SYSTEM] Your response was cut short due to length limits. \
+                             Continue from where you left off and provide the remaining content. \
+                             Do NOT repeat what you already wrote."
+                        };
+                        messages.push(LlmMessage::user(nudge));
+                        continue;
+                    }
                 }
 
                 if tool_uses.is_empty()
@@ -1855,6 +1868,54 @@ impl Orchestrator {
                     };
                     messages.push(LlmMessage::user(nudge));
                     continue;
+                }
+
+                {
+                    let verdict = detect_empty_promise_structural(
+                        scheduled_task_retries,
+                        tool_uses.len(),
+                        &resp.text,
+                    );
+
+                    let is_empty_promise = match verdict {
+                        EmptyPromiseVerdict::Structural => true,
+                        EmptyPromiseVerdict::Inconclusive => {
+                            detect_empty_promise_by_llm(
+                                &view.router,
+                                primary,
+                                fallbacks,
+                                &resp.text,
+                            )
+                            .await
+                        }
+                        EmptyPromiseVerdict::No => false,
+                    };
+
+                    if is_empty_promise {
+                        scheduled_task_retries += 1;
+                        let detection_type = match verdict {
+                            EmptyPromiseVerdict::Structural => "structural",
+                            _ => "llm",
+                        };
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            iteration = iteration_no,
+                            retry_count = scheduled_task_retries,
+                            response_len = resp.text.len(),
+                            detection_type,
+                            "tool_use_loop: empty promise detected, nudging to deliver content"
+                        );
+                        messages.push(LlmMessage {
+                            role: "assistant".into(),
+                            content: resp.content.clone(),
+                        });
+                        messages.push(LlmMessage::user(
+                            "[SYSTEM] Your response announced or promised content but did not \
+                             deliver it. Output the actual content NOW. Do NOT repeat the \
+                             introduction or announce what you plan to do — just produce the content.",
+                        ));
+                        continue;
+                    }
                 }
 
                 tracing::debug!(
@@ -2733,6 +2794,88 @@ fn should_retry_incomplete_scheduled_thought(
     is_short && has_intent_phrase
 }
 
+fn detect_empty_promise_structural(
+    retry_count: u32,
+    current_tool_calls: usize,
+    response_text: &str,
+) -> EmptyPromiseVerdict {
+    if retry_count >= 1 || current_tool_calls > 0 {
+        return EmptyPromiseVerdict::No;
+    }
+
+    let trimmed = response_text.trim();
+    if trimmed.len() >= 500 {
+        return EmptyPromiseVerdict::No;
+    }
+
+    let ends_with_continuation = trimmed.ends_with(':')
+        || trimmed.ends_with('\u{ff1a}') // ：
+        || trimmed.ends_with("——")
+        || trimmed.ends_with("—")
+        || trimmed.ends_with("...")
+        || trimmed.ends_with('\u{2026}') // …
+        || trimmed.ends_with("\u{2026}\u{2026}"); // ……
+
+    if ends_with_continuation {
+        return EmptyPromiseVerdict::Structural;
+    }
+
+    let ends_with_sentence_ending = trimmed.ends_with('.')
+        || trimmed.ends_with('!')
+        || trimmed.ends_with('?')
+        || trimmed.ends_with('\u{3002}') // 。
+        || trimmed.ends_with('\u{ff01}') // ！
+        || trimmed.ends_with('\u{ff1f}') // ？
+        || trimmed.ends_with('"')
+        || trimmed.ends_with('\u{201d}') // "
+        || trimmed.ends_with(')')
+        || trimmed.ends_with('\u{ff09}'); // ）
+
+    if ends_with_sentence_ending {
+        return EmptyPromiseVerdict::No;
+    }
+
+    EmptyPromiseVerdict::Inconclusive
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyPromiseVerdict {
+    Structural,
+    Inconclusive,
+    No,
+}
+
+async fn detect_empty_promise_by_llm(
+    router: &LlmRouter,
+    primary: &str,
+    fallbacks: &[String],
+    response_text: &str,
+) -> bool {
+    let prompt = format!(
+        "An AI assistant produced the following response to a user:\n\
+         ---\n{response_text}\n---\n\
+         Did the assistant promise or announce that it would produce content \
+         (compile, write, generate, summarize, etc.) without actually providing \
+         that content in the response? Answer only YES or NO."
+    );
+    let result = router
+        .chat(
+            primary,
+            fallbacks,
+            Some("You are a binary classifier. Answer only YES or NO.".to_string()),
+            vec![LlmMessage::user(prompt)],
+            16,
+        )
+        .await;
+    match result {
+        Ok(resp) => resp.text.trim().to_uppercase().starts_with("YES"),
+        Err(e) => {
+            tracing::warn!("empty promise LLM detection failed, skipping: {e}");
+            false
+        }
+    }
+}
+
 fn collect_recent_messages(messages: &[LlmMessage], limit: usize) -> Vec<ConversationMessage> {
     let mut collected = Vec::new();
 
@@ -3486,6 +3629,83 @@ Body"#,
         assert!(
             merged.is_none(),
             "skill without permissions should not trigger External origin"
+        );
+    }
+
+    #[test]
+    fn empty_promise_structural_detects_colon_endings() {
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, "好，让我把所有内容整合起来："),
+            EmptyPromiseVerdict::Structural,
+        );
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, "Here is the compiled content:"),
+            EmptyPromiseVerdict::Structural,
+        );
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, "Let me compile everything..."),
+            EmptyPromiseVerdict::Structural,
+        );
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, "整理如下——"),
+            EmptyPromiseVerdict::Structural,
+        );
+    }
+
+    #[test]
+    fn empty_promise_structural_skips_long_responses() {
+        let long_response = "x".repeat(500);
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, &format!("{long_response}:")),
+            EmptyPromiseVerdict::No,
+        );
+    }
+
+    #[test]
+    fn empty_promise_structural_skips_when_tools_called() {
+        assert_eq!(
+            detect_empty_promise_structural(0, 1, "好，让我整合："),
+            EmptyPromiseVerdict::No,
+        );
+    }
+
+    #[test]
+    fn empty_promise_structural_skips_after_retry() {
+        assert_eq!(
+            detect_empty_promise_structural(1, 0, "好，让我整合："),
+            EmptyPromiseVerdict::No,
+        );
+    }
+
+    #[test]
+    fn empty_promise_structural_inconclusive_for_short_no_ending_punctuation() {
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, "我现在就整理给你"),
+            EmptyPromiseVerdict::Inconclusive,
+        );
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, "Sure, I'll do that right away"),
+            EmptyPromiseVerdict::Inconclusive,
+        );
+    }
+
+    #[test]
+    fn empty_promise_structural_no_for_complete_sentences() {
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, "Hello from mock!"),
+            EmptyPromiseVerdict::No,
+        );
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, "The answer is 42."),
+            EmptyPromiseVerdict::No,
+        );
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, "你确定吗？"),
+            EmptyPromiseVerdict::No,
+        );
+        assert_eq!(
+            detect_empty_promise_structural(0, 0, "没问题。"),
+            EmptyPromiseVerdict::No,
         );
     }
 }
