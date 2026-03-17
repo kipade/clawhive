@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useMemo, useEffect, type DragEvent, type ClipboardEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Send, Square, Loader2, Paperclip, X, FileText, File as FileIcon } from "lucide-react";
+import { Send, Square, Loader2, ImagePlus, X, FileText, File as FileIcon } from "lucide-react";
 import { useChatStore } from "@/stores/chat";
 import { uploadAttachment } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -207,7 +207,7 @@ export function MessageInput({ onSend, onCancel }: MessageInputProps) {
       {isDragging && (
         <div className="absolute inset-0 z-10 flex items-center justify-center rounded-b-xl border-2 border-dashed border-primary/50 bg-primary/5 backdrop-blur-[2px]">
           <div className="flex flex-col items-center gap-2 text-primary">
-            <Paperclip className="h-8 w-8" />
+            <ImagePlus className="h-8 w-8" />
             <span className="text-sm font-medium">Drop files here</span>
           </div>
         </div>
@@ -276,7 +276,7 @@ export function MessageInput({ onSend, onCancel }: MessageInputProps) {
           title="Attach files"
         >
           <div className="relative">
-            <Paperclip className="h-4 w-4" />
+            <ImagePlus className="h-4 w-4" />
             {pendingAttachments.length > 0 && (
               <span className="absolute -right-2 -top-2 flex h-4 w-4 items-center justify-center rounded-full bg-primary text-[9px] font-bold text-primary-foreground">
                 {pendingAttachments.length}
