@@ -299,25 +299,45 @@ pub async fn start_whatsapp(
                             Ok(outbound) => {
                                 let _ = client.chatstate().send_paused(&info.source.chat).await;
 
-                                if outbound.text.trim().is_empty() {
+                                let has_text = !outbound.text.trim().is_empty();
+                                let has_attachments = !outbound.attachments.is_empty();
+
+                                if !has_text && !has_attachments {
                                     return;
                                 }
 
-                                let reply = wa::Message {
-                                    conversation: Some(outbound.text),
-                                    ..Default::default()
-                                };
-                                if let Err(e) =
-                                    client.send_message(info.source.chat.clone(), reply).await
-                                {
-                                    tracing::error!("Failed to send WhatsApp reply: {e}");
-                                } else {
-                                    tracing::info!(
-                                        sender = %sender_jid,
-                                        chat = %chat_jid,
-                                        "WhatsApp reply sent"
-                                    );
+                                if has_attachments {
+                                    for att in &outbound.attachments {
+                                        if let Err(e) =
+                                            send_wa_attachment(&client, &chat_jid, att).await
+                                        {
+                                            tracing::error!(
+                                                error = %e,
+                                                "failed to send WhatsApp attachment"
+                                            );
+                                        }
+                                    }
                                 }
+
+                                if has_text {
+                                    let reply = wa::Message {
+                                        conversation: Some(outbound.text),
+                                        ..Default::default()
+                                    };
+                                    if let Err(e) =
+                                        client.send_message(info.source.chat.clone(), reply).await
+                                    {
+                                        tracing::error!("Failed to send WhatsApp reply: {e}");
+                                    }
+                                }
+
+                                tracing::info!(
+                                    sender = %sender_jid,
+                                    chat = %chat_jid,
+                                    has_text,
+                                    attachments = outbound.attachments.len(),
+                                    "WhatsApp reply sent"
+                                );
                             }
                             Err(err) => {
                                 let _ = client.chatstate().send_paused(&info.source.chat).await;
@@ -502,6 +522,89 @@ async fn spawn_delivery_listener(bus: Arc<EventBus>, connector_id: String, clien
             tracing::error!("Failed to deliver WhatsApp announce: {e}");
         }
     }
+}
+
+async fn resolve_attachment_bytes(att: &Attachment) -> anyhow::Result<Vec<u8>> {
+    let url = &att.url;
+    if url.starts_with('/') || url.starts_with("./") {
+        return tokio::fs::read(url)
+            .await
+            .map_err(|e| anyhow::anyhow!("read file {url}: {e}"));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let resp = reqwest::get(url).await?;
+        return Ok(resp.bytes().await?.to_vec());
+    }
+    BASE64_STANDARD
+        .decode(url)
+        .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))
+}
+
+async fn send_wa_attachment(
+    client: &std::sync::Arc<Client>,
+    chat_jid_str: &str,
+    att: &Attachment,
+) -> anyhow::Result<()> {
+    use wacore::download::MediaType;
+    use waproto::whatsapp::message::{DocumentMessage, ImageMessage};
+
+    let chat_jid = chat_jid_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid JID: {chat_jid_str}"))?;
+
+    let bytes = resolve_attachment_bytes(att).await?;
+
+    let media_type = match att.kind {
+        AttachmentKind::Image => MediaType::Image,
+        AttachmentKind::Video => MediaType::Video,
+        AttachmentKind::Audio => MediaType::Audio,
+        _ => MediaType::Document,
+    };
+
+    let upload = client.upload(bytes, media_type).await?;
+
+    let message = match att.kind {
+        AttachmentKind::Image => wa::Message {
+            image_message: Some(Box::new(ImageMessage {
+                url: Some(upload.url),
+                direct_path: Some(upload.direct_path),
+                media_key: Some(upload.media_key),
+                file_enc_sha256: Some(upload.file_enc_sha256),
+                file_sha256: Some(upload.file_sha256),
+                file_length: Some(upload.file_length),
+                mimetype: att.mime_type.clone(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+        _ => {
+            let file_name = att.file_name.clone().unwrap_or_else(|| {
+                let ext = att
+                    .mime_type
+                    .as_deref()
+                    .and_then(|m| m.split('/').nth(1))
+                    .unwrap_or("bin");
+                format!("file.{ext}")
+            });
+            wa::Message {
+                document_message: Some(Box::new(DocumentMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(upload.media_key),
+                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    file_sha256: Some(upload.file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: att.mime_type.clone(),
+                    file_name: Some(file_name),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+        }
+    };
+
+    client.send_message(chat_jid, message).await?;
+    Ok(())
 }
 
 #[cfg(test)]

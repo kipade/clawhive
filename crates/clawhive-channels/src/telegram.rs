@@ -290,6 +290,10 @@ impl TelegramBot {
                                     );
                                 }
                             }
+
+                            if !outbound.attachments.is_empty() {
+                                send_attachments(&bot, chat_id, &outbound.attachments).await;
+                            }
                         }
                         Err(err) => {
                             tracing::error!(
@@ -1171,6 +1175,65 @@ fn utf16_offset_to_byte_idx(text: &str, target: usize) -> Option<usize> {
         Some(text.len())
     } else {
         None
+    }
+}
+
+async fn resolve_attachment_bytes(att: &Attachment) -> anyhow::Result<Vec<u8>> {
+    let url = &att.url;
+    if url.starts_with('/') || url.starts_with("./") {
+        return tokio::fs::read(url)
+            .await
+            .map_err(|e| anyhow::anyhow!("read file {url}: {e}"));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let resp = reqwest::get(url).await?;
+        return Ok(resp.bytes().await?.to_vec());
+    }
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(url)
+        .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))
+}
+
+fn default_file_name(kind: &AttachmentKind, mime_type: &Option<String>) -> String {
+    let ext = mime_type
+        .as_deref()
+        .and_then(|m| m.split('/').nth(1))
+        .unwrap_or("bin");
+    match kind {
+        AttachmentKind::Image => format!("image.{ext}"),
+        AttachmentKind::Video => format!("video.{ext}"),
+        AttachmentKind::Audio => format!("audio.{ext}"),
+        AttachmentKind::Document | AttachmentKind::Other => format!("file.{ext}"),
+    }
+}
+
+async fn send_attachments(bot: &Bot, chat_id: ChatId, attachments: &[Attachment]) {
+    use teloxide::types::InputFile;
+
+    for att in attachments {
+        let bytes = match resolve_attachment_bytes(att).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to resolve attachment data for telegram");
+                continue;
+            }
+        };
+
+        let file_name = att
+            .file_name
+            .clone()
+            .unwrap_or_else(|| default_file_name(&att.kind, &att.mime_type));
+        let input = InputFile::memory(bytes).file_name(file_name);
+
+        let result = match att.kind {
+            AttachmentKind::Image => bot.send_photo(chat_id, input).await.map(|_| ()),
+            _ => bot.send_document(chat_id, input).await.map(|_| ()),
+        };
+
+        if let Err(e) = result {
+            tracing::error!(error = %e, kind = ?att.kind, "failed to send telegram attachment");
+        }
     }
 }
 

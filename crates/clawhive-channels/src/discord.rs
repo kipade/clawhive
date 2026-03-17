@@ -6,7 +6,7 @@ use clawhive_gateway::Gateway;
 use clawhive_schema::{Attachment, AttachmentKind, BusMessage, InboundMessage, OutboundMessage};
 use serenity::all::{
     ButtonStyle, ChannelId, Client, Command, CommandInteraction, CommandOptionType,
-    ComponentInteraction, Context, CreateActionRow, CreateButton, CreateCommand,
+    ComponentInteraction, Context, CreateActionRow, CreateAttachment, CreateButton, CreateCommand,
     CreateCommandOption, CreateInteractionResponse, CreateInteractionResponseFollowup,
     CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse, EventHandler,
     GatewayIntents, Http, Interaction, Message, Ready,
@@ -374,14 +374,31 @@ impl EventHandler for DiscordHandler {
 
             match result {
                 Ok(outbound) => {
-                    let reply = if outbound.text.trim().is_empty() {
-                        "Sorry, I got an empty response. Please try again."
-                    } else {
-                        outbound.text.as_str()
-                    };
-                    let reply_to = outbound.reply_to.as_deref().unwrap_or(&user_msg_id);
-                    if let Err(err) = send_chunked(channel_id, &http, reply, Some(reply_to)).await {
-                        tracing::error!("failed to send discord reply: {err}");
+                    let has_text = !outbound.text.trim().is_empty();
+                    let has_attachments = !outbound.attachments.is_empty();
+
+                    if has_text {
+                        let reply_to = outbound.reply_to.as_deref().unwrap_or(&user_msg_id);
+                        if let Err(err) =
+                            send_chunked(channel_id, &http, &outbound.text, Some(reply_to)).await
+                        {
+                            tracing::error!("failed to send discord reply: {err}");
+                        }
+                    } else if !has_attachments {
+                        if let Err(err) = channel_id
+                            .say(&http, "Sorry, I got an empty response. Please try again.")
+                            .await
+                        {
+                            tracing::error!("failed to send discord reply: {err}");
+                        }
+                    }
+
+                    if has_attachments {
+                        if let Err(err) =
+                            send_attachments(channel_id, &http, &outbound.attachments).await
+                        {
+                            tracing::error!("failed to send discord attachments: {err}");
+                        }
                     }
                 }
                 Err(err) => {
@@ -905,6 +922,71 @@ async fn download_attachment(client: &reqwest::Client, url: &str) -> anyhow::Res
     let bytes = client.get(url).send().await?.bytes().await?;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(base64_data)
+}
+
+async fn resolve_attachment_bytes(att: &Attachment) -> anyhow::Result<Vec<u8>> {
+    let url = &att.url;
+    if url.starts_with('/') || url.starts_with("./") {
+        return tokio::fs::read(url)
+            .await
+            .map_err(|e| anyhow::anyhow!("read file {url}: {e}"));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let resp = reqwest::get(url).await?;
+        return Ok(resp.bytes().await?.to_vec());
+    }
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(url)
+        .map_err(|e| anyhow::anyhow!("base64 decode: {e}"))
+}
+
+fn default_file_name(kind: &AttachmentKind, mime_type: &Option<String>) -> String {
+    let ext = mime_type
+        .as_deref()
+        .and_then(|m| m.split('/').nth(1))
+        .unwrap_or("bin");
+    match kind {
+        AttachmentKind::Image => format!("image.{ext}"),
+        AttachmentKind::Video => format!("video.{ext}"),
+        AttachmentKind::Audio => format!("audio.{ext}"),
+        AttachmentKind::Document | AttachmentKind::Other => format!("file.{ext}"),
+    }
+}
+
+async fn send_attachments(
+    channel_id: ChannelId,
+    http: &Http,
+    attachments: &[Attachment],
+) -> Result<(), serenity::Error> {
+    let mut discord_files = Vec::new();
+
+    for att in attachments {
+        let bytes = match resolve_attachment_bytes(att).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to resolve attachment data for discord");
+                continue;
+            }
+        };
+
+        let file_name = att
+            .file_name
+            .clone()
+            .unwrap_or_else(|| default_file_name(&att.kind, &att.mime_type));
+        discord_files.push(CreateAttachment::bytes(bytes, file_name));
+    }
+
+    if discord_files.is_empty() {
+        return Ok(());
+    }
+
+    let mut msg = CreateMessage::new();
+    for file in discord_files {
+        msg = msg.add_file(file);
+    }
+    channel_id.send_message(http, msg).await?;
+    Ok(())
 }
 
 #[cfg(test)]
