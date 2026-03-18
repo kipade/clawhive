@@ -149,6 +149,10 @@ impl TelegramBot {
 
             async move {
                 let has_photo = msg.photo().is_some();
+                let has_document = msg.document().is_some();
+                let has_voice = msg.voice().is_some();
+                let has_audio = msg.audio().is_some();
+                let has_media = has_photo || has_document || has_voice || has_audio;
                 let mut text = msg
                     .text()
                     .or_else(|| msg.caption())
@@ -168,8 +172,8 @@ impl TelegramBot {
                     .replacen("/skill_install", "/skill install", 1)
                     .replacen("/skill_confirm", "/skill confirm", 1);
 
-                // Skip messages with no text and no photo
-                if text.is_empty() && !has_photo {
+                // Skip messages with no text and no media
+                if text.is_empty() && !has_media {
                     return Ok::<(), teloxide::RequestError>(());
                 }
 
@@ -213,6 +217,95 @@ impl TelegramBot {
                             Err(e) => {
                                 tracing::warn!("Failed to download photo: {e}");
                             }
+                        }
+                    }
+                }
+
+                if let Some(doc) = msg.document() {
+                    let mime = doc
+                        .mime_type
+                        .as_ref()
+                        .map(|m| m.to_string())
+                        .or_else(|| mime_from_filename(doc.file_name.as_deref()))
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+                    let kind = if mime.starts_with("image/") {
+                        AttachmentKind::Image
+                    } else {
+                        AttachmentKind::Document
+                    };
+
+                    match download_file_as_base64(&bot, &doc.file.id).await {
+                        Ok(buf) => {
+                            use base64::Engine;
+                            let base64_data =
+                                base64::engine::general_purpose::STANDARD.encode(&buf);
+                            inbound.attachments.push(Attachment {
+                                kind,
+                                url: base64_data,
+                                mime_type: Some(mime),
+                                file_name: doc.file_name.clone(),
+                                size: Some(doc.file.size as u64),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                file_name = ?doc.file_name,
+                                error = %e,
+                                "failed to download telegram document"
+                            );
+                        }
+                    }
+                }
+
+                if let Some(voice) = msg.voice() {
+                    let mime = voice
+                        .mime_type
+                        .as_ref()
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "audio/ogg".to_string());
+
+                    match download_file_as_base64(&bot, &voice.file.id).await {
+                        Ok(buf) => {
+                            use base64::Engine;
+                            let base64_data =
+                                base64::engine::general_purpose::STANDARD.encode(&buf);
+                            inbound.attachments.push(Attachment {
+                                kind: AttachmentKind::Audio,
+                                url: base64_data,
+                                mime_type: Some(mime),
+                                file_name: None,
+                                size: Some(voice.file.size as u64),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to download telegram voice");
+                        }
+                    }
+                }
+
+                if let Some(audio) = msg.audio() {
+                    let mime = audio
+                        .mime_type
+                        .as_ref()
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "audio/mpeg".to_string());
+
+                    match download_file_as_base64(&bot, &audio.file.id).await {
+                        Ok(buf) => {
+                            use base64::Engine;
+                            let base64_data =
+                                base64::engine::general_purpose::STANDARD.encode(&buf);
+                            inbound.attachments.push(Attachment {
+                                kind: AttachmentKind::Audio,
+                                url: base64_data,
+                                mime_type: Some(mime),
+                                file_name: audio.file_name.clone(),
+                                size: Some(audio.file.size as u64),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to download telegram audio");
                         }
                     }
                 }
@@ -490,11 +583,13 @@ impl crate::ChannelBot for TelegramBot {
 }
 
 pub fn detect_mention(msg: &Message) -> (bool, Option<String>) {
-    let Some(entities) = msg.entities() else {
-        return (false, None);
-    };
-    let Some(text) = msg.text() else {
-        return (false, None);
+    // Check text entities first, then caption entities (for media messages)
+    let (entities, text) = match (msg.entities(), msg.text()) {
+        (Some(e), Some(t)) => (e, t),
+        _ => match (msg.caption_entities(), msg.caption()) {
+            (Some(e), Some(t)) => (e, t),
+            _ => return (false, None),
+        },
     };
 
     for entity in entities {
@@ -797,6 +892,14 @@ async fn spawn_action_listener(
     }
 }
 
+/// Download any Telegram file by file_id, returning base64-encoded content.
+async fn download_file_as_base64(bot: &Bot, file_id: &str) -> anyhow::Result<Vec<u8>> {
+    let file = bot.get_file(file_id).await?;
+    let mut buf = Vec::new();
+    bot.download_file(&file.path, &mut buf).await?;
+    Ok(buf)
+}
+
 /// Download a Telegram photo by file_id, returning (base64_data, mime_type).
 async fn download_photo(bot: &Bot, file_id: &str) -> anyhow::Result<(String, String)> {
     use base64::Engine;
@@ -819,6 +922,44 @@ async fn download_photo(bot: &Bot, file_id: &str) -> anyhow::Result<(String, Str
 
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&buf);
     Ok((base64_data, mime.to_string()))
+}
+
+/// Infer MIME type from a filename extension.
+fn mime_from_filename(name: Option<&str>) -> Option<String> {
+    let ext = name?.rsplit('.').next()?;
+    let mime = match ext.to_lowercase().as_str() {
+        "txt" | "log" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "json" => "application/json",
+        "yaml" | "yml" => "application/x-yaml",
+        "toml" => "application/toml",
+        "xml" => "application/xml",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "application/javascript",
+        "ts" | "tsx" => "text/typescript",
+        "py" => "text/x-python",
+        "rs" => "text/x-rust",
+        "go" => "text/x-go",
+        "java" => "text/x-java",
+        "c" | "h" => "text/x-c",
+        "cpp" | "cc" | "cxx" | "hpp" => "text/x-c++",
+        "sh" | "bash" | "zsh" => "application/x-sh",
+        "csv" => "text/csv",
+        "sql" => "text/x-sql",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" => "audio/ogg",
+        "wav" => "audio/wav",
+        _ => return None,
+    };
+    Some(mime.to_string())
 }
 
 /// Maximum length for a single Telegram message.
