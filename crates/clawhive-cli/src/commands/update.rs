@@ -167,6 +167,11 @@ pub async fn handle_update(
         .as_deref()
         .unwrap_or_else(|| channel_from_version(&current));
 
+    // Capture binary path BEFORE self_replace runs.
+    // On Linux, /proc/self/exe becomes stale after self_replace, so
+    // current_exe() would return a "(deleted)" path and fail to spawn.
+    let binary_path = std::env::current_exe().context("cannot determine current binary path")?;
+
     println!("Current version: {current} (channel: {channel}, target: {TARGET})");
 
     if let Some(ref target_ver) = target_version {
@@ -192,7 +197,7 @@ pub async fn handle_update(
         }
         download_and_replace(&release).await?;
         println!("Updated successfully: {current} → {}", release.version);
-        restart_if_running(root).await?;
+        restart_if_running(root, &binary_path).await?;
         return Ok(());
     }
 
@@ -226,11 +231,11 @@ pub async fn handle_update(
 
     download_and_replace(latest).await?;
     println!("Updated successfully: {current} → {}", latest.version);
-    restart_if_running(root).await?;
+    restart_if_running(root, &binary_path).await?;
     Ok(())
 }
 
-async fn restart_if_running(root: &std::path::Path) -> Result<()> {
+async fn restart_if_running(root: &std::path::Path, binary_path: &std::path::Path) -> Result<()> {
     use crate::runtime::pid::{is_process_running, read_pid_file, read_port_file};
 
     let pid = read_pid_file(root)?;
@@ -241,8 +246,33 @@ async fn restart_if_running(root: &std::path::Path) -> Result<()> {
 
     println!("Restarting daemon...");
     let port = read_port_file(root)?.unwrap_or(8848);
-    let security_override = None;
-    crate::commands::start::run_restart(root, port, security_override).await?;
+
+    crate::commands::start::run_stop(root)?;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    let log_dir = root.join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("clawhive.out"))?;
+    let log_file_err = log_file.try_clone()?;
+
+    std::process::Command::new(binary_path)
+        .arg("--config-root")
+        .arg(root)
+        .arg("start")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_file_err))
+        .spawn()
+        .context("failed to restart daemon after update")?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    crate::commands::status::print_status_after_start(root);
+
     Ok(())
 }
 
