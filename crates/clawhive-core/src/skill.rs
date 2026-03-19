@@ -317,11 +317,23 @@ fn load_skill(path: &Path) -> Result<Skill> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let (frontmatter, content) = parse_frontmatter(&raw)?;
+
+    // requires.env implies permissions.env — if a skill requires an env var
+    // to load, it obviously needs access to it at runtime too.
+    let permissions = frontmatter.permissions.map(|mut p| {
+        for env_var in &frontmatter.requires.env {
+            if !p.env.contains(env_var) {
+                p.env.push(env_var.clone());
+            }
+        }
+        p
+    });
+
     Ok(Skill {
         name: frontmatter.name,
         description: frontmatter.description,
         requires: frontmatter.requires,
-        permissions: frontmatter.permissions,
+        permissions,
         content,
         path: path.to_path_buf(),
     })

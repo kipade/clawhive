@@ -405,6 +405,10 @@ impl PolicyContext {
         }
     }
 
+    pub fn declared_env_vars(&self) -> Option<&[String]> {
+        self.permissions.as_ref().map(|p| p.env.as_slice())
+    }
+
     /// Check if environment variable access is allowed.
     pub fn check_env(&self, var_name: &str) -> bool {
         if self.security_mode == SecurityMode::Off {

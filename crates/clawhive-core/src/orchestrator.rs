@@ -632,7 +632,7 @@ impl Orchestrator {
     ) -> Result<super::tool::ToolOutput> {
         let gate = self.access_gate_for(agent_id);
         let ws = self.workspace_root_for(agent_id);
-        let (exec_security, sandbox_config) = view
+        let (exec_security, mut sandbox_config) = view
             .agent(agent_id)
             .map(|agent| {
                 (
@@ -646,6 +646,15 @@ impl Orchestrator {
                     SandboxPolicyConfig::default(),
                 )
             });
+
+        if let Some(env_vars) = ctx.declared_env_vars() {
+            for var in env_vars {
+                if !sandbox_config.env_inherit.contains(var) {
+                    sandbox_config.env_inherit.push(var.clone());
+                }
+            }
+        }
+
         match name {
             "read" | "read_file" => ReadFileTool::new(ws, gate).execute(input, ctx).await,
             "write" | "write_file" => WriteFileTool::new(ws, gate).execute(input, ctx).await,

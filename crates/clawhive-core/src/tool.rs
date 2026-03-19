@@ -338,6 +338,10 @@ impl ToolContext {
         self.policy_ctx.check_exec(cmd)
     }
 
+    pub fn declared_env_vars(&self) -> Option<&[String]> {
+        self.policy_ctx.declared_env_vars()
+    }
+
     /// Check if accessing the given environment variable is allowed.
     pub fn check_env(&self, var_name: &str) -> bool {
         self.policy_ctx.check_env(var_name)
