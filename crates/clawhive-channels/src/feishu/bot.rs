@@ -330,21 +330,31 @@ impl FeishuBot {
 
                             let first = chunks[0];
                             if use_card {
+                                let _ = client.delete_message(ph_id).await;
                                 let card = md_to_feishu_card(first);
-                                let content = serde_json::to_string(&card).unwrap_or_default();
-                                let _ = client.edit_message(ph_id, "interactive", &content).await;
+                                if let Err(e) = client.reply_card(&message_id, &card).await {
+                                    tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to reply with card");
+                                }
                             } else {
                                 let content = serde_json::json!({"text": first}).to_string();
-                                let _ = client.edit_message(ph_id, "text", &content).await;
+                                if let Err(e) = client.edit_message(ph_id, "text", &content).await {
+                                    tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to edit message with text");
+                                }
                             }
 
                             for chunk in chunks.iter().skip(1) {
                                 if use_card {
                                     let card = md_to_feishu_card(chunk);
-                                    let _ = client.send_card(&chat_id, &card).await;
+                                    if let Err(e) = client.send_card(&chat_id, &card).await {
+                                        tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to send card chunk");
+                                    }
                                 } else {
                                     let content = serde_json::json!({"text": *chunk}).to_string();
-                                    let _ = client.send_message(&chat_id, "text", &content).await;
+                                    if let Err(e) =
+                                        client.send_message(&chat_id, "text", &content).await
+                                    {
+                                        tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to send text chunk");
+                                    }
                                 }
                             }
                         }
@@ -363,9 +373,11 @@ impl FeishuBot {
                                 for (i, chunk) in chunks.iter().enumerate() {
                                     let card = md_to_feishu_card(chunk);
                                     if i == 0 {
-                                        let _ = client.reply_card(reply_to, &card).await;
-                                    } else {
-                                        let _ = client.send_card(&chat_id, &card).await;
+                                        if let Err(e) = client.reply_card(reply_to, &card).await {
+                                            tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to reply with card");
+                                        }
+                                    } else if let Err(e) = client.send_card(&chat_id, &card).await {
+                                        tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to send card chunk");
                                     }
                                 }
                             } else {
@@ -373,11 +385,15 @@ impl FeishuBot {
                                 for (i, chunk) in chunks.iter().enumerate() {
                                     let content = serde_json::json!({"text": *chunk}).to_string();
                                     if i == 0 {
-                                        let _ =
-                                            client.reply_message(reply_to, "text", &content).await;
-                                    } else {
-                                        let _ =
-                                            client.send_message(&chat_id, "text", &content).await;
+                                        if let Err(e) =
+                                            client.reply_message(reply_to, "text", &content).await
+                                        {
+                                            tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to reply with text");
+                                        }
+                                    } else if let Err(e) =
+                                        client.send_message(&chat_id, "text", &content).await
+                                    {
+                                        tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to send text chunk");
                                     }
                                 }
                             }
