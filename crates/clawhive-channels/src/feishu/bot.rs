@@ -190,6 +190,17 @@ impl FeishuBot {
                                 }
                             }
                         }
+                        Some(Ok(WsMessage::Text(data))) => {
+                            if let Ok(frame) = Frame::decode(data.as_bytes()) {
+                                let ack = self.handle_frame(&frame, adapter, client).await;
+                                if let Some(ack_bytes) = ack {
+                                    if let Err(e) = write.send(WsMessage::Binary(ack_bytes.into())).await {
+                                        tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to send ACK");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         Some(Ok(WsMessage::Close(_))) | None => {
                             tracing::info!(target: "clawhive::channel::feishu", "WebSocket closed");
                             break;
