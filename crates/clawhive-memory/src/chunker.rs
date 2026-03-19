@@ -190,7 +190,7 @@ fn split_large_section(
     for range in core_ranges {
         let mut start = range.start;
         if let Some(prev) = with_overlap.last() {
-            let desired = prev.end.saturating_sub(overlap_size);
+            let desired = text.floor_char_boundary(prev.end.saturating_sub(overlap_size));
             if start > desired {
                 start = desired;
             }
@@ -236,7 +236,7 @@ fn split_fixed_window(
     let step = target_size.saturating_sub(overlap_size).max(1);
 
     while cursor < end {
-        let window_end = (cursor + target_size).min(end);
+        let window_end = text.floor_char_boundary((cursor + target_size).min(end));
         let mut split_end = window_end;
 
         if window_end < end && window_end > cursor {
@@ -260,7 +260,7 @@ fn split_fixed_window(
             break;
         }
 
-        cursor = cursor.saturating_add(step);
+        cursor = text.ceil_char_boundary(cursor.saturating_add(step).min(end));
     }
 
     ranges
@@ -391,5 +391,16 @@ mod tests {
     fn hash_helper_smoke() {
         let h = compute_hash("abc");
         assert_eq!(h.len(), 64);
+    }
+
+    #[test]
+    fn multibyte_utf8_does_not_panic() {
+        let content = "# 标题\n\n".to_owned()
+            + &"这是一段包含中文字符的长文本用于测试多字节UTF8切割。".repeat(50);
+        let chunks = chunk_markdown(&content, &cfg(80, 16));
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(!chunk.text.is_empty());
+        }
     }
 }
