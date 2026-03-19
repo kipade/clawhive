@@ -1995,7 +1995,9 @@ impl Orchestrator {
             }
             .with_recent_messages(recent_messages)
             .with_attachment_collector(attachment_collector.clone());
-            let ctx = ctx.with_skill_registry(self.active_skill_registry());
+            let ctx = ctx
+                .with_skill_registry(self.active_skill_registry())
+                .with_agent_id(agent_id);
             let ctx = if let Some((ref ch, ref co, ref cv, ref us)) = source_info {
                 ctx.with_source(ch.clone(), co.clone(), cv.clone())
                     .with_source_user_scope(us.clone())

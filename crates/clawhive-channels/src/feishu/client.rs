@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::RwLock;
@@ -8,10 +9,19 @@ use super::types::{FeishuClientConfig, WsEndpointResponse};
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_ENDPOINT: &str = "https://open.feishu.cn/callback/ws/endpoint";
 
+const TOKEN_PROACTIVE_REFRESH_AGE: Duration = Duration::from_secs(90 * 60);
+const TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(100 * 60);
+const TOKEN_EXPIRED_CODE: i64 = 99991663;
+
+struct TokenState {
+    value: String,
+    fetched_at: Instant,
+}
+
 pub struct FeishuClient {
     app_id: String,
     app_secret: String,
-    token: Arc<RwLock<String>>,
+    token: Arc<RwLock<TokenState>>,
     http: reqwest::Client,
 }
 
@@ -20,7 +30,10 @@ impl FeishuClient {
         Self {
             app_id: app_id.into(),
             app_secret: app_secret.into(),
-            token: Arc::new(RwLock::new(String::new())),
+            token: Arc::new(RwLock::new(TokenState {
+                value: String::new(),
+                fetched_at: Instant::now() - TOKEN_PROACTIVE_REFRESH_AGE - Duration::from_secs(1),
+            })),
             http: reqwest::Client::new(),
         }
     }
@@ -74,7 +87,8 @@ impl FeishuClient {
             .ok_or_else(|| anyhow::anyhow!("feishu: missing tenant_access_token"))?;
 
         let mut guard = self.token.write().await;
-        *guard = token.to_string();
+        guard.value = token.to_string();
+        guard.fetched_at = Instant::now();
 
         tracing::info!(
             target: "clawhive::channel::feishu",
@@ -83,25 +97,100 @@ impl FeishuClient {
         Ok(())
     }
 
-    pub async fn send_message(&self, chat_id: &str, msg_type: &str, content: &str) -> Result<()> {
-        let token = self.token.read().await.clone();
-        let resp = self
-            .http
-            .post(format!(
-                "{FEISHU_BASE_URL}/im/v1/messages?receive_id_type=chat_id"
-            ))
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&serde_json::json!({
-                "receive_id": chat_id,
-                "msg_type": msg_type,
-                "content": content,
-            }))
-            .send()
-            .await?;
+    async fn get_token(&self) -> String {
+        {
+            let guard = self.token.read().await;
+            if !guard.value.is_empty() && guard.fetched_at.elapsed() < TOKEN_PROACTIVE_REFRESH_AGE {
+                return guard.value.clone();
+            }
+        }
+        if let Err(e) = self.refresh_token().await {
+            tracing::warn!(
+                target: "clawhive::channel::feishu",
+                error = %e,
+                "proactive token refresh failed, using cached token"
+            );
+        }
+        self.token.read().await.value.clone()
+    }
 
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("feishu: send_message failed: {body}");
+    pub fn spawn_token_refresh(self: &Arc<Self>) {
+        let client = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(TOKEN_REFRESH_INTERVAL).await;
+
+                let mut backoff = Duration::from_secs(5);
+                loop {
+                    match client.refresh_token().await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            tracing::error!(
+                                target: "clawhive::channel::feishu",
+                                error = %e,
+                                retry_secs = backoff.as_secs(),
+                                "failed to refresh tenant_access_token, retrying"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(60));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn is_token_expired(resp: &serde_json::Value) -> bool {
+        resp.pointer("/code")
+            .and_then(|v| v.as_i64())
+            .is_some_and(|c| c == TOKEN_EXPIRED_CODE)
+    }
+
+    fn extract_api_error(resp: &serde_json::Value, method: &str) -> Option<anyhow::Error> {
+        let code = resp.pointer("/code").and_then(|v| v.as_i64()).unwrap_or(0);
+        if code != 0 {
+            Some(anyhow::anyhow!("feishu: {method} failed: {resp}"))
+        } else {
+            None
+        }
+    }
+
+    fn extract_message_id(resp: &serde_json::Value) -> String {
+        resp.pointer("/data/message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    pub async fn send_message(&self, chat_id: &str, msg_type: &str, content: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "receive_id": chat_id,
+            "msg_type": msg_type,
+            "content": content,
+        });
+
+        for attempt in 0..2 {
+            let token = self.get_token().await;
+            let resp: serde_json::Value = self
+                .http
+                .post(format!(
+                    "{FEISHU_BASE_URL}/im/v1/messages?receive_id_type=chat_id"
+                ))
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if attempt == 0 && Self::is_token_expired(&resp) {
+                self.refresh_token().await?;
+                continue;
+            }
+            if let Some(e) = Self::extract_api_error(&resp, "send_message") {
+                return Err(e);
+            }
+            return Ok(());
         }
         Ok(())
     }
@@ -112,56 +201,72 @@ impl FeishuClient {
         msg_type: &str,
         content: &str,
     ) -> Result<()> {
-        let token = self.token.read().await.clone();
-        let resp = self
-            .http
-            .post(format!(
-                "{FEISHU_BASE_URL}/im/v1/messages/{message_id}/reply"
-            ))
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&serde_json::json!({
-                "msg_type": msg_type,
-                "content": content,
-            }))
-            .send()
-            .await?;
+        let body = serde_json::json!({
+            "msg_type": msg_type,
+            "content": content,
+        });
 
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("feishu: reply_message failed: {body}");
+        for attempt in 0..2 {
+            let token = self.get_token().await;
+            let resp: serde_json::Value = self
+                .http
+                .post(format!(
+                    "{FEISHU_BASE_URL}/im/v1/messages/{message_id}/reply"
+                ))
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if attempt == 0 && Self::is_token_expired(&resp) {
+                self.refresh_token().await?;
+                continue;
+            }
+            if let Some(e) = Self::extract_api_error(&resp, "reply_message") {
+                return Err(e);
+            }
+            return Ok(());
         }
         Ok(())
     }
 
-    /// Reply to a message and return the sent message's ID.
     pub async fn reply_message_with_id(
         &self,
         message_id: &str,
         msg_type: &str,
         content: &str,
     ) -> Result<String> {
-        let token = self.token.read().await.clone();
-        let resp = self
-            .http
-            .post(format!(
-                "{FEISHU_BASE_URL}/im/v1/messages/{message_id}/reply"
-            ))
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&serde_json::json!({
-                "msg_type": msg_type,
-                "content": content,
-            }))
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?;
+        let body = serde_json::json!({
+            "msg_type": msg_type,
+            "content": content,
+        });
 
-        let sent_msg_id = resp
-            .pointer("/data/message_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        Ok(sent_msg_id)
+        for attempt in 0..2 {
+            let token = self.get_token().await;
+            let resp: serde_json::Value = self
+                .http
+                .post(format!(
+                    "{FEISHU_BASE_URL}/im/v1/messages/{message_id}/reply"
+                ))
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if attempt == 0 && Self::is_token_expired(&resp) {
+                self.refresh_token().await?;
+                continue;
+            }
+            if let Some(e) = Self::extract_api_error(&resp, "reply_message_with_id") {
+                return Err(e);
+            }
+            return Ok(Self::extract_message_id(&resp));
+        }
+        Ok(String::new())
     }
 
     pub async fn edit_message(
@@ -170,113 +275,132 @@ impl FeishuClient {
         msg_type: &str,
         content: &str,
     ) -> Result<()> {
-        let token = self.token.read().await.clone();
-        let resp = self
-            .http
-            .patch(format!("{FEISHU_BASE_URL}/im/v1/messages/{message_id}"))
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&serde_json::json!({
-                "msg_type": msg_type,
-                "content": content,
-            }))
-            .send()
-            .await?;
+        let body = serde_json::json!({
+            "msg_type": msg_type,
+            "content": content,
+        });
 
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("feishu: edit_message failed: {body}");
+        for attempt in 0..2 {
+            let token = self.get_token().await;
+            let resp: serde_json::Value = self
+                .http
+                .patch(format!("{FEISHU_BASE_URL}/im/v1/messages/{message_id}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if attempt == 0 && Self::is_token_expired(&resp) {
+                self.refresh_token().await?;
+                continue;
+            }
+            if let Some(e) = Self::extract_api_error(&resp, "edit_message") {
+                return Err(e);
+            }
+            return Ok(());
         }
         Ok(())
     }
 
     pub async fn delete_message(&self, message_id: &str) -> Result<()> {
-        let token = self.token.read().await.clone();
-        let resp = self
-            .http
-            .delete(format!("{FEISHU_BASE_URL}/im/v1/messages/{message_id}"))
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await?;
+        for attempt in 0..2 {
+            let token = self.get_token().await;
+            let resp: serde_json::Value = self
+                .http
+                .delete(format!("{FEISHU_BASE_URL}/im/v1/messages/{message_id}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await?
+                .json()
+                .await?;
 
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("feishu: delete_message failed: {body}");
+            if attempt == 0 && Self::is_token_expired(&resp) {
+                self.refresh_token().await?;
+                continue;
+            }
+            if let Some(e) = Self::extract_api_error(&resp, "delete_message") {
+                return Err(e);
+            }
+            return Ok(());
         }
         Ok(())
     }
 
-    /// Send an Interactive Card to a chat. Returns the sent message's ID.
     pub async fn send_card(&self, chat_id: &str, card_json: &serde_json::Value) -> Result<String> {
         let content = serde_json::to_string(card_json)?;
-        let token = self.token.read().await.clone();
-        let resp = self
-            .http
-            .post(format!(
-                "{FEISHU_BASE_URL}/im/v1/messages?receive_id_type=chat_id"
-            ))
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&serde_json::json!({
-                "receive_id": chat_id,
-                "msg_type": "interactive",
-                "content": content,
-            }))
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?;
+        let body = serde_json::json!({
+            "receive_id": chat_id,
+            "msg_type": "interactive",
+            "content": content,
+        });
 
-        let code = resp.pointer("/code").and_then(|v| v.as_i64()).unwrap_or(0);
-        if code != 0 {
-            anyhow::bail!("feishu: send_card failed: {resp}");
+        for attempt in 0..2 {
+            let token = self.get_token().await;
+            let resp: serde_json::Value = self
+                .http
+                .post(format!(
+                    "{FEISHU_BASE_URL}/im/v1/messages?receive_id_type=chat_id"
+                ))
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if attempt == 0 && Self::is_token_expired(&resp) {
+                self.refresh_token().await?;
+                continue;
+            }
+            if let Some(e) = Self::extract_api_error(&resp, "send_card") {
+                return Err(e);
+            }
+            return Ok(Self::extract_message_id(&resp));
         }
-
-        let message_id = resp
-            .pointer("/data/message_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        Ok(message_id)
+        Ok(String::new())
     }
 
-    /// Reply with an Interactive Card. Returns the sent message's ID.
     pub async fn reply_card(
         &self,
         message_id: &str,
         card_json: &serde_json::Value,
     ) -> Result<String> {
         let content = serde_json::to_string(card_json)?;
-        let token = self.token.read().await.clone();
-        let resp: serde_json::Value = self
-            .http
-            .post(format!(
-                "{FEISHU_BASE_URL}/im/v1/messages/{message_id}/reply"
-            ))
-            .header("Authorization", format!("Bearer {token}"))
-            .json(&serde_json::json!({
-                "msg_type": "interactive",
-                "content": content,
-            }))
-            .send()
-            .await?
-            .json()
-            .await?;
+        let body = serde_json::json!({
+            "msg_type": "interactive",
+            "content": content,
+        });
 
-        let code = resp.pointer("/code").and_then(|v| v.as_i64()).unwrap_or(0);
-        if code != 0 {
-            anyhow::bail!("feishu: reply_card failed: {resp}");
+        for attempt in 0..2 {
+            let token = self.get_token().await;
+            let resp: serde_json::Value = self
+                .http
+                .post(format!(
+                    "{FEISHU_BASE_URL}/im/v1/messages/{message_id}/reply"
+                ))
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&body)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if attempt == 0 && Self::is_token_expired(&resp) {
+                self.refresh_token().await?;
+                continue;
+            }
+            if let Some(e) = Self::extract_api_error(&resp, "reply_card") {
+                return Err(e);
+            }
+            return Ok(Self::extract_message_id(&resp));
         }
-
-        let reply_msg_id = resp
-            .pointer("/data/message_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        Ok(reply_msg_id)
+        Ok(String::new())
     }
 
-    /// Upload an image and return the image_key.
     pub async fn upload_image(&self, image_bytes: Vec<u8>, file_name: &str) -> Result<String> {
-        let token = self.token.read().await.clone();
+        let token = self.get_token().await;
         let part = reqwest::multipart::Part::bytes(image_bytes)
             .file_name(file_name.to_string())
             .mime_str("application/octet-stream")?;
@@ -302,14 +426,13 @@ impl FeishuClient {
         Ok(image_key)
     }
 
-    /// Upload a file and return the file_key.
     pub async fn upload_file(
         &self,
         file_bytes: Vec<u8>,
         file_name: &str,
         file_type: &str,
     ) -> Result<String> {
-        let token = self.token.read().await.clone();
+        let token = self.get_token().await;
         let part = reqwest::multipart::Part::bytes(file_bytes)
             .file_name(file_name.to_string())
             .mime_str("application/octet-stream")?;
@@ -336,14 +459,13 @@ impl FeishuClient {
         Ok(file_key)
     }
 
-    /// Download a resource (image/file) from a user-sent message.
     pub async fn download_resource(
         &self,
         message_id: &str,
         file_key: &str,
         resource_type: &str,
     ) -> Result<Vec<u8>> {
-        let token = self.token.read().await.clone();
+        let token = self.get_token().await;
         let resp = self
             .http
             .get(format!(
@@ -359,21 +481,5 @@ impl FeishuClient {
             anyhow::bail!("feishu: download_resource failed ({}): {body}", status);
         }
         Ok(resp.bytes().await?.to_vec())
-    }
-
-    pub fn spawn_token_refresh(self: &Arc<Self>) {
-        let client = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = client.refresh_token().await {
-                    tracing::error!(
-                        target: "clawhive::channel::feishu",
-                        error = %e,
-                        "failed to refresh tenant_access_token"
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(100 * 60)).await;
-            }
-        });
     }
 }

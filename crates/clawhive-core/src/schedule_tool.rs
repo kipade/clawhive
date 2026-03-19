@@ -28,6 +28,16 @@ impl ScheduleTool {
             default_agent_id: DEFAULT_AGENT_ID.to_string(),
         }
     }
+
+    async fn check_ownership(&self, schedule_id: &str, ctx: &ToolContext) -> Option<ToolOutput> {
+        let agent_id = ctx.agent_id()?;
+        match self.manager.get_schedule(schedule_id).await {
+            Some(entry) if entry.config.agent_id != agent_id => {
+                Some(tool_error(format!("schedule not found: {schedule_id}")))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,9 +180,10 @@ impl ScheduleJobInput {
             name: self.name,
             description: self.description,
             schedule,
-            agent_id: self
-                .agent_id
-                .filter(|id| !id.trim().is_empty())
+            agent_id: ctx
+                .agent_id()
+                .map(String::from)
+                .or_else(|| self.agent_id.filter(|id| !id.trim().is_empty()))
                 .unwrap_or_else(|| default_agent_id.to_string()),
             session_mode,
             payload: Some(payload),
@@ -256,6 +267,10 @@ fn slug_from_name(name: &str) -> String {
     } else {
         slug
     }
+}
+
+fn is_owned_by(ctx: &ToolContext, schedule_agent_id: &str) -> bool {
+    ctx.agent_id().is_none_or(|aid| aid == schedule_agent_id)
 }
 
 fn tool_error(message: impl Into<String>) -> ToolOutput {
@@ -432,6 +447,7 @@ impl ToolExecutor for ScheduleTool {
                 let include_payload_summary = parsed.include_payload_summary.unwrap_or(false);
                 let summary = entries
                     .iter()
+                    .filter(|entry| is_owned_by(ctx, &entry.config.agent_id))
                     .map(|entry| {
                         let payload = entry.config.payload.as_ref();
                         serde_json::json!({
@@ -461,10 +477,9 @@ impl ToolExecutor for ScheduleTool {
                 };
 
                 let entries = self.manager.list().await;
-                let Some(entry) = entries
-                    .into_iter()
-                    .find(|e| e.config.schedule_id == schedule_id)
-                else {
+                let Some(entry) = entries.into_iter().find(|e| {
+                    e.config.schedule_id == schedule_id && is_owned_by(ctx, &e.config.agent_id)
+                }) else {
                     return Ok(tool_error(format!("schedule not found: {schedule_id}")));
                 };
 
@@ -517,6 +532,9 @@ impl ToolExecutor for ScheduleTool {
                     return Ok(tool_error("patch is required for update action"));
                 };
 
+                if let Some(err) = self.check_ownership(&schedule_id, ctx).await {
+                    return Ok(err);
+                }
                 self.manager.update_schedule(&schedule_id, &patch).await?;
                 Ok(tool_ok(format!("Updated schedule '{schedule_id}'")))
             }
@@ -525,6 +543,9 @@ impl ToolExecutor for ScheduleTool {
                     return Ok(tool_error("schedule_id is required for remove action"));
                 };
 
+                if let Some(err) = self.check_ownership(&schedule_id, ctx).await {
+                    return Ok(err);
+                }
                 self.manager.remove_schedule(&schedule_id).await?;
                 Ok(tool_ok(format!("Removed schedule '{schedule_id}'")))
             }
@@ -533,6 +554,9 @@ impl ToolExecutor for ScheduleTool {
                     return Ok(tool_error("schedule_id is required for run action"));
                 };
 
+                if let Some(err) = self.check_ownership(&schedule_id, ctx).await {
+                    return Ok(err);
+                }
                 self.manager.trigger_now(&schedule_id).await?;
                 Ok(tool_ok(format!(
                     "Triggered immediate run of '{schedule_id}'"
@@ -1064,6 +1088,167 @@ mod tests {
             entries[0].config.delivery.source_user_scope.as_deref(),
             Some("user:789")
         );
+    }
+
+    #[tokio::test]
+    async fn list_only_returns_schedules_owned_by_current_agent() {
+        let (manager, _bus, _tmp) = setup().await;
+        let tool = ScheduleTool::new(manager.clone());
+        let ctx_a = ToolContext::builtin().with_agent_id("agent-a");
+        tool.execute(
+            serde_json::json!({
+                "action": "add",
+                "job": {
+                    "name": "Agent A task",
+                    "schedule": { "kind": "every", "interval_ms": 60000 },
+                    "payload": { "kind": "agent_turn", "message": "a's work" }
+                }
+            }),
+            &ctx_a,
+        )
+        .await
+        .unwrap();
+
+        let ctx_b = ToolContext::builtin().with_agent_id("agent-b");
+        tool.execute(
+            serde_json::json!({
+                "action": "add",
+                "job": {
+                    "name": "Agent B task",
+                    "schedule": { "kind": "every", "interval_ms": 60000 },
+                    "payload": { "kind": "agent_turn", "message": "b's work" }
+                }
+            }),
+            &ctx_b,
+        )
+        .await
+        .unwrap();
+
+        let result_a = tool
+            .execute(serde_json::json!({ "action": "list" }), &ctx_a)
+            .await
+            .unwrap();
+        let list_a: serde_json::Value = serde_json::from_str(&result_a.content).unwrap();
+        assert_eq!(list_a.as_array().unwrap().len(), 1);
+        assert_eq!(list_a[0]["name"], "Agent A task");
+
+        let result_b = tool
+            .execute(serde_json::json!({ "action": "list" }), &ctx_b)
+            .await
+            .unwrap();
+        let list_b: serde_json::Value = serde_json::from_str(&result_b.content).unwrap();
+        assert_eq!(list_b.as_array().unwrap().len(), 1);
+        assert_eq!(list_b[0]["name"], "Agent B task");
+
+        let ctx_none = ToolContext::builtin();
+        let result_all = tool
+            .execute(serde_json::json!({ "action": "list" }), &ctx_none)
+            .await
+            .unwrap();
+        let list_all: serde_json::Value = serde_json::from_str(&result_all.content).unwrap();
+        assert_eq!(list_all.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn agent_cannot_get_or_modify_another_agents_schedule() {
+        let (manager, _bus, _tmp) = setup().await;
+        let tool = ScheduleTool::new(manager.clone());
+
+        let ctx_a = ToolContext::builtin().with_agent_id("agent-a");
+        tool.execute(
+            serde_json::json!({
+                "action": "add",
+                "job": {
+                    "name": "Private task",
+                    "schedule": { "kind": "every", "interval_ms": 60000 },
+                    "payload": { "kind": "agent_turn", "message": "secret" }
+                }
+            }),
+            &ctx_a,
+        )
+        .await
+        .unwrap();
+
+        let schedule_id = manager.list().await[0].config.schedule_id.clone();
+        let ctx_b = ToolContext::builtin().with_agent_id("agent-b");
+
+        let get = tool
+            .execute(
+                serde_json::json!({ "action": "get", "schedule_id": schedule_id }),
+                &ctx_b,
+            )
+            .await
+            .unwrap();
+        assert!(get.is_error);
+        assert!(get.content.contains("not found"));
+
+        let update = tool
+            .execute(
+                serde_json::json!({
+                    "action": "update",
+                    "schedule_id": schedule_id,
+                    "patch": { "enabled": false }
+                }),
+                &ctx_b,
+            )
+            .await
+            .unwrap();
+        assert!(update.is_error);
+        assert!(update.content.contains("not found"));
+
+        let remove = tool
+            .execute(
+                serde_json::json!({ "action": "remove", "schedule_id": schedule_id }),
+                &ctx_b,
+            )
+            .await
+            .unwrap();
+        assert!(remove.is_error);
+        assert!(remove.content.contains("not found"));
+
+        let run = tool
+            .execute(
+                serde_json::json!({ "action": "run", "schedule_id": schedule_id }),
+                &ctx_b,
+            )
+            .await
+            .unwrap();
+        assert!(run.is_error);
+        assert!(run.content.contains("not found"));
+
+        let get_a = tool
+            .execute(
+                serde_json::json!({ "action": "get", "schedule_id": schedule_id }),
+                &ctx_a,
+            )
+            .await
+            .unwrap();
+        assert!(!get_a.is_error);
+    }
+
+    #[tokio::test]
+    async fn add_action_uses_ctx_agent_id_over_input() {
+        let (manager, _bus, _tmp) = setup().await;
+        let tool = ScheduleTool::new(manager.clone());
+        let ctx = ToolContext::builtin().with_agent_id("real-agent");
+
+        tool.execute(
+            serde_json::json!({
+                "action": "add",
+                "job": {
+                    "name": "Spoofed task",
+                    "schedule": { "kind": "every", "interval_ms": 60000 },
+                    "payload": { "kind": "agent_turn", "message": "test" },
+                    "agent_id": "fake-agent"
+                }
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let entries = manager.list().await;
+        assert_eq!(entries[0].config.agent_id, "real-agent");
     }
 
     #[test]

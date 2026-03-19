@@ -56,6 +56,8 @@ pub struct ToolContext {
     session_key: String,
     skill_registry: Option<Arc<SkillRegistry>>,
     attachment_collector: Option<Arc<Mutex<Vec<Attachment>>>>,
+    /// The agent that is currently executing this tool
+    agent_id: Option<String>,
 }
 
 impl ToolContext {
@@ -78,6 +80,7 @@ impl ToolContext {
             session_key: String::new(),
             skill_registry: None,
             attachment_collector: None,
+            agent_id: None,
         }
     }
 
@@ -93,6 +96,7 @@ impl ToolContext {
             session_key: String::new(),
             skill_registry: None,
             attachment_collector: None,
+            agent_id: None,
         }
     }
 
@@ -110,6 +114,7 @@ impl ToolContext {
             session_key: String::new(),
             skill_registry: None,
             attachment_collector: None,
+            agent_id: None,
         }
     }
 
@@ -128,6 +133,7 @@ impl ToolContext {
             session_key: String::new(),
             skill_registry: None,
             attachment_collector: None,
+            agent_id: None,
         }
     }
 
@@ -146,6 +152,7 @@ impl ToolContext {
             session_key: String::new(),
             skill_registry: None,
             attachment_collector: None,
+            agent_id: None,
         }
     }
 
@@ -168,6 +175,7 @@ impl ToolContext {
             session_key: String::new(),
             skill_registry: None,
             attachment_collector: None,
+            agent_id: None,
         }
     }
 
@@ -187,6 +195,7 @@ impl ToolContext {
             session_key: String::new(),
             skill_registry: None,
             attachment_collector: None,
+            agent_id: None,
         }
     }
 
@@ -249,6 +258,11 @@ impl ToolContext {
         self
     }
 
+    pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
+        self.agent_id = Some(agent_id.into());
+        self
+    }
+
     // ============================================================
     // Accessors
     // ============================================================
@@ -289,6 +303,10 @@ impl ToolContext {
 
     pub fn attachment_collector(&self) -> Option<&Arc<Mutex<Vec<Attachment>>>> {
         self.attachment_collector.as_ref()
+    }
+
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
     }
 
     /// Get recent messages up to a limit.
