@@ -290,21 +290,7 @@ impl FeishuBot {
         let client = client.clone();
 
         tokio::spawn(async move {
-            let placeholder_id = match client
-                .reply_message_with_id(
-                    &message_id,
-                    "text",
-                    &serde_json::json!({"text": "⏳ Processing..."}).to_string(),
-                )
-                .await
-            {
-                Ok(id) if !id.is_empty() => Some(id),
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::warn!(target: "clawhive::channel::feishu", error = %e, "failed to send typing placeholder");
-                    None
-                }
-            };
+            let placeholder_id: Option<String> = None;
 
             match gw.handle_inbound(inbound).await {
                 Ok(outbound) => {
