@@ -1072,8 +1072,7 @@ impl Orchestrator {
             if attachment_blocks.is_empty() {
                 messages.push(LlmMessage::user(preprocessed));
             } else {
-                let mut content = vec![ContentBlock::Text { text: preprocessed }];
-                content.extend(attachment_blocks);
+                let content = build_user_content(preprocessed, attachment_blocks);
                 messages.push(LlmMessage {
                     role: "user".into(),
                     content,
@@ -1410,8 +1409,7 @@ impl Orchestrator {
             if attachment_blocks.is_empty() {
                 messages.push(LlmMessage::user(preprocessed));
             } else {
-                let mut content = vec![ContentBlock::Text { text: preprocessed }];
-                content.extend(attachment_blocks);
+                let content = build_user_content(preprocessed, attachment_blocks);
                 messages.push(LlmMessage {
                     role: "user".into(),
                     content,
@@ -2565,6 +2563,15 @@ fn is_text_mime(mime: &str) -> bool {
         || mime == "application/yaml"
         || mime == "application/toml"
         || mime == "application/x-sh"
+}
+
+fn build_user_content(text: String, attachment_blocks: Vec<ContentBlock>) -> Vec<ContentBlock> {
+    let mut content = Vec::with_capacity(1 + attachment_blocks.len());
+    if !text.is_empty() {
+        content.push(ContentBlock::Text { text });
+    }
+    content.extend(attachment_blocks);
+    content
 }
 
 fn build_attachment_blocks(attachments: &[clawhive_schema::Attachment]) -> Vec<ContentBlock> {

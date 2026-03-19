@@ -33,6 +33,9 @@ impl FeishuAdapter {
             "text" => serde_json::from_str::<FeishuTextContent>(&event.event.message.content)
                 .map(|c| c.text)
                 .unwrap_or_default(),
+            "post" => serde_json::from_str::<FeishuPostContent>(&event.event.message.content)
+                .map(|c| c.extract_text())
+                .unwrap_or_default(),
             "image" | "file" => String::new(),
             _ => event.event.message.content.clone(),
         };
@@ -411,23 +414,14 @@ impl FeishuBot {
         match msg.message_type.as_str() {
             "image" => {
                 if let Ok(img) = serde_json::from_str::<FeishuImageContent>(&msg.content) {
-                    match client
-                        .download_resource(&msg.message_id, &img.image_key, "image")
-                        .await
-                    {
-                        Ok(bytes) => {
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            attachments.push(Attachment {
-                                kind: AttachmentKind::Image,
-                                url: b64,
-                                mime_type: Some("image/png".to_string()),
-                                file_name: None,
-                                size: Some(bytes.len() as u64),
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!(target: "clawhive::channel::feishu", error = %e, "failed to download inbound image")
-                        }
+                    Self::download_image(client, &msg.message_id, &img.image_key, &mut attachments)
+                        .await;
+                }
+            }
+            "post" => {
+                if let Ok(post) = serde_json::from_str::<FeishuPostContent>(&msg.content) {
+                    for key in post.image_keys() {
+                        Self::download_image(client, &msg.message_id, &key, &mut attachments).await;
                     }
                 }
             }
@@ -457,6 +451,38 @@ impl FeishuBot {
         }
 
         attachments
+    }
+
+    async fn download_image(
+        client: &Arc<FeishuClient>,
+        message_id: &str,
+        image_key: &str,
+        attachments: &mut Vec<Attachment>,
+    ) {
+        match client
+            .download_resource(message_id, image_key, "image")
+            .await
+        {
+            Ok(bytes) => {
+                let mime = detect_image_mime(&bytes);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                attachments.push(Attachment {
+                    kind: AttachmentKind::Image,
+                    url: b64,
+                    mime_type: Some(mime.to_string()),
+                    file_name: None,
+                    size: Some(bytes.len() as u64),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "clawhive::channel::feishu",
+                    error = %e,
+                    image_key,
+                    "failed to download inbound image"
+                );
+            }
+        }
     }
 
     async fn handle_card_action(&self, event: &FeishuCardActionEvent, client: &Arc<FeishuClient>) {
@@ -649,6 +675,16 @@ impl crate::ChannelBot for FeishuBot {
     }
 }
 
+fn detect_image_mime(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0x89, 0x50, 0x4E, 0x47, ..] => "image/png",
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [0x47, 0x49, 0x46, 0x38, ..] => "image/gif",
+        [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x57, 0x45, 0x42, 0x50, ..] => "image/webp",
+        _ => "image/png",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,6 +698,41 @@ mod tests {
         assert_eq!(inbound.connector_id, "feishu-main");
         assert_eq!(inbound.conversation_scope, "chat:oc_chat1");
         assert_eq!(inbound.text, "hello world");
+    }
+
+    #[test]
+    fn adapter_to_inbound_post_extracts_text() {
+        let adapter = FeishuAdapter::new("feishu-main");
+        let mut event = make_test_event("oc_chat1", "ou_user1", "om_msg1", "");
+        event.event.message.message_type = "post".to_string();
+        event.event.message.content =
+            r#"{"title":"","content":[[{"tag":"text","text":"这是什么"}]]}"#.to_string();
+        let inbound = adapter.to_inbound(&event, vec![]);
+        assert_eq!(inbound.text, "这是什么");
+    }
+
+    #[test]
+    fn detect_jpeg_from_magic_bytes() {
+        assert_eq!(
+            detect_image_mime(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]),
+            "image/jpeg"
+        );
+    }
+
+    #[test]
+    fn detect_png_from_magic_bytes() {
+        assert_eq!(
+            detect_image_mime(&[0x89, 0x50, 0x4E, 0x47, 0x0D]),
+            "image/png"
+        );
+    }
+
+    #[test]
+    fn detect_webp_from_magic_bytes() {
+        let webp = [
+            0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
+        ];
+        assert_eq!(detect_image_mime(&webp), "image/webp");
     }
 
     fn make_test_event(chat_id: &str, user_id: &str, msg_id: &str, text: &str) -> FeishuEvent {

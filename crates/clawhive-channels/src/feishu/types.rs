@@ -69,6 +69,74 @@ pub struct FeishuFileContent {
     pub file_name: Option<String>,
 }
 
+/// Rich-text (post) message content.
+///
+/// Webhook format: `{"title":"...","content":[[{element},...],...]}`.
+#[derive(Debug, Deserialize)]
+pub struct FeishuPostContent {
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Paragraphs → each paragraph is a vec of inline elements.
+    #[serde(default)]
+    pub content: Vec<Vec<FeishuPostElement>>,
+}
+
+/// A single inline element inside a post paragraph.
+///
+/// Uses optional fields rather than a tagged enum so unknown tags are
+/// silently tolerated instead of causing a parse failure.
+#[derive(Debug, Deserialize)]
+pub struct FeishuPostElement {
+    pub tag: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub image_key: Option<String>,
+    #[serde(default)]
+    pub href: Option<String>,
+    #[serde(default)]
+    pub user_name: Option<String>,
+}
+
+impl FeishuPostContent {
+    /// Collect all human-readable text from the post, joining paragraphs with newlines.
+    pub fn extract_text(&self) -> String {
+        let mut paragraphs = Vec::new();
+        for para in &self.content {
+            let line: String = para
+                .iter()
+                .filter_map(|el| match el.tag.as_str() {
+                    "text" => el.text.clone(),
+                    "a" => el.text.clone(),
+                    "at" => el.user_name.as_ref().map(|n| format!("@{n}")),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if !line.is_empty() {
+                paragraphs.push(line);
+            }
+        }
+        let mut result = paragraphs.join("\n");
+        if let Some(title) = &self.title {
+            if !title.is_empty() {
+                result = format!("{title}\n{result}");
+            }
+        }
+        result
+    }
+
+    /// Collect all image_keys referenced in the post.
+    pub fn image_keys(&self) -> Vec<String> {
+        self.content
+            .iter()
+            .flatten()
+            .filter(|el| el.tag == "img")
+            .filter_map(|el| el.image_key.clone())
+            .collect()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FeishuCardActionEvent {
     pub schema: Option<String>,
@@ -202,6 +270,36 @@ mod tests {
     fn parse_file_content_without_name() {
         let c: FeishuFileContent = serde_json::from_str(r#"{"file_key": "file_abc123"}"#).unwrap();
         assert_eq!(c.file_name, None);
+    }
+
+    #[test]
+    fn post_extract_text_and_images() {
+        let raw = r#"{"title":"日报","content":[[{"tag":"text","text":"今天完成了"},{"tag":"a","href":"https://example.com","text":"这个链接"}],[{"tag":"img","image_key":"img_v3_abc"},{"tag":"text","text":"如图所示"}],[{"tag":"at","user_id":"ou_xxx","user_name":"张三"}]]}"#;
+        let post: FeishuPostContent = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(
+            post.extract_text(),
+            "日报\n今天完成了这个链接\n如图所示\n@张三"
+        );
+
+        let keys = post.image_keys();
+        assert_eq!(keys, vec!["img_v3_abc"]);
+    }
+
+    #[test]
+    fn post_text_only() {
+        let raw = r#"{"title":"","content":[[{"tag":"text","text":"hello world"}]]}"#;
+        let post: FeishuPostContent = serde_json::from_str(raw).unwrap();
+        assert_eq!(post.extract_text(), "hello world");
+        assert!(post.image_keys().is_empty());
+    }
+
+    #[test]
+    fn post_image_only() {
+        let raw = r#"{"content":[[{"tag":"img","image_key":"img_v3_xyz"}]]}"#;
+        let post: FeishuPostContent = serde_json::from_str(raw).unwrap();
+        assert_eq!(post.extract_text(), "");
+        assert_eq!(post.image_keys(), vec!["img_v3_xyz"]);
     }
 
     #[test]
