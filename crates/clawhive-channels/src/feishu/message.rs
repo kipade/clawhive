@@ -1,13 +1,22 @@
 use anyhow::Result;
 use clawhive_schema::{Attachment, AttachmentKind};
 
+const APPROVAL_CMD_MAX_CHARS: usize = 200;
+
 pub fn build_approval_card(agent_id: &str, command: &str, short_id: &str) -> serde_json::Value {
-    let (cmd_display, network_display) =
-        if let Some((cmd, target)) = command.split_once("\nNetwork: ") {
-            (cmd.to_string(), Some(target.to_string()))
-        } else {
-            (command.to_string(), None)
-        };
+    let (cmd_raw, network_display) = if let Some((cmd, target)) = command.split_once("\nNetwork: ")
+    {
+        (cmd.to_string(), Some(target.to_string()))
+    } else {
+        (command.to_string(), None)
+    };
+
+    let cmd_display = if cmd_raw.len() > APPROVAL_CMD_MAX_CHARS {
+        let end = cmd_raw.floor_char_boundary(APPROVAL_CMD_MAX_CHARS);
+        format!("{}…", &cmd_raw[..end])
+    } else {
+        cmd_raw
+    };
 
     let md_content = format!(
         "**Agent:** `{agent_id}`\n**Command:** `{cmd_display}`{}",
@@ -27,25 +36,41 @@ pub fn build_approval_card(agent_id: &str, command: &str, short_id: &str) -> ser
             "elements": [
                 { "tag": "markdown", "content": md_content },
                 {
-                    "tag": "action",
-                    "actions": [
+                    "tag": "column_set",
+                    "flex_mode": "flow",
+                    "columns": [
                         {
-                            "tag": "button",
-                            "text": { "tag": "plain_text", "content": "✅ Allow Once" },
-                            "type": "primary",
-                            "value": { "action": "approve_allow", "short_id": short_id }
+                            "tag": "column",
+                            "width": "auto",
+                            "weight": 1,
+                            "elements": [{
+                                "tag": "button",
+                                "text": { "tag": "plain_text", "content": "✅ Allow Once" },
+                                "type": "primary",
+                                "value": { "action": "approve_allow", "short_id": short_id }
+                            }]
                         },
                         {
-                            "tag": "button",
-                            "text": { "tag": "plain_text", "content": "🔓 Always Allow" },
-                            "type": "default",
-                            "value": { "action": "approve_always", "short_id": short_id }
+                            "tag": "column",
+                            "width": "auto",
+                            "weight": 1,
+                            "elements": [{
+                                "tag": "button",
+                                "text": { "tag": "plain_text", "content": "🔓 Always Allow" },
+                                "type": "default",
+                                "value": { "action": "approve_always", "short_id": short_id }
+                            }]
                         },
                         {
-                            "tag": "button",
-                            "text": { "tag": "plain_text", "content": "❌ Deny" },
-                            "type": "danger",
-                            "value": { "action": "approve_deny", "short_id": short_id }
+                            "tag": "column",
+                            "width": "auto",
+                            "weight": 1,
+                            "elements": [{
+                                "tag": "button",
+                                "text": { "tag": "plain_text", "content": "❌ Deny" },
+                                "type": "danger",
+                                "value": { "action": "approve_deny", "short_id": short_id }
+                            }]
                         }
                     ]
                 }
@@ -65,19 +90,30 @@ pub fn build_skill_confirm_card(skill_name: &str, token: &str) -> serde_json::Va
             "elements": [
                 { "tag": "markdown", "content": format!("Install skill **{skill_name}**?") },
                 {
-                    "tag": "action",
-                    "actions": [
+                    "tag": "column_set",
+                    "flex_mode": "flow",
+                    "columns": [
                         {
-                            "tag": "button",
-                            "text": { "tag": "plain_text", "content": format!("✅ Install {skill_name}") },
-                            "type": "primary",
-                            "value": { "action": "skill_confirm", "token": token }
+                            "tag": "column",
+                            "width": "auto",
+                            "weight": 1,
+                            "elements": [{
+                                "tag": "button",
+                                "text": { "tag": "plain_text", "content": format!("✅ Install {skill_name}") },
+                                "type": "primary",
+                                "value": { "action": "skill_confirm", "token": token }
+                            }]
                         },
                         {
-                            "tag": "button",
-                            "text": { "tag": "plain_text", "content": "❌ Cancel" },
-                            "type": "danger",
-                            "value": { "action": "skill_cancel", "token": token }
+                            "tag": "column",
+                            "width": "auto",
+                            "weight": 1,
+                            "elements": [{
+                                "tag": "button",
+                                "text": { "tag": "plain_text", "content": "❌ Cancel" },
+                                "type": "danger",
+                                "value": { "action": "skill_cancel", "token": token }
+                            }]
                         }
                     ]
                 }
@@ -306,14 +342,15 @@ mod tests {
         let card = build_approval_card("test-agent", "rm -rf /tmp", "abc123");
         let elements = card.pointer("/body/elements").unwrap().as_array().unwrap();
         assert_eq!(elements.len(), 2);
+        let columns = elements[1].pointer("/columns").unwrap().as_array().unwrap();
+        assert_eq!(columns.len(), 3);
         assert_eq!(
-            elements[1]
-                .pointer("/actions")
+            columns[0]
+                .pointer("/elements/0/tag")
                 .unwrap()
-                .as_array()
-                .unwrap()
-                .len(),
-            3
+                .as_str()
+                .unwrap(),
+            "button"
         );
     }
 
@@ -337,14 +374,15 @@ mod tests {
         let card = build_skill_confirm_card("weather", "tok_123");
         let elements = card.pointer("/body/elements").unwrap().as_array().unwrap();
         assert_eq!(elements.len(), 2);
+        let columns = elements[1].pointer("/columns").unwrap().as_array().unwrap();
+        assert_eq!(columns.len(), 2);
         assert_eq!(
-            elements[1]
-                .pointer("/actions")
+            columns[0]
+                .pointer("/elements/0/tag")
                 .unwrap()
-                .as_array()
-                .unwrap()
-                .len(),
-            2
+                .as_str()
+                .unwrap(),
+            "button"
         );
     }
 

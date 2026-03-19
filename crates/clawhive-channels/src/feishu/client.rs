@@ -225,6 +225,11 @@ impl FeishuClient {
             .json::<serde_json::Value>()
             .await?;
 
+        let code = resp.pointer("/code").and_then(|v| v.as_i64()).unwrap_or(0);
+        if code != 0 {
+            anyhow::bail!("feishu: send_card failed: {resp}");
+        }
+
         let message_id = resp
             .pointer("/data/message_id")
             .and_then(|v| v.as_str())
