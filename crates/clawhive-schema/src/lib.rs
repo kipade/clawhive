@@ -296,6 +296,8 @@ pub enum BusMessage {
         short_id: String,
         agent_id: String,
         command: String,
+        #[serde(default)]
+        network_target: Option<String>,
     },
     DeliverSkillConfirm {
         channel_type: String,
@@ -323,6 +325,94 @@ impl SessionKey {
             "{}:{}:{}:{}",
             msg.channel_type, msg.connector_id, msg.conversation_scope, msg.user_scope
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Approval display helpers (shared across channel adapters)
+// ---------------------------------------------------------------------------
+
+/// Maximum characters for command preview in approval messages.
+const APPROVAL_CMD_MAX_CHARS: usize = 200;
+
+/// Structured approval info ready for channel-specific rendering.
+#[derive(Debug, Clone)]
+pub struct ApprovalDisplay {
+    /// e.g. "Command Approval Required" or "Network Access Required"
+    pub title: String,
+    pub agent_id: String,
+    /// First token of the command (e.g. `curl`, `python3`)
+    pub program: String,
+    /// Truncated command string for display
+    pub command_preview: String,
+    /// Network target if this is a network approval
+    pub network_target: Option<String>,
+}
+
+impl ApprovalDisplay {
+    pub fn new(agent_id: &str, command: &str, network_target: Option<&str>) -> Self {
+        let program = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .to_string();
+
+        let command_preview = if command.len() > APPROVAL_CMD_MAX_CHARS {
+            let end = command.floor_char_boundary(APPROVAL_CMD_MAX_CHARS);
+            format!("{}…", &command[..end])
+        } else {
+            command.to_string()
+        };
+
+        let title = if network_target.is_some() {
+            "Network Access Required".to_string()
+        } else {
+            "Command Approval Required".to_string()
+        };
+
+        Self {
+            title,
+            agent_id: agent_id.to_string(),
+            program,
+            command_preview,
+            network_target: network_target.map(|s| s.to_string()),
+        }
+    }
+
+    /// Format as Discord/generic Markdown.
+    pub fn to_markdown(&self) -> String {
+        let mut s = format!(
+            "⚠️ **{}**\n**Agent:** `{}`\n**Program:** `{}`",
+            self.title, self.agent_id, self.program
+        );
+        if let Some(ref target) = self.network_target {
+            s.push_str(&format!("\n**Target:** `{target}`"));
+        }
+        s.push_str(&format!("\n**Command:** `{}`", self.command_preview));
+        s
+    }
+
+    /// Format as Telegram HTML.
+    pub fn to_html(&self) -> String {
+        fn esc(s: &str) -> String {
+            s.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        }
+        let mut s = format!(
+            "⚠️ <b>{}</b>\n<b>Agent:</b> <code>{}</code>\n<b>Program:</b> <code>{}</code>",
+            esc(&self.title),
+            esc(&self.agent_id),
+            esc(&self.program),
+        );
+        if let Some(ref target) = self.network_target {
+            s.push_str(&format!("\n<b>Target:</b> <code>{}</code>", esc(target)));
+        }
+        s.push_str(&format!(
+            "\n<b>Command:</b> <code>{}</code>",
+            esc(&self.command_preview)
+        ));
+        s
     }
 }
 
@@ -641,5 +731,54 @@ mod tests {
         assert!(
             matches!(back, ScheduledTaskPayload::AgentTurn { message, .. } if message == "do task")
         );
+    }
+
+    #[test]
+    fn approval_display_exec_command() {
+        let d = ApprovalDisplay::new("agent-1", "rm -rf /tmp", None);
+        assert_eq!(d.title, "Command Approval Required");
+        assert_eq!(d.program, "rm");
+        assert_eq!(d.command_preview, "rm -rf /tmp");
+        assert!(d.network_target.is_none());
+    }
+
+    #[test]
+    fn approval_display_network() {
+        let d = ApprovalDisplay::new(
+            "agent-1",
+            "curl https://example.com",
+            Some("example.com:443"),
+        );
+        assert_eq!(d.title, "Network Access Required");
+        assert_eq!(d.program, "curl");
+        assert!(d.network_target.as_deref() == Some("example.com:443"));
+    }
+
+    #[test]
+    fn approval_display_truncates_long_command() {
+        let long_cmd = format!("python3 {}", "x".repeat(300));
+        let d = ApprovalDisplay::new("agent-1", &long_cmd, None);
+        assert!(d.command_preview.len() < 210);
+        assert!(d.command_preview.ends_with('…'));
+        assert_eq!(d.program, "python3");
+    }
+
+    #[test]
+    fn approval_display_markdown_format() {
+        let d = ApprovalDisplay::new("agent-1", "curl https://api.com/data", Some("api.com:443"));
+        let md = d.to_markdown();
+        assert!(md.contains("**Network Access Required**"));
+        assert!(md.contains("**Program:** `curl`"));
+        assert!(md.contains("**Target:** `api.com:443`"));
+        assert!(md.contains("**Command:**"));
+    }
+
+    #[test]
+    fn approval_display_html_escapes() {
+        let d = ApprovalDisplay::new("agent<x>", "echo '<tag>'", None);
+        let html = d.to_html();
+        assert!(html.contains("agent&lt;x&gt;"));
+        assert!(html.contains("&lt;tag&gt;"));
+        assert!(!html.contains("<tag>"));
     }
 }

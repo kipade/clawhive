@@ -299,6 +299,16 @@ pub async fn start_whatsapp(
 
                         let _ = client.chatstate().send_composing(&info.source.chat).await;
 
+                        let agent_id = gateway.resolve_agent(&inbound);
+                        let agent_emoji = gateway
+                            .orchestrator()
+                            .config_view()
+                            .agents
+                            .get(&agent_id)
+                            .and_then(|a| a.identity.as_ref())
+                            .and_then(|i| i.emoji.clone());
+                        let prefix = build_bot_prefix(agent_emoji.as_deref());
+
                         match gateway.handle_inbound(inbound).await {
                             Ok(outbound) => {
                                 let _ = client.chatstate().send_paused(&info.source.chat).await;
@@ -310,10 +320,12 @@ pub async fn start_whatsapp(
                                     return;
                                 }
 
+                                let prefixed_text = format!("{prefix}{}", outbound.text);
+
                                 if has_attachments {
                                     for (i, att) in outbound.attachments.iter().enumerate() {
                                         let caption = if i == 0 && has_text {
-                                            Some(outbound.text.as_str())
+                                            Some(prefixed_text.as_str())
                                         } else {
                                             None
                                         };
@@ -345,7 +357,7 @@ pub async fn start_whatsapp(
 
                                 if has_text && !has_attachments {
                                     let reply = wa::Message {
-                                        conversation: Some(outbound.text),
+                                        conversation: Some(prefixed_text),
                                         ..Default::default()
                                     };
                                     if let Err(e) =
@@ -444,6 +456,13 @@ fn parse_chat_jid(conversation_scope: &str) -> Option<&str> {
     conversation_scope.strip_prefix("chat:")
 }
 
+fn build_bot_prefix(emoji: Option<&str>) -> String {
+    match emoji {
+        Some(e) => format!("{e} "),
+        None => "[Bot] ".to_string(),
+    }
+}
+
 async fn spawn_action_listener(bus: Arc<EventBus>, connector_id: String, client: Arc<Client>) {
     let mut rx = bus.subscribe(Topic::ActionReady).await;
     while let Some(msg) = rx.recv().await {
@@ -474,8 +493,9 @@ async fn spawn_action_listener(bus: Arc<EventBus>, connector_id: String, client:
             }
             ActionKind::Edit { ref new_text } => {
                 if let Some(ref original_id) = action.message_id {
+                    let fallback_prefix = build_bot_prefix(None);
                     let edit_msg = wa::Message {
-                        conversation: Some(new_text.clone()),
+                        conversation: Some(format!("{fallback_prefix}{new_text}")),
                         ..Default::default()
                     };
                     if let Err(e) = client
@@ -536,8 +556,9 @@ async fn spawn_delivery_listener(bus: Arc<EventBus>, connector_id: String, clien
             continue;
         };
 
+        let fallback_prefix = build_bot_prefix(None);
         let message = wa::Message {
-            conversation: Some(text.clone()),
+            conversation: Some(format!("{fallback_prefix}{text}")),
             ..Default::default()
         };
         if let Err(e) = client.send_message(chat_jid, message).await {
@@ -832,5 +853,16 @@ mod tests {
         env::set_current_dir(old_dir).expect("restore cwd");
         fs::remove_dir_all(&temp_dir).expect("cleanup temp dir");
         assert_eq!(result.expect("read bytes"), b"hello");
+    }
+
+    #[test]
+    fn build_bot_prefix_with_emoji() {
+        assert_eq!(build_bot_prefix(Some("🐝")), "🐝 ");
+        assert_eq!(build_bot_prefix(Some("🤖")), "🤖 ");
+    }
+
+    #[test]
+    fn build_bot_prefix_without_emoji() {
+        assert_eq!(build_bot_prefix(None), "[Bot] ");
     }
 }

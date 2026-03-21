@@ -3,8 +3,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use clawhive_bus::{EventBus, Topic};
 use clawhive_gateway::Gateway;
-use clawhive_schema::BusMessage;
 use clawhive_schema::{ActionKind, Attachment, AttachmentKind, InboundMessage, OutboundMessage};
+use clawhive_schema::{ApprovalDisplay, BusMessage};
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -707,6 +707,7 @@ async fn spawn_approval_listener(
             short_id,
             agent_id,
             command,
+            network_target,
         } = msg
         else {
             continue;
@@ -734,7 +735,8 @@ async fn spawn_approval_listener(
             continue;
         };
 
-        let text = approval_request_html(&agent_id, &command);
+        let display = ApprovalDisplay::new(&agent_id, &command, network_target.as_deref());
+        let text = display.to_html();
 
         let keyboard = InlineKeyboardMarkup::new(vec![vec![
             InlineKeyboardButton::callback("✅ Allow Once", format!("approve:{short_id}:allow")),
@@ -751,22 +753,6 @@ async fn spawn_approval_listener(
         {
             tracing::error!("Failed to send approval keyboard to Telegram: {e}");
         }
-    }
-}
-
-fn approval_request_html(agent_id: &str, command: &str) -> String {
-    let safe_agent_id = escape_html(agent_id);
-    if let Some((cmd, target)) = command.split_once("\nNetwork: ") {
-        let safe_cmd = escape_html(cmd);
-        let safe_target = escape_html(target);
-        format!(
-            "⚠️ <b>Approval Required</b>\nAgent: <code>{safe_agent_id}</code>\nCommand: <code>{safe_cmd}</code>\nNetwork: <code>{safe_target}</code>"
-        )
-    } else {
-        let safe_command = escape_html(command);
-        format!(
-            "⚠️ <b>Command Approval Required</b>\nAgent: <code>{safe_agent_id}</code>\nCommand: <code>{safe_command}</code>"
-        )
     }
 }
 
@@ -1638,13 +1624,14 @@ mod tests {
 
     #[test]
     fn approval_html_escapes_untrusted_command_and_agent() {
-        let command = "python3 - <<'PY'\nprint('<tag>')\nPY\nNetwork: example.com:443";
-        let html = approval_request_html("agent<one>", command);
+        let command = "python3 - <<'PY'\nprint('<tag>')\nPY";
+        let display = ApprovalDisplay::new("agent<one>", command, Some("example.com:443"));
+        let html = display.to_html();
 
-        assert!(html.contains("<b>Approval Required</b>"));
+        assert!(html.contains("<b>Network Access Required</b>"));
         assert!(html.contains("agent&lt;one&gt;"));
-        assert!(html.contains("&lt;'PY'"));
-        assert!(html.contains("&lt;tag&gt;"));
+        assert!(html.contains("<b>Program:</b> <code>python3</code>"));
+        assert!(html.contains("<b>Target:</b> <code>example.com:443</code>"));
         assert!(!html.contains("<'PY'"));
     }
 

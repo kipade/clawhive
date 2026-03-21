@@ -22,8 +22,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ErrorState } from "@/components/ui/error-state";
-
-const EMOJI_OPTIONS = ["🐝", "🤖", "🧠", "⚡", "🚀", "💡", "🌿", "🔥"];
+import { EMOJI_OPTIONS } from "@/lib/constants";
 
 // ---------------------------------------------------------------------------
 // New Agent Dialog
@@ -104,7 +103,7 @@ function NewAgentDialog() {
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
               Emoji
             </label>
-            <div className="mt-1.5 flex gap-1.5">
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
               {EMOJI_OPTIONS.map((e) => (
                 <button
                   key={e}

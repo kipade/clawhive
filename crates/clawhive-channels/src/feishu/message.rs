@@ -1,35 +1,20 @@
 use anyhow::Result;
-use clawhive_schema::{Attachment, AttachmentKind};
+use clawhive_schema::{ApprovalDisplay, Attachment, AttachmentKind};
 
-const APPROVAL_CMD_MAX_CHARS: usize = 200;
-
-pub fn build_approval_card(agent_id: &str, command: &str, short_id: &str) -> serde_json::Value {
-    let (cmd_raw, network_display) = if let Some((cmd, target)) = command.split_once("\nNetwork: ")
-    {
-        (cmd.to_string(), Some(target.to_string()))
-    } else {
-        (command.to_string(), None)
-    };
-
-    let cmd_display = if cmd_raw.len() > APPROVAL_CMD_MAX_CHARS {
-        let end = cmd_raw.floor_char_boundary(APPROVAL_CMD_MAX_CHARS);
-        format!("{}…", &cmd_raw[..end])
-    } else {
-        cmd_raw
-    };
-
-    let md_content = format!(
-        "**Agent:** `{agent_id}`\n**Command:** `{cmd_display}`{}",
-        network_display
-            .as_ref()
-            .map(|t| format!("\n**Network:** `{t}`"))
-            .unwrap_or_default()
+pub fn build_approval_card(display: &ApprovalDisplay, short_id: &str) -> serde_json::Value {
+    let mut md_content = format!(
+        "**Agent:** `{}`\n**Program:** `{}`",
+        display.agent_id, display.program,
     );
+    if let Some(ref target) = display.network_target {
+        md_content.push_str(&format!("\n**Target:** `{target}`"));
+    }
+    md_content.push_str(&format!("\n**Command:** `{}`", display.command_preview));
 
     serde_json::json!({
         "schema": "2.0",
         "header": {
-            "title": { "tag": "plain_text", "content": "⚠️ Command Approval Required" },
+            "title": { "tag": "plain_text", "content": format!("⚠️ {}", display.title) },
             "template": "orange"
         },
         "body": {
@@ -339,7 +324,8 @@ mod tests {
 
     #[test]
     fn build_approval_card_structure() {
-        let card = build_approval_card("test-agent", "rm -rf /tmp", "abc123");
+        let display = ApprovalDisplay::new("test-agent", "rm -rf /tmp", None);
+        let card = build_approval_card(&display, "abc123");
         let elements = card.pointer("/body/elements").unwrap().as_array().unwrap();
         assert_eq!(elements.len(), 2);
         let columns = elements[1].pointer("/columns").unwrap().as_array().unwrap();
@@ -352,21 +338,36 @@ mod tests {
                 .unwrap(),
             "button"
         );
+        let content = card
+            .pointer("/body/elements/0/content")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(content.contains("Program:"));
+        assert!(content.contains("`rm`"));
     }
 
     #[test]
     fn build_approval_card_with_network() {
-        let card = build_approval_card(
+        let display = ApprovalDisplay::new(
             "test-agent",
-            "curl api.example.com\nNetwork: api.example.com:443",
-            "abc123",
+            "curl api.example.com",
+            Some("api.example.com:443"),
         );
-        assert!(card
+        let card = build_approval_card(&display, "abc123");
+        let content = card
             .pointer("/body/elements/0/content")
             .unwrap()
             .as_str()
+            .unwrap();
+        assert!(content.contains("Target:"));
+        assert!(content.contains("api.example.com:443"));
+        let title = card
+            .pointer("/header/title/content")
             .unwrap()
-            .contains("Network:"));
+            .as_str()
+            .unwrap();
+        assert!(title.contains("Network Access Required"));
     }
 
     #[test]

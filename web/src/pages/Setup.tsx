@@ -34,6 +34,7 @@ import {
 } from "lucide-react";
 
 import { toast } from "sonner";
+import { EMOJI_OPTIONS } from "@/lib/constants";
 
 const STEP_LABELS = ["Provider", "Agent", "Channel", "Tools", "Launch"];
 
@@ -788,7 +789,6 @@ function StepProvider({
 // ---------------------------------------------------------------------------
 // Step 2: Agent
 // ---------------------------------------------------------------------------
-const EMOJI_OPTIONS = ["\u{1F980}", "\u{1F916}", "\u{1F9E0}", "\u{26A1}", "\u{1F680}", "\u{1F4A1}", "\u{1F33F}", "\u{1F525}"];
 
 function StepAgent({
   agentId,
@@ -871,7 +871,7 @@ function StepAgent({
           <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
             Emoji
           </label>
-          <div className="mt-1.5 flex gap-1.5">
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
             {EMOJI_OPTIONS.map((e) => (
               <button
                 key={e}

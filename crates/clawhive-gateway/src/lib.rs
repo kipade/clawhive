@@ -960,11 +960,6 @@ pub fn spawn_approval_delivery_listener(bus: Arc<EventBus>) -> tokio::task::Join
             );
 
             let short_id = trace_id.to_string()[..8].to_string();
-            let command = if let Some(target) = network_target {
-                format!("{command}\nNetwork: {target}")
-            } else {
-                command
-            };
 
             let _ = publisher
                 .publish(BusMessage::DeliverApprovalRequest {
@@ -974,6 +969,7 @@ pub fn spawn_approval_delivery_listener(bus: Arc<EventBus>) -> tokio::task::Join
                     short_id,
                     agent_id,
                     command,
+                    network_target,
                 })
                 .await;
         }

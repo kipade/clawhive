@@ -68,6 +68,7 @@ pub fn spawn_approval_listener(
                 short_id,
                 agent_id,
                 command,
+                network_target,
             } = msg
             else {
                 continue;
@@ -83,7 +84,12 @@ pub fn spawn_approval_listener(
             }
 
             let chat_id = conversation_scope.trim_start_matches("chat:");
-            let card = build_approval_card(&agent_id, &command, &short_id);
+            let display = clawhive_schema::ApprovalDisplay::new(
+                &agent_id,
+                &command,
+                network_target.as_deref(),
+            );
+            let card = build_approval_card(&display, &short_id);
 
             tracing::info!(
                 target: "clawhive::channel::feishu",

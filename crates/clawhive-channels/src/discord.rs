@@ -3,7 +3,9 @@ use std::sync::Arc;
 use chrono::Utc;
 use clawhive_bus::{EventBus, Topic};
 use clawhive_gateway::Gateway;
-use clawhive_schema::{Attachment, AttachmentKind, BusMessage, InboundMessage, OutboundMessage};
+use clawhive_schema::{
+    ApprovalDisplay, Attachment, AttachmentKind, BusMessage, InboundMessage, OutboundMessage,
+};
 use serenity::all::{
     ButtonStyle, ChannelId, Client, Command, CommandInteraction, CommandOptionType,
     ComponentInteraction, Context, CreateActionRow, CreateAttachment, CreateButton, CreateCommand,
@@ -781,6 +783,7 @@ async fn spawn_approval_listener(
             short_id,
             agent_id,
             command,
+            network_target,
         } = msg
         else {
             continue;
@@ -815,13 +818,8 @@ async fn spawn_approval_listener(
             continue;
         };
 
-        let text = if let Some((cmd, target)) = command.split_once("\nNetwork: ") {
-            format!(
-                "⚠️ **Approval Required**\nAgent: `{agent_id}`\nCommand: `{cmd}`\nNetwork: `{target}`"
-            )
-        } else {
-            format!("⚠️ **Command Approval Required**\nAgent: `{agent_id}`\nCommand: `{command}`")
-        };
+        let display = ApprovalDisplay::new(&agent_id, &command, network_target.as_deref());
+        let text = display.to_markdown();
 
         let buttons = CreateActionRow::Buttons(vec![
             CreateButton::new(format!("approve:{short_id}:allow"))

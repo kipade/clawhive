@@ -386,6 +386,7 @@ mod tests {
                     short_id: "abc12345".into(),
                     agent_id: "agent-1".into(),
                     command: "echo ok".into(),
+                    network_target: None,
                 },
                 Topic::DeliverApprovalRequest,
             ),
