@@ -200,6 +200,10 @@ export function AddConnectorDialog({ kind, label, onAdded }: AddConnectorDialogP
                   )}
                 />
               </>
+            ) : kind === "weixin" ? (
+              <p className="text-sm text-muted-foreground py-2">
+                No credentials needed. After adding, use the QR Login button to scan with WeChat.
+              </p>
             ) : (
               <FormField
                 control={form.control}
