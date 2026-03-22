@@ -69,7 +69,7 @@ async fn make_orchestrator(
     let bus = Arc::new(EventBus::new(16));
     let publisher = bus.publisher();
     let file_store = MemoryFileStore::new(tmp.path());
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "test-agent");
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let schedule_manager = Arc::new(
         ScheduleManager::new(

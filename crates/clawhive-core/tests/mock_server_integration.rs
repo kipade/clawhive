@@ -107,7 +107,7 @@ async fn make_orchestrator_with_provider(
     );
     let publisher = bus.publisher();
     let file_store = MemoryFileStore::new(tmp.path());
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "test-agent");
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let personas = HashMap::new();
     let tool_registry = build_tool_registry(

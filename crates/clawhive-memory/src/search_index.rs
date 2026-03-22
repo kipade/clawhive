@@ -12,6 +12,7 @@ use crate::session::{SessionEntry, SessionReader};
 #[derive(Clone)]
 pub struct SearchIndex {
     db: Arc<Mutex<Connection>>,
+    agent_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -26,8 +27,11 @@ pub struct SearchResult {
 }
 
 impl SearchIndex {
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
-        Self { db }
+    pub fn new(db: Arc<Mutex<Connection>>, agent_id: impl Into<String>) -> Self {
+        Self {
+            db,
+            agent_id: agent_id.into(),
+        }
     }
 
     pub fn ensure_vec_table(&self, dimensions: usize) -> Result<()> {
@@ -122,20 +126,24 @@ impl SearchIndex {
             let now_ts = chrono::Utc::now().timestamp();
             let size = content.len() as i64;
             let model_id = provider.model_id().to_owned();
+            let agent_id = self.agent_id.clone();
             task::spawn_blocking(move || {
                 let conn = db
                     .lock()
                     .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
                 let tx = conn.unchecked_transaction()?;
                 tx.execute(
-                    "DELETE FROM chunks_fts WHERE path = ?1",
-                    params![path_owned],
+                    "DELETE FROM chunks_fts WHERE path = ?1 AND id IN (SELECT id FROM chunks WHERE path = ?1 AND agent_id = ?2)",
+                    params![path_owned, agent_id],
                 )?;
                 tx.execute(
-                    "DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?1)",
-                    params![path_owned],
+                    "DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?1 AND agent_id = ?2)",
+                    params![path_owned, agent_id],
                 )?;
-                tx.execute("DELETE FROM chunks WHERE path = ?1", params![path_owned])?;
+                tx.execute(
+                    "DELETE FROM chunks WHERE path = ?1 AND agent_id = ?2",
+                    params![path_owned, agent_id],
+                )?;
                 tx.execute(
                     r#"
                     INSERT INTO files(path, source, hash, mtime, size)
@@ -259,25 +267,32 @@ impl SearchIndex {
         let source_owned = source.to_owned();
         let file_hash_for_write = change_hash.to_owned();
         let model_id = provider.model_id().to_owned();
+        let agent_id = self.agent_id.clone();
         task::spawn_blocking(move || {
             let conn = db
                 .lock()
                 .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
             let tx = conn.unchecked_transaction()?;
 
-            tx.execute("DELETE FROM chunks_fts WHERE path = ?1", params![path_owned])?;
             tx.execute(
-                "DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?1)",
-                params![path_owned],
+                "DELETE FROM chunks_fts WHERE path = ?1 AND id IN (SELECT id FROM chunks WHERE path = ?1 AND agent_id = ?2)",
+                params![path_owned, agent_id],
             )?;
-            tx.execute("DELETE FROM chunks WHERE path = ?1", params![path_owned])?;
+            tx.execute(
+                "DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?1 AND agent_id = ?2)",
+                params![path_owned, agent_id],
+            )?;
+            tx.execute(
+                "DELETE FROM chunks WHERE path = ?1 AND agent_id = ?2",
+                params![path_owned, agent_id],
+            )?;
 
             for (chunk_id, start_line, end_line, hash, model, text, embedding) in rows {
                 tx.execute(
                     r#"
                     INSERT INTO chunks(
-                        id, path, source, start_line, end_line, hash, model, text, embedding, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                        id, path, source, start_line, end_line, hash, model, text, embedding, updated_at, agent_id
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                     "#,
                     params![
                         chunk_id,
@@ -289,7 +304,8 @@ impl SearchIndex {
                         model,
                         text,
                         embedding,
-                        now_ts
+                        now_ts,
+                        agent_id
                     ],
                 )?;
                 tx.execute(
@@ -421,6 +437,7 @@ impl SearchIndex {
             sessions.iter().map(|id| format!("sessions/{id}")).collect();
 
         let db = Arc::clone(&self.db);
+        let agent_id = self.agent_id.clone();
         task::spawn_blocking(move || {
             let conn = db
                 .lock()
@@ -435,14 +452,20 @@ impl SearchIndex {
 
             for path in indexed_paths {
                 if !active_paths.contains(&path) {
-                    tracing::info!(path = %path, "removing stale session index");
+                    tracing::info!(path = %path, agent_id = %agent_id, "removing stale session index");
                     let tx = conn.unchecked_transaction()?;
-                    tx.execute("DELETE FROM chunks_fts WHERE path = ?1", params![&path])?;
                     tx.execute(
-                        "DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?1)",
-                        params![&path],
+                        "DELETE FROM chunks_fts WHERE id IN (SELECT id FROM chunks WHERE path = ?1 AND agent_id = ?2)",
+                        params![&path, &agent_id],
                     )?;
-                    tx.execute("DELETE FROM chunks WHERE path = ?1", params![&path])?;
+                    tx.execute(
+                        "DELETE FROM chunks_vec WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?1 AND agent_id = ?2)",
+                        params![&path, &agent_id],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM chunks WHERE path = ?1 AND agent_id = ?2",
+                        params![&path, &agent_id],
+                    )?;
                     tx.execute("DELETE FROM files WHERE path = ?1", params![&path])?;
                     tx.commit()?;
                 }
@@ -526,6 +549,7 @@ impl SearchIndex {
             let query_embedding_json = embedding_to_json(&query_embedding_for_vec);
 
             let db = Arc::clone(&self.db);
+            let agent_id = self.agent_id.clone();
             vector_candidates = task::spawn_blocking(move || {
             let conn = db
                 .lock()
@@ -540,6 +564,9 @@ impl SearchIndex {
                 .unwrap_or(false);
 
             if has_vec_table {
+                // vec0 virtual tables don't support arbitrary WHERE on joined tables,
+                // so we over-fetch and post-filter by agent_id.
+                let over_fetch_limit = candidate_limit * 4;
                 let mut stmt = conn.prepare(
                     r#"
                     SELECT v.chunk_id, c.path, c.source, c.start_line, c.end_line, c.text, v.distance
@@ -548,7 +575,7 @@ impl SearchIndex {
                     WHERE v.embedding MATCH ?1 AND k = ?2
                     "#,
                 )?;
-                let rows = stmt.query_map(params![query_embedding_json, candidate_limit as i64], |r| {
+                let rows = stmt.query_map(params![query_embedding_json, over_fetch_limit as i64], |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
@@ -560,11 +587,37 @@ impl SearchIndex {
                     ))
                 })?;
 
-                let mut out = Vec::new();
+                // Collect chunk IDs from vec results, then filter by agent_id
+                let mut vec_results = Vec::new();
                 for row in rows {
-                    let (chunk_id, path, source, start_line, end_line, text, distance) = row?;
-                    let score = (1.0_f64 - distance).max(0.0_f64);
-                    out.push((chunk_id, path, source, start_line, end_line, text, score));
+                    vec_results.push(row?);
+                }
+
+                // Batch-check agent_id for returned chunk IDs
+                let chunk_ids: Vec<&str> = vec_results.iter().map(|r| r.0.as_str()).collect();
+                let owned_agent_ids = if chunk_ids.is_empty() {
+                    std::collections::HashMap::new()
+                } else {
+                    let placeholders: String = chunk_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let sql = format!("SELECT id, agent_id FROM chunks WHERE id IN ({placeholders})");
+                    let mut lookup_stmt = conn.prepare(&sql)?;
+                    let lookup_rows = lookup_stmt.query_map(rusqlite::params_from_iter(&chunk_ids), |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?;
+                    let mut map = std::collections::HashMap::new();
+                    for lr in lookup_rows {
+                        let (id, aid) = lr?;
+                        map.insert(id, aid);
+                    }
+                    map
+                };
+
+                let mut out = Vec::new();
+                for (chunk_id, path, source, start_line, end_line, text, distance) in vec_results {
+                    if owned_agent_ids.get(&chunk_id) == Some(&agent_id) {
+                        let score = (1.0_f64 - distance).max(0.0_f64);
+                        out.push((chunk_id, path, source, start_line, end_line, text, score));
+                    }
                 }
                 out.sort_by(|a, b| b.6.total_cmp(&a.6));
                 out.truncate(candidate_limit);
@@ -574,9 +627,9 @@ impl SearchIndex {
             }
 
             let mut stmt = conn.prepare(
-                "SELECT id, path, source, start_line, end_line, text, embedding FROM chunks",
+                "SELECT id, path, source, start_line, end_line, text, embedding FROM chunks WHERE agent_id = ?1",
             )?;
-            let rows = stmt.query_map([], |r| {
+            let rows = stmt.query_map(params![agent_id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -623,21 +676,23 @@ impl SearchIndex {
             Vec::new()
         } else {
             let db = Arc::clone(&self.db);
+            let agent_id = self.agent_id.clone();
             match task::spawn_blocking(move || {
                 let conn = db
                     .lock()
                     .map_err(|_| anyhow!("failed to lock sqlite connection"))?;
                 let mut stmt = conn.prepare(
                     r#"
-                    SELECT id, path, source, start_line, end_line, text, bm25(chunks_fts) AS rank
-                    FROM chunks_fts
-                    WHERE chunks_fts MATCH ?1
+                    SELECT f.id, c.path, c.source, c.start_line, c.end_line, c.text, bm25(chunks_fts) AS rank
+                    FROM chunks_fts f
+                    JOIN chunks c ON c.id = f.id
+                    WHERE chunks_fts MATCH ?1 AND c.agent_id = ?2
                     ORDER BY rank
-                    LIMIT ?2
+                    LIMIT ?3
                     "#,
                 )?;
                 let rows =
-                    stmt.query_map(params![safe_fts_query, candidate_limit as i64], |r| {
+                    stmt.query_map(params![safe_fts_query, agent_id, candidate_limit as i64], |r| {
                         Ok((
                             r.get::<_, String>(0)?,
                             r.get::<_, String>(1)?,
@@ -1030,7 +1085,7 @@ mod tests {
     #[tokio::test]
     async fn index_file_creates_chunks() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         let count = index
@@ -1052,7 +1107,7 @@ mod tests {
     #[tokio::test]
     async fn index_file_skips_unchanged() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         let first = index
@@ -1070,7 +1125,7 @@ mod tests {
     #[tokio::test]
     async fn index_file_reindexes_changed() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index
@@ -1100,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn index_file_populates_fts() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index
@@ -1125,7 +1180,7 @@ mod tests {
     #[tokio::test]
     async fn index_file_stores_embeddings() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index
@@ -1151,7 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn reuse_ignores_different_model_embeddings() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let first_provider = NamedStubEmbeddingProvider::new(8, "stub-a", 1.0);
         let second_provider = NamedStubEmbeddingProvider::new(8, "stub-b", 2.0);
         let content = "# Shared\n\nchunk text reused across models";
@@ -1204,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn search_bm25_only() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(db);
+        let index = SearchIndex::new(db, "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index
@@ -1224,7 +1279,7 @@ mod tests {
     #[tokio::test]
     async fn search_hybrid_returns_results() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(db);
+        let index = SearchIndex::new(db, "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index
@@ -1245,7 +1300,7 @@ mod tests {
     #[tokio::test]
     async fn search_respects_min_score() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(db);
+        let index = SearchIndex::new(db, "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index
@@ -1266,7 +1321,7 @@ mod tests {
     #[tokio::test]
     async fn search_respects_max_results() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(db);
+        let index = SearchIndex::new(db, "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         for i in 0..10 {
@@ -1285,7 +1340,7 @@ mod tests {
     #[tokio::test]
     async fn search_uses_vec_index() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index.ensure_vec_table(provider.dimensions())?;
@@ -1318,7 +1373,7 @@ mod tests {
     #[tokio::test]
     async fn search_empty_index_returns_empty() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(db);
+        let index = SearchIndex::new(db, "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         let results = index.search("anything", &provider, 6, 0.0).await?;
@@ -1348,7 +1403,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_with_fts_special_chars() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(db);
+        let index = SearchIndex::new(db, "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index
@@ -1403,7 +1458,7 @@ mod tests {
             )?;
         }
 
-        let index = SearchIndex::new(db);
+        let index = SearchIndex::new(db, "test-agent");
         let provider = StubEmbeddingProvider::new(8);
         let needs = index.needs_reindex(&provider)?;
         assert!(needs);
@@ -1431,7 +1486,7 @@ mod tests {
             .await?;
 
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         let total = index
@@ -1472,7 +1527,7 @@ mod tests {
             .await?;
 
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         let count = index.index_session("s1", &reader, &provider).await?;
@@ -1544,7 +1599,7 @@ mod tests {
         writer.append_message("s1", "user", "keep this").await?;
 
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index.index_session("s1", &reader, &provider).await?;
@@ -1574,7 +1629,7 @@ mod tests {
         writer.append_message("s2", "assistant", "beta").await?;
 
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         let total = index.index_sessions(&reader, &provider).await?;
@@ -1601,7 +1656,7 @@ mod tests {
         writer.append_message("s2", "user", "beta").await?;
 
         let db = test_db()?;
-        let index = SearchIndex::new(Arc::clone(&db));
+        let index = SearchIndex::new(Arc::clone(&db), "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index.index_sessions(&reader, &provider).await?;
@@ -1641,7 +1696,7 @@ mod tests {
     #[tokio::test]
     async fn search_scores_are_normalized() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(db);
+        let index = SearchIndex::new(db, "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index
@@ -1673,7 +1728,7 @@ mod tests {
     #[tokio::test]
     async fn search_vector_only_fallback_on_fts_error() -> Result<()> {
         let db = test_db()?;
-        let index = SearchIndex::new(db);
+        let index = SearchIndex::new(db, "test-agent");
         let provider = StubEmbeddingProvider::new(8);
 
         index

@@ -1392,7 +1392,7 @@ Working on Clawhive memory safety.
 
         // Create in-memory MemoryStore and SearchIndex
         let memory_store = MemoryStore::open_in_memory()?;
-        let search_index = SearchIndex::new(memory_store.db());
+        let search_index = SearchIndex::new(memory_store.db(), "agent-1");
 
         // Create a stub embedding provider
         let embedding_provider = Arc::new(StubEmbeddingProvider);

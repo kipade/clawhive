@@ -63,7 +63,7 @@ async fn make_orchestrator() -> (Orchestrator, tempfile::TempDir) {
     let router = LlmRouter::new(ProviderRegistry::new(), HashMap::new(), vec![]);
     let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
     let file_store = MemoryFileStore::new(tmp.path());
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "test-agent");
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let schedule_manager = Arc::new(
         ScheduleManager::new(

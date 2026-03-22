@@ -190,6 +190,13 @@ fn migrations() -> Vec<Migration> {
             ALTER TABLE sessions ADD COLUMN interaction_count INTEGER NOT NULL DEFAULT 0;
             "#,
         ),
+        (
+            9,
+            r#"
+            ALTER TABLE chunks ADD COLUMN agent_id TEXT NOT NULL DEFAULT '';
+            CREATE INDEX IF NOT EXISTS idx_chunks_agent_id ON chunks(agent_id);
+            "#,
+        ),
     ]
 }
 

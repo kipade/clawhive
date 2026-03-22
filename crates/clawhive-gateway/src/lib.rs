@@ -1120,7 +1120,7 @@ mod tests {
                 .unwrap(),
         );
         let file_store = MemoryFileStore::new(tmp.path());
-        let search_index = SearchIndex::new(memory.db());
+        let search_index = SearchIndex::new(memory.db(), "clawhive-main");
         let embedding_provider: Arc<dyn EmbeddingProvider> =
             Arc::new(StubEmbeddingProvider::new(8));
         let agents = vec![FullAgentConfig {
@@ -1216,7 +1216,7 @@ mod tests {
             .unwrap(),
         );
         let file_store = MemoryFileStore::new(tmp.path());
-        let search_index = SearchIndex::new(memory.db());
+        let search_index = SearchIndex::new(memory.db(), "clawhive-main");
         let embedding_provider: Arc<dyn EmbeddingProvider> =
             Arc::new(StubEmbeddingProvider::new(8));
         let agents = vec![FullAgentConfig {

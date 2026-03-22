@@ -335,7 +335,7 @@ mod tests {
     fn setup() -> (TempDir, Arc<MemoryStore>, MemorySearchTool, MemoryGetTool) {
         let tmp = TempDir::new().unwrap();
         let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
-        let search_index = SearchIndex::new(memory.db());
+        let search_index = SearchIndex::new(memory.db(), "test-agent");
         let embedding: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
         let file_store = MemoryFileStore::new(tmp.path());
 

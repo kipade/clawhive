@@ -105,7 +105,7 @@ mod tests {
             file_store: MemoryFileStore::new(root),
             session_writer: SessionWriter::new(root),
             session_reader: SessionReader::new(root),
-            search_index: SearchIndex::new(memory.db()),
+            search_index: SearchIndex::new(memory.db(), "test-agent"),
             access_gate: Arc::new(AccessGate::new(
                 root.to_path_buf(),
                 root.join("access_policy.json"),

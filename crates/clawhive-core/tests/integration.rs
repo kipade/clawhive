@@ -237,7 +237,7 @@ async fn make_orchestrator(
     let bus = EventBus::new(16);
     let publisher = bus.publisher();
     let file_store = MemoryFileStore::new(tmp.path());
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "test-agent");
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let schedule_manager = Arc::new(
         ScheduleManager::new(
@@ -291,7 +291,7 @@ async fn orchestrator_uses_search_index_for_memory_context() {
     let session_reader = SessionReader::new(tmp.path());
 
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "clawhive-main");
     let schedule_manager = Arc::new(
         ScheduleManager::new(
             SqliteStore::open(&tmp.path().join("data/scheduler.db")).unwrap(),
@@ -362,7 +362,7 @@ async fn orchestrator_injects_active_facts_into_memory_context() {
     let file_store = MemoryFileStore::new(tmp.path());
     let session_writer = SessionWriter::new(tmp.path());
     let session_reader = SessionReader::new(tmp.path());
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "test-agent");
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let schedule_manager = Arc::new(
         ScheduleManager::new(
@@ -453,7 +453,7 @@ async fn fallback_summary_appends_for_multiple_expired_sessions_on_same_day() {
     let file_store = MemoryFileStore::new(tmp.path());
     let session_writer = SessionWriter::new(tmp.path());
     let session_reader = SessionReader::new(tmp.path());
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "test-agent");
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let schedule_manager = Arc::new(
         ScheduleManager::new(
@@ -660,7 +660,7 @@ async fn orchestrator_creates_session() {
         .unwrap(),
     );
     let file_store = MemoryFileStore::new(tmp.path());
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "test-agent");
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let config_view = build_test_config_view(
         agents,
@@ -746,7 +746,7 @@ async fn orchestrator_publishes_reply_ready() {
         .unwrap(),
     );
     let file_store = MemoryFileStore::new(tmp.path());
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "test-agent");
     let embedding_provider: Arc<dyn EmbeddingProvider> = Arc::new(StubEmbeddingProvider::new(8));
     let config_view = build_test_config_view(
         agents,

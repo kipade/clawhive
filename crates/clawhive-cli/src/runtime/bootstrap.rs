@@ -438,7 +438,7 @@ pub(crate) async fn bootstrap(
     let workspace_dir = root.to_path_buf();
     let embedding_provider = build_embedding_provider(&config).await;
     let file_store = MemoryFileStore::new(&workspace_dir);
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "");
 
     let brave_api_key = config
         .main

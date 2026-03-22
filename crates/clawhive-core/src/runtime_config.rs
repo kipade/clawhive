@@ -658,7 +658,7 @@ pub async fn build_config_view(
     let personas = build_personas_from_config(root, config).await;
     let embedding_provider = build_embedding_provider(config).await;
     let file_store = MemoryFileStore::new(root);
-    let search_index = SearchIndex::new(memory.db());
+    let search_index = SearchIndex::new(memory.db(), "");
     let brave_api_key = config
         .main
         .tools

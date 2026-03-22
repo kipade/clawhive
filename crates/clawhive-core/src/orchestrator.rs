@@ -160,7 +160,7 @@ impl OrchestratorBuilder {
             .unwrap_or_else(|| SessionReader::new(&self.workspace_root));
         let search_index = self
             .search_index
-            .unwrap_or_else(|| SearchIndex::new(self.memory.db()));
+            .unwrap_or_else(|| SearchIndex::new(self.memory.db(), ""));
         let session_mgr = self
             .session_mgr
             .unwrap_or_else(|| SessionManager::new(self.memory.clone(), 1800));
@@ -221,7 +221,7 @@ impl Orchestrator {
                 file_store: MemoryFileStore::new(&ws_root),
                 session_writer: SessionWriter::new(&ws_root),
                 session_reader: SessionReader::new(&ws_root),
-                search_index: SearchIndex::new(memory.db()),
+                search_index: SearchIndex::new(memory.db(), agent_id),
                 access_gate: gate,
             };
             agent_workspace_map.insert(agent_id.clone(), state);
@@ -805,7 +805,7 @@ impl Orchestrator {
                 file_store: MemoryFileStore::new(&ws_root),
                 session_writer: SessionWriter::new(&ws_root),
                 session_reader: SessionReader::new(&ws_root),
-                search_index: SearchIndex::new(self.memory.db()),
+                search_index: SearchIndex::new(self.memory.db(), agent_id),
                 access_gate: gate,
             };
             new_map.insert(agent_id.clone(), Arc::new(state));
@@ -3309,7 +3309,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let memory = Arc::new(MemoryStore::open_in_memory().unwrap());
         let file_store = MemoryFileStore::new(dir.path());
-        let search_index = SearchIndex::new(memory.db());
+        let search_index = SearchIndex::new(memory.db(), "test-agent");
         let embedding_provider: Arc<dyn EmbeddingProvider> =
             Arc::new(StubEmbeddingProvider::new(8));
         let router = LlmRouter::new(

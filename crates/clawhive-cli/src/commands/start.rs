@@ -574,7 +574,8 @@ async fn start_bot(
         let workspace_dir = workspace.root().to_path_buf();
         let file_store = clawhive_memory::file_store::MemoryFileStore::new(&workspace_dir);
         let session_reader = clawhive_memory::session::SessionReader::new(&workspace_dir);
-        let search_index = clawhive_memory::search_index::SearchIndex::new(memory.db());
+        let search_index =
+            clawhive_memory::search_index::SearchIndex::new(memory.db(), &agent_config.agent_id);
 
         {
             let idx = search_index.clone();
