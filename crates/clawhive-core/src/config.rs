@@ -150,6 +150,21 @@ pub struct WeComChannelConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeixinConnectorConfig {
+    pub connector_id: String,
+    #[serde(default)]
+    pub bot_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeixinChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub connectors: Vec<WeixinConnectorConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackConnectorConfig {
     pub connector_id: String,
     pub bot_token: String,
@@ -282,6 +297,8 @@ pub struct ChannelsConfig {
     pub imessage: Option<IMessageChannelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook: Option<WebhookChannelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weixin: Option<WeixinChannelConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -363,6 +380,7 @@ impl Default for MainConfig {
                 whatsapp: None,
                 imessage: None,
                 webhook: None,
+                weixin: None,
             },
             embedding: EmbeddingConfig::default(),
             tools: ToolsConfig::default(),
@@ -905,6 +923,15 @@ fn resolve_main_env(main: &mut MainConfig) {
         }
     }
 
+    if let Some(weixin) = &mut main.channels.weixin {
+        for connector in &mut weixin.connectors {
+            connector.connector_id = resolve_env_var(&connector.connector_id);
+            if let Some(token) = &mut connector.bot_token {
+                *token = resolve_env_var(token);
+            }
+        }
+    }
+
     main.embedding.api_key = resolve_env_var(&main.embedding.api_key);
     main.embedding.base_url = resolve_env_var(&main.embedding.base_url);
     main.embedding.model = resolve_env_var(&main.embedding.model);
@@ -1240,6 +1267,7 @@ auth:
                     whatsapp: None,
                     imessage: None,
                     webhook: None,
+                    weixin: None,
                 },
                 embedding: EmbeddingConfig::default(),
                 tools: ToolsConfig::default(),

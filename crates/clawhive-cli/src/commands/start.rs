@@ -12,6 +12,7 @@ use clawhive_channels::imessage::IMessageBot;
 use clawhive_channels::slack::{SlackBot, SlackBotConfig};
 use clawhive_channels::telegram::TelegramBot;
 use clawhive_channels::wecom::WeComBot;
+use clawhive_channels::weixin::WeixinBot;
 use clawhive_channels::ChannelBot;
 use clawhive_core::heartbeat::{is_heartbeat_ack, should_skip_heartbeat, DEFAULT_HEARTBEAT_PROMPT};
 use clawhive_core::*;
@@ -357,6 +358,44 @@ fn build_bot_factory() -> BotFactory {
                     Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
                 >)
         }
+        "weixin" => {
+            let connector_id = config["connector_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let bot_token = config["bot_token"].as_str().map(|s| s.to_string());
+            let data_dir = expand_tilde(&format!("~/.clawhive/data/weixin-{connector_id}"));
+            let _ = std::fs::create_dir_all(&data_dir);
+            let session_path = data_dir.join("session.json");
+
+            let session = if let Some(s) = clawhive_channels::weixin::load_session(&session_path) {
+                tracing::info!(connector = %connector_id, "loaded existing weixin session");
+                s
+            } else if let Some(token) = bot_token {
+                // Build session from bot_token config (skip QR login)
+                let session = clawhive_channels::weixin::WeixinSession {
+                    bot_token: token,
+                    base_url: "https://ilinkai.weixin.qq.com".to_string(),
+                    bot_id: connector_id.clone(),
+                    user_id: String::new(),
+                    saved_at: chrono::Utc::now().to_rfc3339(),
+                };
+                clawhive_channels::weixin::save_session(&session_path, &session)?;
+                session
+            } else {
+                tracing::info!(connector = %connector_id, "no weixin session found, starting QR login");
+                let session = tokio::runtime::Handle::current()
+                    .block_on(clawhive_channels::weixin::qr_login())?;
+                clawhive_channels::weixin::save_session(&session_path, &session)?;
+                session
+            };
+
+            let bot = WeixinBot::new(connector_id, gateway, bus, session, data_dir);
+            Ok(Box::pin(async move { Box::new(bot).run().await })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
+                >)
+        }
         _ => Err(anyhow::anyhow!("unknown channel type: {channel_type}")),
     })
 }
@@ -480,6 +519,21 @@ fn start_configured_bots(
                     supervisor.start(connector.connector_id.clone(), "imessage", config_json)
                 {
                     tracing::error!(connector = %connector.connector_id, "failed to start imessage bot: {error}");
+                } else {
+                    started += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(weixin) = &config.main.channels.weixin {
+        if weixin.enabled {
+            for connector in &weixin.connectors {
+                let config_json = serde_json::to_value(connector)?;
+                if let Err(error) =
+                    supervisor.start(connector.connector_id.clone(), "weixin", config_json)
+                {
+                    tracing::error!(connector = %connector.connector_id, "failed to start weixin bot: {error}");
                 } else {
                     started += 1;
                 }
