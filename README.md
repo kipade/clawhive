@@ -7,7 +7,7 @@
 
 English | [中文](README_CN.md)
 
-An open-source, Rust-native alternative to [OpenClaw](https://github.com/openclaw/openclaw) — deploy your own AI agents across Telegram, Discord, Slack, WhatsApp, iMessage, and more with a single binary.
+An open-source, Rust-native alternative to [OpenClaw](https://github.com/openclaw/openclaw) — deploy your own AI agents across Telegram, Discord, Feishu/Lark, WhatsApp, WeChat, and more with a single binary.
 
 **One binary, ~14 MB, zero runtime dependencies.** No Node.js, no npm, no Docker — just download, configure, and run.
 

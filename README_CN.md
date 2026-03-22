@@ -7,7 +7,7 @@
 
 [English](README.md) | 中文
 
-用 Rust 从零构建的开源 AI Agent 平台——一个二进制文件，部署到 Telegram、Discord、Slack、WhatsApp、iMessage 等多个渠道。
+用 Rust 从零构建的开源 AI Agent 平台——一个二进制文件，部署到 Telegram、Discord、飞书/Lark、WhatsApp、微信等多个渠道。
 
 **单文件约 14MB，零运行时依赖。** 不需要 Node.js，不需要 npm，不需要 Docker——下载、配置、运行。
 
