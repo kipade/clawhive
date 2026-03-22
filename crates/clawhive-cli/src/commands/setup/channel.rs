@@ -9,7 +9,8 @@ use clawhive_core::config::{
     DingTalkChannelConfig, DingTalkConnectorConfig, DiscordChannelConfig, DiscordConnectorConfig,
     FeishuChannelConfig, FeishuConnectorConfig, IMessageChannelConfig, IMessageConnectorConfig,
     SlackChannelConfig, SlackConnectorConfig, TelegramChannelConfig, TelegramConnectorConfig,
-    WeComChannelConfig, WeComConnectorConfig, WhatsAppChannelConfig, WhatsAppConnectorConfig,
+    WeComChannelConfig, WeComConnectorConfig, WeixinChannelConfig, WeixinConnectorConfig,
+    WhatsAppChannelConfig, WhatsAppConnectorConfig,
 };
 
 use super::config_io::{
@@ -45,7 +46,7 @@ pub(super) fn handle_add_channel(
 ) -> Result<()> {
     let channel_types = [
         "Telegram", "Discord", "Slack", "WhatsApp", "iMessage", "Feishu", "DingTalk", "WeCom",
-        "← Back",
+        "WeChat", "← Back",
     ];
     let selected = Select::with_theme(theme)
         .with_prompt("Channel type")
@@ -61,6 +62,7 @@ pub(super) fn handle_add_channel(
         5 => "feishu",
         6 => "dingtalk",
         7 => "wecom",
+        8 => "weixin",
         _ => return Ok(()),
     };
     let default_id = match channel_type {
@@ -72,6 +74,7 @@ pub(super) fn handle_add_channel(
         "feishu" => "my_feishu_bot",
         "dingtalk" => "my_dingtalk_bot",
         "wecom" => "my_wecom_bot",
+        "weixin" => "my_weixin_bot",
         _ => "my_bot",
     };
 
@@ -194,6 +197,12 @@ pub(super) fn handle_add_channel(
             secret = Some(sec);
             token = String::new();
         }
+        "weixin" => {
+            // WeChat uses QR code login — no token needed at this stage
+            println!("  {ARROW} WeChat uses QR code login via iLink protocol.");
+            println!("  {ARROW} You will scan a QR code after setup to authenticate.");
+            token = String::new();
+        }
         _ => {
             token = match input_or_back(theme, "Bot token")? {
                 Some(t) if !t.is_empty() => t,
@@ -287,6 +296,19 @@ pub(super) fn handle_add_channel(
         &Term::stdout(),
         &format!("Channel {connector_id} ({channel_type}) configured."),
     );
+
+    if channel_type == "weixin" {
+        let do_login = Confirm::with_theme(theme)
+            .with_prompt("Scan WeChat QR code now?")
+            .default(true)
+            .interact()?;
+
+        if do_login {
+            run_weixin_qr_login(config_root, &connector_id)?;
+        } else {
+            println!("  {ARROW} QR login will be triggered on first start.");
+        }
+    }
 
     if channel_type == "whatsapp" {
         let do_pair = Confirm::with_theme(theme)
@@ -474,6 +496,25 @@ fn add_channel_to_config(
                 }
             }
         }
+        "weixin" => {
+            let connector = WeixinConnectorConfig {
+                connector_id: cfg.connector_id.clone(),
+                bot_token: None, // Will be set by QR login
+            };
+            match main_cfg.channels.weixin.as_mut() {
+                Some(wx) => {
+                    wx.enabled = true;
+                    wx.connectors.retain(|c| c.connector_id != cfg.connector_id);
+                    wx.connectors.push(connector);
+                }
+                None => {
+                    main_cfg.channels.weixin = Some(WeixinChannelConfig {
+                        enabled: true,
+                        connectors: vec![connector],
+                    });
+                }
+            }
+        }
         _ => return Err(anyhow!("unsupported channel type: {channel_type}")),
     }
 
@@ -561,6 +602,9 @@ pub(super) fn remove_channel_from_config(config_root: &Path, connector_id: &str)
     if let Some(im) = cfg.channels.imessage.as_mut() {
         im.connectors.retain(|c| c.connector_id != connector_id);
     }
+    if let Some(wx) = cfg.channels.weixin.as_mut() {
+        wx.connectors.retain(|c| c.connector_id != connector_id);
+    }
     save_main_config(config_root, &cfg)?;
     Ok(())
 }
@@ -601,6 +645,42 @@ fn generate_routing_yaml(
     }
 
     out
+}
+
+fn run_weixin_qr_login(config_root: &Path, connector_id: &str) -> Result<()> {
+    println!("\n  {ARROW} Starting WeChat iLink QR login...");
+    println!("  Scan the QR code with WeChat on your phone.\n");
+
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(clawhive_channels::weixin::qr_login())
+    });
+
+    match result {
+        Ok(session) => {
+            // Save session to data dir
+            let data_dir = if let Ok(home) = std::env::var("HOME") {
+                std::path::PathBuf::from(home)
+                    .join(".clawhive/data")
+                    .join(format!("weixin-{connector_id}"))
+            } else {
+                std::path::PathBuf::from(format!(".clawhive/data/weixin-{connector_id}"))
+            };
+            let _ = std::fs::create_dir_all(&data_dir);
+            let session_path = data_dir.join("session.json");
+            clawhive_channels::weixin::save_session(&session_path, &session)?;
+            print_done(
+                &Term::stdout(),
+                &format!("WeChat logged in as {}", session.bot_id),
+            );
+        }
+        Err(e) => {
+            eprintln!("  ⚠ WeChat QR login failed: {e}");
+            eprintln!("  You can log in later — QR code will appear on first start.");
+        }
+    }
+
+    let _ = config_root;
+    Ok(())
 }
 
 fn run_whatsapp_pairing(config_root: &Path, connector_id: &str) -> Result<()> {

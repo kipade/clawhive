@@ -232,6 +232,15 @@ fn scan_main_and_routing(config_dir: &Path) -> (Vec<ChannelInfo>, Option<String>
                 }
             }
 
+            if let Some(weixin) = main.channels.weixin {
+                for connector in weixin.connectors {
+                    channels.push(ChannelInfo {
+                        channel_type: "weixin".to_string(),
+                        connector_id: connector.connector_id,
+                    });
+                }
+            }
+
             if let Some(ws) = &main.tools.web_search {
                 tools.web_search_enabled = ws.enabled;
                 tools.web_search_provider = ws.provider.clone();
