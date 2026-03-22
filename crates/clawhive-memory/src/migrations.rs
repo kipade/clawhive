@@ -197,6 +197,13 @@ fn migrations() -> Vec<Migration> {
             CREATE INDEX IF NOT EXISTS idx_chunks_agent_id ON chunks(agent_id);
             "#,
         ),
+        (
+            10,
+            r#"
+            DELETE FROM chunks WHERE agent_id = '';
+            DELETE FROM chunks_fts WHERE rowid NOT IN (SELECT rowid FROM chunks);
+            "#,
+        ),
     ]
 }
 

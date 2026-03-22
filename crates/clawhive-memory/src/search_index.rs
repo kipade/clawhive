@@ -244,13 +244,24 @@ impl SearchIndex {
         let mut rows = Vec::with_capacity(text_chunks.len());
         for (idx, chunk) in text_chunks.iter().enumerate() {
             let prefix_len = chunk.hash.len().min(8);
-            let chunk_id = format!(
-                "{}:{}-{}:{}",
-                path,
-                chunk.start_line,
-                chunk.end_line,
-                &chunk.hash[..prefix_len]
-            );
+            let chunk_id = if self.agent_id.is_empty() {
+                format!(
+                    "{}:{}-{}:{}",
+                    path,
+                    chunk.start_line,
+                    chunk.end_line,
+                    &chunk.hash[..prefix_len]
+                )
+            } else {
+                format!(
+                    "{}:{}:{}-{}:{}",
+                    self.agent_id,
+                    path,
+                    chunk.start_line,
+                    chunk.end_line,
+                    &chunk.hash[..prefix_len]
+                )
+            };
             rows.push((
                 chunk_id,
                 chunk.start_line as i64,
