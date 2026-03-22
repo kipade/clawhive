@@ -479,16 +479,11 @@ fn render_qr_terminal(url: &str) {
     };
 
     let string = code
-        .render::<char>()
-        .quiet_zone(true)
-        .module_dimensions(2, 1)
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .dark_color(qrcode::render::unicode::Dense1x2::Light)
+        .light_color(qrcode::render::unicode::Dense1x2::Dark)
         .build();
-
-    // Print to stdout — user-facing CLI output during login
-    for line in string.lines() {
-        println!("{line}");
-    }
-    println!();
+    println!("{string}");
     tracing::info!(url = %url, "scan the QR code above with WeChat");
 }
 
