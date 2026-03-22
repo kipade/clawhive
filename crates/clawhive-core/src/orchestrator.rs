@@ -1118,7 +1118,10 @@ impl Orchestrator {
             .as_ref()
             .map(|s| s.dangerous_allow_private.clone())
             .unwrap_or_default();
-        let max_response_tokens = if is_scheduled_task { 8192 } else { 2048 };
+        let max_response_tokens =
+            agent
+                .max_response_tokens
+                .unwrap_or(if is_scheduled_task { 8192 } else { 4096 });
         let (resp, _messages, tool_attachments) = self
             .tool_use_loop(
                 view.as_ref(),
@@ -1143,7 +1146,7 @@ impl Orchestrator {
         // Check for NO_REPLY suppression
         let reply_text = filter_no_reply(&reply_text);
 
-        if reply_text.is_empty() {
+        let reply_text = if reply_text.is_empty() {
             tracing::warn!(
                 raw_text_len = resp.text.len(),
                 raw_text_preview = &resp.text[..resp.text.len().min(200)],
@@ -1151,7 +1154,14 @@ impl Orchestrator {
                 content_blocks = resp.content.len(),
                 "handle_inbound: final reply is empty"
             );
-        }
+            if resp.stop_reason.as_deref() == Some("length") {
+                "Response exceeded the output token limit. Please try a simpler request or break it into smaller parts.".to_string()
+            } else {
+                reply_text
+            }
+        } else {
+            reply_text
+        };
 
         log_language_guard(agent_id, &inbound, &reply_text, target_language, false);
 
@@ -1823,7 +1833,7 @@ impl Orchestrator {
                 }
 
                 {
-                    let max_truncation_retries: u32 = if is_scheduled_task { 2 } else { 1 };
+                    let max_truncation_retries: u32 = 2;
                     if tool_uses.is_empty()
                         && resp.stop_reason.as_deref() == Some("length")
                         && scheduled_task_retries < max_truncation_retries
@@ -1852,8 +1862,8 @@ impl Orchestrator {
                              and use tools (write_file, execute_command) to complete the remaining steps."
                         } else {
                             "[SYSTEM] Your response was cut short due to length limits. \
-                             Continue from where you left off and provide the remaining content. \
-                             Do NOT repeat what you already wrote."
+                             Summarize the key findings concisely. Do NOT repeat what you already wrote. \
+                             Focus on the most important information only."
                         };
                         messages.push(LlmMessage::user(nudge));
                         continue;
@@ -3202,6 +3212,7 @@ mod tests {
             heartbeat: None,
             exec_security: None,
             sandbox: None,
+            max_response_tokens: None,
         }
     }
 

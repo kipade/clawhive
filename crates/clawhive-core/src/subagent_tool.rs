@@ -128,6 +128,7 @@ mod tests {
             heartbeat: None,
             exec_security: None,
             sandbox: None,
+            max_response_tokens: None,
         };
 
         let mut agents = HashMap::new();

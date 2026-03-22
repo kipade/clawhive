@@ -53,6 +53,7 @@ fn test_full_agent() -> FullAgentConfig {
         heartbeat: None,
         exec_security: None,
         sandbox: None,
+        max_response_tokens: None,
     }
 }
 

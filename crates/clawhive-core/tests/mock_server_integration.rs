@@ -94,6 +94,7 @@ async fn make_orchestrator_with_provider(
         heartbeat: None,
         exec_security: None,
         sandbox: None,
+        max_response_tokens: None,
     }];
     let schedule_manager = Arc::new(
         ScheduleManager::new(

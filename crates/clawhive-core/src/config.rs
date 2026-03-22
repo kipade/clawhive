@@ -703,6 +703,9 @@ pub struct FullAgentConfig {
     pub exec_security: Option<ExecSecurityConfig>,
     #[serde(default)]
     pub sandbox: Option<SandboxPolicyConfig>,
+    /// Maximum output tokens per LLM response. Defaults to 4096 (conversation) / 8192 (scheduled).
+    #[serde(default)]
+    pub max_response_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1265,6 +1268,7 @@ auth:
                 heartbeat: None,
                 exec_security: None,
                 sandbox: None,
+                max_response_tokens: None,
             }],
         };
         let err = validate_config(&config).unwrap_err();

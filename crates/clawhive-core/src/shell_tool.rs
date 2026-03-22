@@ -21,7 +21,7 @@ use super::config::{
 };
 use super::tool::{ToolContext, ToolExecutor, ToolOutput};
 
-const MAX_OUTPUT_BYTES: usize = 50_000;
+const MAX_OUTPUT_BYTES: usize = 20_000;
 
 pub struct ExecuteCommandTool {
     workspace: PathBuf,

@@ -351,11 +351,7 @@ pub struct ApprovalDisplay {
 
 impl ApprovalDisplay {
     pub fn new(agent_id: &str, command: &str, network_target: Option<&str>) -> Self {
-        let program = command
-            .split_whitespace()
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
+        let program = Self::extract_program(command);
 
         let command_preview = if command.len() > APPROVAL_CMD_MAX_CHARS {
             let end = command.floor_char_boundary(APPROVAL_CMD_MAX_CHARS);
@@ -413,6 +409,51 @@ impl ApprovalDisplay {
             esc(&self.command_preview)
         ));
         s
+    }
+
+    /// Extract the main program name from a shell command.
+    ///
+    /// Handles common patterns:
+    /// - Simple commands: `curl https://example.com` → `curl`
+    /// - Variable assignments: `NOW_MS=$(python3 ...) curl -s ...` → `curl`
+    /// - Pipelines: `echo hello | grep h` → `echo`
+    fn extract_program(command: &str) -> String {
+        // Track parenthesis depth to skip subshell contents like $(python3 -c "...")
+        let mut depth = 0i32;
+        for token in command.split_whitespace() {
+            let was_top = depth == 0;
+            depth += token.matches('(').count() as i32;
+            depth -= token.matches(')').count() as i32;
+            if depth < 0 {
+                depth = 0;
+            }
+
+            // Skip tokens inside subshells or that started inside one
+            if !was_top || depth > 0 {
+                continue;
+            }
+
+            // Skip variable assignments (FOO=bar, FOO=$(cmd))
+            if token.contains('=') {
+                continue;
+            }
+
+            // Skip flags and quoted strings
+            if token.starts_with('-') || token.starts_with('"') || token.starts_with('\'') {
+                continue;
+            }
+
+            // Found the actual program — strip path prefix
+            return token.rsplit('/').next().unwrap_or(token).to_string();
+        }
+
+        // Fallback: first token, cleaned up
+        let first = command.split_whitespace().next().unwrap_or("unknown");
+        if let Some(pos) = first.find("$(") {
+            first[pos + 2..].to_string()
+        } else {
+            first.to_string()
+        }
     }
 }
 
@@ -771,6 +812,19 @@ mod tests {
         assert!(md.contains("**Program:** `curl`"));
         assert!(md.contains("**Target:** `api.com:443`"));
         assert!(md.contains("**Command:**"));
+    }
+
+    #[test]
+    fn approval_display_skips_variable_assignments() {
+        let cmd = r#"NOW_MS=$(python3 -c "import time; print(int(time.time()*1000))") FROM_MS=$(python3 -c "import time; print(int((time.time()-86400)*1000))") curl -s -H "Authorization: Bearer token" https://api.example.com"#;
+        let d = ApprovalDisplay::new("agent-1", cmd, None);
+        assert_eq!(d.program, "curl");
+    }
+
+    #[test]
+    fn approval_display_simple_var_assignment() {
+        let d = ApprovalDisplay::new("agent-1", "FOO=bar python3 script.py", None);
+        assert_eq!(d.program, "python3");
     }
 
     #[test]
