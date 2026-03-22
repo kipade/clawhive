@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-fn default_dotenv_path() -> Option<PathBuf> {
+pub fn default_dotenv_path() -> Option<PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(|home| PathBuf::from(home).join(".clawhive").join(".env"))

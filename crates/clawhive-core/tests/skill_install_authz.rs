@@ -56,6 +56,7 @@ fn test_full_agent() -> FullAgentConfig {
         exec_security: None,
         sandbox: None,
         max_response_tokens: None,
+        max_iterations: None,
     }
 }
 

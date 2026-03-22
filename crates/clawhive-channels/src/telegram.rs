@@ -1410,18 +1410,33 @@ async fn send_attachments(
             .file_name
             .clone()
             .unwrap_or_else(|| default_file_name(&att.kind, &att.mime_type));
-        let input = InputFile::memory(bytes).file_name(file_name);
         let cap = if i == 0 { caption } else { None };
 
         let result = match att.kind {
             AttachmentKind::Image => {
-                let mut req = bot.send_photo(chat_id, input);
+                let photo_input = InputFile::memory(bytes.clone()).file_name(file_name.clone());
+                let mut req = bot.send_photo(chat_id, photo_input);
                 if let Some(c) = cap {
                     req = req.caption(c);
                 }
-                req.await.map(|_| ())
+                match req.await {
+                    Ok(_) => Ok(()),
+                    Err(photo_err) => {
+                        tracing::warn!(
+                            error = %photo_err,
+                            "send_photo failed, retrying as document"
+                        );
+                        let fallback = InputFile::memory(bytes).file_name(file_name);
+                        let mut req = bot.send_document(chat_id, fallback);
+                        if let Some(c) = cap {
+                            req = req.caption(c);
+                        }
+                        req.await.map(|_| ())
+                    }
+                }
             }
             _ => {
+                let input = InputFile::memory(bytes).file_name(file_name);
                 let mut req = bot.send_document(chat_id, input);
                 if let Some(c) = cap {
                     req = req.caption(c);

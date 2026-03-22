@@ -1628,7 +1628,11 @@ impl Orchestrator {
                 .collect(),
             None => view.tool_registry.tool_defs(),
         };
-        let max_iterations = 25;
+        let max_iterations = view
+            .agents
+            .get(agent_id)
+            .and_then(|a| a.max_iterations)
+            .unwrap_or(50) as usize;
         let mut web_search_reminder_injected = false;
         let mut web_search_called = false;
         let mut memory_flush_triggered = false;
@@ -3213,6 +3217,7 @@ mod tests {
             exec_security: None,
             sandbox: None,
             max_response_tokens: None,
+            max_iterations: None,
         }
     }
 

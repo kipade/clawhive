@@ -211,7 +211,7 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState, token: String)
                                 let out_tx2 = out_tx.clone();
                                 let active_ids = Arc::clone(&active_trace_ids);
                                 tokio::spawn(async move {
-                                    match gateway.handle_inbound(inbound).await {
+                                    match gateway.handle_inbound_for_agent(inbound, &agent_id).await {
                                         Ok(outbound) => {
                                             // For slash commands and other early returns,
                                             // the orchestrator may not publish ReplyReady.

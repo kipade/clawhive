@@ -172,6 +172,7 @@ fn test_full_agent(agent_id: &str, primary: &str, fallbacks: Vec<&str>) -> FullA
         exec_security: None,
         sandbox: None,
         max_response_tokens: None,
+        max_iterations: None,
     }
 }
 

@@ -219,6 +219,7 @@ mod tests {
             exec_security: None,
             sandbox: None,
             max_response_tokens: None,
+            max_iterations: None,
         };
 
         let mut agents = HashMap::new();

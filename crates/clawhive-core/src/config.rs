@@ -706,6 +706,9 @@ pub struct FullAgentConfig {
     /// Maximum output tokens per LLM response. Defaults to 4096 (conversation) / 8192 (scheduled).
     #[serde(default)]
     pub max_response_tokens: Option<u32>,
+    /// Maximum tool-use loop iterations. Defaults to 50.
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1269,6 +1272,7 @@ auth:
                 exec_security: None,
                 sandbox: None,
                 max_response_tokens: None,
+                max_iterations: None,
             }],
         };
         let err = validate_config(&config).unwrap_err();

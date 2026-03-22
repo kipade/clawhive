@@ -57,7 +57,7 @@ impl OpenAiProvider {
         auth_profile: Option<AuthProfile>,
     ) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(180))
             .build()
             .unwrap_or_default();
         Self::with_client(client, api_key, api_base, auth_profile)
@@ -161,11 +161,11 @@ impl LlmProvider for OpenAiProvider {
             Ok(r) => r,
             Err(e) if e.is_timeout() => {
                 return Err(anyhow!(
-                    "openai api error (timeout) [retryable]: request timed out after 60s"
+                    "api error (timeout) [retryable]: request timed out after 180s"
                 ));
             }
             Err(e) if e.is_connect() => {
-                return Err(anyhow!("openai api error (connect) [retryable]: {e}"));
+                return Err(anyhow!("api error (connect) [retryable]: {e}"));
             }
             Err(e) => return Err(e.into()),
         };
@@ -203,11 +203,11 @@ impl LlmProvider for OpenAiProvider {
             Ok(r) => r,
             Err(e) if e.is_timeout() => {
                 return Err(anyhow!(
-                    "openai api error (timeout) [retryable]: request timed out after 60s"
+                    "api error (timeout) [retryable]: request timed out after 180s"
                 ));
             }
             Err(e) if e.is_connect() => {
-                return Err(anyhow!("openai api error (connect) [retryable]: {e}"));
+                return Err(anyhow!("api error (connect) [retryable]: {e}"));
             }
             Err(e) => return Err(e.into()),
         };

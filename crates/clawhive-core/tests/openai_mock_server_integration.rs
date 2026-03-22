@@ -329,6 +329,6 @@ async fn openai_connection_error_retryable() {
         .unwrap_err();
 
     let err_text = err.to_string();
-    assert!(err_text.contains("openai api error (connect)"));
+    assert!(err_text.contains("api error (connect)"));
     assert!(err_text.contains("[retryable]"));
 }

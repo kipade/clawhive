@@ -414,6 +414,14 @@ impl ServiceHandler for RemindersHandler {
 
 fn collect_env_vars(env_inherit: &[String]) -> HashMap<String, String> {
     let mut env_vars = HashMap::new();
+
+    // Load all vars from ~/.clawhive/.env — operator-controlled, always trusted.
+    if let Some(dotenv_path) = crate::dotenv::default_dotenv_path() {
+        for (key, val) in crate::dotenv::read_dotenv(&dotenv_path) {
+            env_vars.insert(key, val);
+        }
+    }
+
     for key in env_inherit {
         if key == "PATH" {
             let inherited = std::env::var("PATH").unwrap_or_default();

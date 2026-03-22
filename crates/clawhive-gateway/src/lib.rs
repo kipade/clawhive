@@ -1142,6 +1142,7 @@ mod tests {
             exec_security: None,
             sandbox: None,
             max_response_tokens: None,
+            max_iterations: None,
         }];
         let personas = HashMap::new();
         let tool_registry = build_tool_registry(
@@ -1237,6 +1238,7 @@ mod tests {
             exec_security: None,
             sandbox: None,
             max_response_tokens: None,
+            max_iterations: None,
         }];
         let personas = HashMap::new();
         let tool_registry = build_tool_registry(
