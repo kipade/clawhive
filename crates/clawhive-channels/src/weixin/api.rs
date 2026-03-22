@@ -402,7 +402,6 @@ pub async fn qr_login() -> Result<WeixinSession> {
         .context("failed to get QR code")?;
 
     render_qr_terminal(&resp.qrcode_img_content);
-    tracing::info!("scan the QR code with WeChat to log in");
 
     // Step 2: Poll for confirmation (up to 3 QR refreshes)
     let mut qrcode_token = resp.qrcode;
@@ -436,7 +435,6 @@ pub async fn qr_login() -> Result<WeixinSession> {
                         .ok_or_else(|| anyhow!("confirmed but no ilink_user_id"))?,
                     saved_at: chrono::Utc::now().to_rfc3339(),
                 };
-                tracing::info!(bot_id = %session.bot_id, "weixin login successful");
                 return Ok(session);
             }
             "expired" => {
@@ -444,7 +442,7 @@ pub async fn qr_login() -> Result<WeixinSession> {
                 if refreshes >= 3 {
                     return Err(anyhow!("QR code expired 3 times, aborting login"));
                 }
-                tracing::warn!("QR code expired, refreshing ({refreshes}/3)");
+                println!("  QR code expired, refreshing ({refreshes}/3)...");
                 let new_resp: QrCodeResponse = http
                     .get(format!(
                         "{DEFAULT_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3"
@@ -472,8 +470,8 @@ fn render_qr_terminal(url: &str) {
     let code = match QrCode::new(url.as_bytes()) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = %e, "failed to generate QR code");
-            tracing::info!(url = %url, "scan this URL manually");
+            eprintln!("  Failed to render QR code: {e}");
+            println!("  Scan this URL manually: {url}");
             return;
         }
     };
@@ -484,7 +482,6 @@ fn render_qr_terminal(url: &str) {
         .light_color(qrcode::render::unicode::Dense1x2::Dark)
         .build();
     println!("{string}");
-    tracing::info!(url = %url, "scan the QR code above with WeChat");
 }
 
 // ---------------------------------------------------------------------------
