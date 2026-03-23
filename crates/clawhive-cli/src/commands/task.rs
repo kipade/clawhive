@@ -42,7 +42,8 @@ pub(crate) async fn run(cmd: TaskCommands, root: &Path) -> Result<()> {
                 message_source: None,
             };
             match gateway.handle_inbound(inbound).await {
-                Ok(out) => println!("{}", out.text),
+                Ok(Some(out)) => println!("{}", out.text),
+                Ok(None) => {}
                 Err(err) => eprintln!("Task failed: {err}"),
             }
         }

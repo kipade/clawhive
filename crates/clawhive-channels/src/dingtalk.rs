@@ -384,7 +384,7 @@ impl DingTalkBot {
                         let conv_id = callback.conversation_id.clone();
                         tokio::spawn(async move {
                             match gw.handle_inbound(inbound).await {
-                                Ok(outbound) => {
+                                Ok(Some(outbound)) => {
                                     if !outbound.text.trim().is_empty() {
                                         if let Err(e) = client
                                             .reply_via_session_webhook(&conv_id, &outbound.text)
@@ -398,6 +398,7 @@ impl DingTalkBot {
                                         }
                                     }
                                 }
+                                Ok(None) => {}
                                 Err(e) => {
                                     tracing::error!(
                                         target: "clawhive::channel::dingtalk",

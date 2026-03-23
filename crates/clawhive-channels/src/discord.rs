@@ -378,7 +378,7 @@ impl EventHandler for DiscordHandler {
             typing_handle.abort();
 
             match result {
-                Ok(outbound) => {
+                Ok(Some(outbound)) => {
                     let has_attachments = !outbound.attachments.is_empty();
                     let has_text = !outbound.text.trim().is_empty();
 
@@ -419,6 +419,7 @@ impl EventHandler for DiscordHandler {
                         }
                     }
                 }
+                Ok(None) => {}
                 Err(err) => {
                     tracing::error!("discord gateway error: {err}");
                     let user_msg = format!("Error: {err}");
@@ -503,7 +504,8 @@ impl DiscordHandler {
         let inbound = adapter.to_inbound(guild_id, channel_id.get(), user_id, text, None);
 
         let reply_text = match self.gateway.handle_inbound(inbound).await {
-            Ok(outbound) => outbound.text,
+            Ok(Some(outbound)) => outbound.text,
+            Ok(None) => String::new(),
             Err(e) => format!("❌ Error: {e}"),
         };
 
@@ -565,13 +567,16 @@ impl DiscordHandler {
         let inbound = adapter.to_inbound(guild_id, channel_id.get(), user_id, &text, None);
 
         match self.gateway.handle_inbound(inbound).await {
-            Ok(outbound) => {
+            Ok(Some(outbound)) => {
                 let reply = if outbound.text.trim().is_empty() {
                     "Sorry, I got an empty response. Please try again."
                 } else {
                     outbound.text.as_str()
                 };
                 edit_deferred_response(ctx, &cmd, reply).await;
+            }
+            Ok(None) => {
+                edit_deferred_response(ctx, &cmd, "No agent matched this request.").await;
             }
             Err(err) => {
                 tracing::error!("discord slash command gateway error: {err}");

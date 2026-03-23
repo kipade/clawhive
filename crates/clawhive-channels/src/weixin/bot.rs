@@ -164,7 +164,7 @@ impl WeixinBot {
                             }
 
                             match gw.handle_inbound(inbound).await {
-                                Ok(outbound) => {
+                                Ok(Some(outbound)) => {
                                     if let Err(e) = send_outbound_reply(
                                         &client_clone,
                                         &from_user,
@@ -180,6 +180,7 @@ impl WeixinBot {
                                         );
                                     }
                                 }
+                                Ok(None) => {}
                                 Err(e) => {
                                     tracing::error!(
                                         target: "clawhive::channel::weixin",

@@ -337,7 +337,7 @@ impl TelegramBot {
                     typing_handle.abort();
 
                     match result {
-                        Ok(outbound) => {
+                        Ok(Some(outbound)) => {
                             match attachment_text_mode(
                                 &outbound.text,
                                 !outbound.attachments.is_empty(),
@@ -419,6 +419,7 @@ impl TelegramBot {
                                 }
                             }
                         }
+                        Ok(None) => {}
                         Err(err) => {
                             tracing::error!(
                                 trace_id = %trace_id,
@@ -497,7 +498,8 @@ impl TelegramBot {
                         };
                         tokio::spawn(async move {
                             let reply_text = match gateway.handle_inbound(inbound).await {
-                                Ok(outbound) => outbound.text,
+                                Ok(Some(outbound)) => outbound.text,
+                                Ok(None) => String::new(),
                                 Err(e) => format!("\u{274c} Error: {e}"),
                             };
                             let _ = bot.send_message(chat_id, &reply_text).await;
@@ -574,7 +576,8 @@ impl TelegramBot {
                     // Process in background
                     tokio::spawn(async move {
                         let reply_text = match gateway.handle_inbound(inbound).await {
-                            Ok(outbound) => outbound.text,
+                            Ok(Some(outbound)) => outbound.text,
+                            Ok(None) => String::new(),
                             Err(e) => format!("\u{274c} Error: {e}"),
                         };
                         let _ = bot.send_message(chat_id, &reply_text).await;

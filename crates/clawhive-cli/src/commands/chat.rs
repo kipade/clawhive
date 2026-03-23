@@ -59,7 +59,8 @@ async fn run_repl(
         };
 
         match gateway.handle_inbound(inbound).await {
-            Ok(out) => println!("{}", out.text),
+            Ok(Some(out)) => println!("{}", out.text),
+            Ok(None) => {}
             Err(err) => eprintln!("Error: {err}"),
         }
     }

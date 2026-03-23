@@ -296,7 +296,7 @@ impl FeishuBot {
             let placeholder_id: Option<String> = None;
 
             match gw.handle_inbound(inbound).await {
-                Ok(outbound) => {
+                Ok(Some(outbound)) => {
                     let text = outbound.text.trim();
 
                     if text.is_empty() && outbound.attachments.is_empty() {
@@ -394,6 +394,7 @@ impl FeishuBot {
                         }
                     }
                 }
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to handle inbound");
                     if let Some(ref ph_id) = placeholder_id {
@@ -553,7 +554,7 @@ impl FeishuBot {
         let client = client.clone();
         tokio::spawn(async move {
             match gw.handle_inbound(inbound).await {
-                Ok(outbound) => {
+                Ok(Some(outbound)) => {
                     let result_text = if outbound.text.trim().is_empty() {
                         format!("Decision recorded: {decision}")
                     } else {
@@ -567,6 +568,7 @@ impl FeishuBot {
                     let content = serde_json::to_string(&updated_card).unwrap_or_default();
                     let _ = client.edit_message(&msg_id, "interactive", &content).await;
                 }
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to handle approval callback")
                 }
@@ -624,7 +626,7 @@ impl FeishuBot {
         let client = client.clone();
         tokio::spawn(async move {
             match gw.handle_inbound(inbound).await {
-                Ok(outbound) => {
+                Ok(Some(outbound)) => {
                     let result_text = if outbound.text.trim().is_empty() {
                         "Skill installed successfully.".to_string()
                     } else {
@@ -638,6 +640,7 @@ impl FeishuBot {
                     let content = serde_json::to_string(&card).unwrap_or_default();
                     let _ = client.edit_message(&msg_id, "interactive", &content).await;
                 }
+                Ok(None) => {}
                 Err(e) => {
                     tracing::error!(target: "clawhive::channel::feishu", error = %e, "failed to handle skill confirm callback")
                 }

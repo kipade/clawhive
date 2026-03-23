@@ -712,7 +712,7 @@ async fn start_bot(
                 tracing::debug!("Sending heartbeat to agent {}", agent_id);
 
                 match gateway_clone.handle_inbound(inbound).await {
-                    Ok(outbound) => {
+                    Ok(Some(outbound)) => {
                         if is_heartbeat_ack(&outbound.text, 50) {
                             tracing::debug!("Heartbeat ack from {}", agent_id);
                         } else {
@@ -743,6 +743,9 @@ async fn start_bot(
                                 );
                             }
                         }
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Heartbeat got no routing match for {}", agent_id);
                     }
                     Err(e) => {
                         tracing::error!("Heartbeat failed for {}: {}", agent_id, e);

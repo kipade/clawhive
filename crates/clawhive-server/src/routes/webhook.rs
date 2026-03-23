@@ -89,13 +89,18 @@ async fn handle_webhook(
         message_source: Some("webhook_event".to_string()),
     };
 
-    let agent_id = gateway.resolve_agent(&inbound);
+    let Some(agent_id) = gateway.resolve_agent(&inbound) else {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ignored"})),
+        ));
+    };
     let delivery = find_delivery_for_webhook(&state, &source_id);
 
     let bus = state.bus.clone();
     tokio::spawn(async move {
         match gateway.handle_inbound(inbound).await {
-            Ok(outbound) => {
+            Ok(Some(outbound)) => {
                 if let Some(delivery) = delivery {
                     let conversation_scope = delivery
                         .target
@@ -110,6 +115,7 @@ async fn handle_webhook(
                         .await;
                 }
             }
+            Ok(None) => {}
             Err(error) => {
                 tracing::warn!(
                     trace_id = %trace_id,

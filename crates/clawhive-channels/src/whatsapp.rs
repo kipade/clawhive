@@ -299,7 +299,14 @@ pub async fn start_whatsapp(
 
                         let _ = client.chatstate().send_composing(&info.source.chat).await;
 
-                        let agent_id = gateway.resolve_agent(&inbound);
+                        let Some(agent_id) = gateway.resolve_agent(&inbound) else {
+                            tracing::debug!(
+                                target: "clawhive::channel::whatsapp",
+                                conversation_scope = %inbound.conversation_scope,
+                                "no routing binding matched, ignoring message"
+                            );
+                            return;
+                        };
                         let agent_emoji = gateway
                             .orchestrator()
                             .config_view()
@@ -310,7 +317,7 @@ pub async fn start_whatsapp(
                         let prefix = build_bot_prefix(agent_emoji.as_deref());
 
                         match gateway.handle_inbound(inbound).await {
-                            Ok(outbound) => {
+                            Ok(Some(outbound)) => {
                                 let _ = client.chatstate().send_paused(&info.source.chat).await;
 
                                 let has_text = !outbound.text.trim().is_empty();
@@ -373,6 +380,7 @@ pub async fn start_whatsapp(
                                     }
                                 }
                             }
+                            Ok(None) => {}
                             Err(err) => {
                                 let _ = client.chatstate().send_paused(&info.source.chat).await;
                                 tracing::error!("Gateway error for WhatsApp message: {err}");

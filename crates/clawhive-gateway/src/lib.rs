@@ -162,38 +162,41 @@ impl Gateway {
         }
     }
 
-    pub fn resolve_agent(&self, inbound: &InboundMessage) -> String {
+    pub fn resolve_agent(&self, inbound: &InboundMessage) -> Option<String> {
         let view = self.orchestrator.config_view();
         Self::resolve_agent_from_routing(&view.routing, inbound)
     }
 
-    fn resolve_agent_from_routing(routing: &RoutingConfig, inbound: &InboundMessage) -> String {
+    fn resolve_agent_from_routing(
+        routing: &RoutingConfig,
+        inbound: &InboundMessage,
+    ) -> Option<String> {
         for binding in &routing.bindings {
             if binding.channel_type == inbound.channel_type
                 && binding.connector_id == inbound.connector_id
             {
                 match binding.match_rule.kind.as_str() {
                     "dm" if !inbound.conversation_scope.contains("group") => {
-                        return binding.agent_id.clone();
+                        return Some(binding.agent_id.clone());
                     }
                     "mention" if inbound.is_mention => {
                         if let Some(pattern) = &binding.match_rule.pattern {
                             if inbound.mention_target.as_deref() == Some(pattern.as_str()) {
-                                return binding.agent_id.clone();
+                                return Some(binding.agent_id.clone());
                             }
                         }
                     }
-                    "group" => {
-                        return binding.agent_id.clone();
+                    "group" if inbound.conversation_scope.contains("group") => {
+                        return Some(binding.agent_id.clone());
                     }
                     "all" => {
-                        return binding.agent_id.clone();
+                        return Some(binding.agent_id.clone());
                     }
                     _ => {}
                 }
             }
         }
-        routing.default_agent_id.clone()
+        None
     }
 
     pub async fn handle_inbound_for_agent(
@@ -259,9 +262,9 @@ impl Gateway {
         }
     }
 
-    pub async fn handle_inbound(&self, inbound: InboundMessage) -> Result<OutboundMessage> {
+    pub async fn handle_inbound(&self, inbound: InboundMessage) -> Result<Option<OutboundMessage>> {
         if let Some(approval_response) = self.try_handle_approve(&inbound).await {
-            return Ok(approval_response);
+            return Ok(Some(approval_response));
         }
 
         if !self.rate_limiter.check(&inbound.user_scope).await {
@@ -269,10 +272,19 @@ impl Gateway {
         }
 
         let view = self.orchestrator.config_view();
-        let agent_id = Self::resolve_agent_from_routing(&view.routing, &inbound);
+        let Some(agent_id) = Self::resolve_agent_from_routing(&view.routing, &inbound) else {
+            tracing::debug!(
+                channel_type = %inbound.channel_type,
+                connector_id = %inbound.connector_id,
+                conversation_scope = %inbound.conversation_scope,
+                "no routing binding matched, ignoring message"
+            );
+            return Ok(None);
+        };
 
         self.handle_inbound_for_agent_with_view(view, inbound, &agent_id)
             .await
+            .map(Some)
     }
 
     pub fn orchestrator(&self) -> &Arc<Orchestrator> {
@@ -1288,9 +1300,25 @@ mod tests {
         )
     }
 
+    fn add_catch_all_binding(gw: &Gateway) {
+        apply_test_routing(gw, |routing| {
+            routing.bindings.push(RoutingBinding {
+                channel_type: "telegram".into(),
+                connector_id: "tg_main".into(),
+                match_rule: MatchRule {
+                    kind: "all".into(),
+                    pattern: None,
+                },
+                agent_id: "clawhive-main".into(),
+                delivery: None,
+            });
+        });
+    }
+
     #[tokio::test]
     async fn gateway_e2e_inbound_to_outbound() {
         let (gw, _tmp) = make_gateway().await;
+        add_catch_all_binding(&gw);
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
             channel_type: "telegram".into(),
@@ -1306,7 +1334,11 @@ mod tests {
             attachments: vec![],
             message_source: None,
         };
-        let out = gw.handle_inbound(inbound).await.unwrap();
+        let out = gw
+            .handle_inbound(inbound)
+            .await
+            .unwrap()
+            .expect("expected routing match");
         assert!(out.text.contains("stub:anthropic:claude-sonnet-4-5"));
     }
 
@@ -1328,7 +1360,7 @@ mod tests {
             attachments: vec![],
             message_source: None,
         };
-        assert_eq!(gw.resolve_agent(&inbound), "clawhive-main");
+        assert_eq!(gw.resolve_agent(&inbound), None);
     }
 
     #[tokio::test]
@@ -1370,7 +1402,7 @@ mod tests {
             message_source: None,
         };
 
-        assert_eq!(gw.resolve_agent(&inbound), "clawhive-builder");
+        assert_eq!(gw.resolve_agent(&inbound), Some("clawhive-builder".into()));
     }
 
     #[tokio::test]
@@ -1442,7 +1474,7 @@ mod tests {
             attachments: vec![],
             message_source: None,
         };
-        assert_eq!(gw.resolve_agent(&inbound), "clawhive-builder");
+        assert_eq!(gw.resolve_agent(&inbound), Some("clawhive-builder".into()));
     }
 
     #[tokio::test]
@@ -1508,7 +1540,7 @@ mod tests {
             attachments: vec![],
             message_source: None,
         };
-        assert_eq!(gw.resolve_agent(&inbound), "clawhive-dm");
+        assert_eq!(gw.resolve_agent(&inbound), Some("clawhive-dm".into()));
     }
 
     #[tokio::test]
@@ -1541,7 +1573,7 @@ mod tests {
             attachments: vec![],
             message_source: None,
         };
-        assert_eq!(gw.resolve_agent(&inbound), "clawhive-main");
+        assert_eq!(gw.resolve_agent(&inbound), None);
     }
 
     #[tokio::test]
@@ -1563,7 +1595,7 @@ mod tests {
             trace_id: uuid::Uuid::new_v4(),
             channel_type: "telegram".into(),
             connector_id: "tg_main".into(),
-            conversation_scope: "chat:999".into(),
+            conversation_scope: "group:chat:999".into(),
             user_scope: "user:1".into(),
             text: "any msg".into(),
             at: chrono::Utc::now(),
@@ -1574,12 +1606,13 @@ mod tests {
             attachments: vec![],
             message_source: None,
         };
-        assert_eq!(gw.resolve_agent(&inbound), "clawhive-group");
+        assert_eq!(gw.resolve_agent(&inbound), Some("clawhive-group".into()));
     }
 
     #[tokio::test]
     async fn handle_inbound_rejects_when_rate_limited() {
         let (mut gw, _tmp) = make_gateway().await;
+        add_catch_all_binding(&gw);
         gw.rate_limiter = RateLimiter::new(RateLimitConfig {
             requests_per_minute: 60,
             burst: 1,
@@ -1602,6 +1635,7 @@ mod tests {
 
         let first = gw.handle_inbound(make_inbound()).await;
         assert!(first.is_ok());
+        assert!(first.unwrap().is_some());
 
         let second = gw.handle_inbound(make_inbound()).await;
         assert!(second.is_err());
@@ -1611,6 +1645,7 @@ mod tests {
     #[tokio::test]
     async fn handle_inbound_publishes_handle_incoming_before_accept() {
         let (gw, mut incoming_rx, mut accepted_rx, _tmp) = make_gateway_with_receivers().await;
+        add_catch_all_binding(&gw);
         let inbound = InboundMessage {
             trace_id: uuid::Uuid::new_v4(),
             channel_type: "telegram".into(),
@@ -1631,7 +1666,11 @@ mod tests {
         let expected_conv = inbound.conversation_scope.clone();
         let expected_user = inbound.user_scope.clone();
 
-        let _ = gw.handle_inbound(inbound).await.unwrap();
+        let _ = gw
+            .handle_inbound(inbound)
+            .await
+            .unwrap()
+            .expect("expected routing match");
 
         let incoming =
             tokio::time::timeout(std::time::Duration::from_millis(200), incoming_rx.recv())
@@ -1690,7 +1729,11 @@ mod tests {
             message_source: None,
         };
 
-        let out = gw.handle_inbound(inbound).await.unwrap();
+        let out = gw
+            .handle_inbound(inbound)
+            .await
+            .unwrap()
+            .expect("expected routing match");
         assert!(out.text.contains("Approval resolved"));
         let decision = rx.await.unwrap();
         assert_eq!(decision, ApprovalDecision::AllowOnce);
@@ -1717,7 +1760,11 @@ mod tests {
             message_source: None,
         };
 
-        let out = gw.handle_inbound(inbound).await.unwrap();
+        let out = gw
+            .handle_inbound(inbound)
+            .await
+            .unwrap()
+            .expect("expected routing match");
         assert!(out.text.contains("Usage: /approve"));
     }
 
@@ -1758,7 +1805,7 @@ mod tests {
             attachments: vec![],
             message_source: None,
         };
-        assert_eq!(gw.resolve_agent(&inbound), "clawhive-main");
+        assert_eq!(gw.resolve_agent(&inbound), None);
     }
 
     #[tokio::test]
