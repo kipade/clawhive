@@ -845,7 +845,7 @@ impl Orchestrator {
         // Handle slash commands before LLM
         if let Some(cmd) = super::slash_commands::parse_command(&inbound.text) {
             match cmd {
-                super::slash_commands::SlashCommand::Model => {
+                super::slash_commands::SlashCommand::Model { new_model: _ } => {
                     return Ok(OutboundMessage {
                         trace_id: inbound.trace_id,
                         channel_type: inbound.channel_type,

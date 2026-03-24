@@ -14,8 +14,11 @@ pub enum SlashCommand {
     New {
         model_hint: Option<String>,
     },
-    /// /model - Show current model info
-    Model,
+    /// /model - Show current model info or change model
+    /// /model provider/model - Change to specified model (persisted)
+    Model {
+        new_model: Option<String>,
+    },
     /// /status - Show session status
     Status,
     SkillAnalyze {
@@ -63,7 +66,10 @@ pub fn parse_command(text: &str) -> Option<SlashCommand> {
             let model_hint = rest.first().map(|s| s.to_string());
             Some(SlashCommand::New { model_hint })
         }
-        "/model" => Some(SlashCommand::Model),
+        "/model" => {
+            let new_model = rest.first().map(|s| s.to_string());
+            Some(SlashCommand::Model { new_model })
+        }
         "/status" => Some(SlashCommand::Status),
         "/skill" => {
             let action = rest.first().map(|s| s.to_lowercase());
@@ -185,8 +191,37 @@ mod tests {
 
     #[test]
     fn parse_model_command() {
-        assert_eq!(parse_command("/model"), Some(SlashCommand::Model));
-        assert_eq!(parse_command("/MODEL"), Some(SlashCommand::Model));
+        assert_eq!(
+            parse_command("/model"),
+            Some(SlashCommand::Model { new_model: None })
+        );
+        assert_eq!(
+            parse_command("/MODEL"),
+            Some(SlashCommand::Model { new_model: None })
+        );
+    }
+
+    #[test]
+    fn parse_model_command_with_arg() {
+        assert_eq!(
+            parse_command("/model openai/gpt-5.2"),
+            Some(SlashCommand::Model {
+                new_model: Some("openai/gpt-5.2".to_string())
+            })
+        );
+        assert_eq!(
+            parse_command("  /model  anthropic/claude-sonnet-4-6  "),
+            Some(SlashCommand::Model {
+                new_model: Some("anthropic/claude-sonnet-4-6".to_string())
+            })
+        );
+        // Nested model name (openrouter)
+        assert_eq!(
+            parse_command("/model openrouter/anthropic/claude-opus-4-6"),
+            Some(SlashCommand::Model {
+                new_model: Some("openrouter/anthropic/claude-opus-4-6".to_string())
+            })
+        );
     }
 
     #[test]
