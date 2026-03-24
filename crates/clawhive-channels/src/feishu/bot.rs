@@ -263,6 +263,7 @@ impl FeishuBot {
                         if let Ok(event) = serde_json::from_value::<FeishuCardActionEvent>(raw) {
                             self.handle_card_action(&event, client).await;
                         }
+                        return Some(self.build_card_action_ack(frame));
                     }
                     other => {
                         tracing::debug!(target: "clawhive::channel::feishu", event_type = other, "ignoring unhandled event type");
@@ -646,6 +647,27 @@ impl FeishuBot {
                 }
             }
         });
+    }
+
+    /// Build ACK for card action callbacks.
+    /// Feishu card actions expect code 0 and a toast in data to avoid error 200340.
+    fn build_card_action_ack(&self, original: &Frame) -> Vec<u8> {
+        let ack = FeishuAckResponse {
+            code: 0,
+            headers: std::collections::HashMap::new(),
+            data: Some(serde_json::json!({
+                "toast": {
+                    "type": "info",
+                    "content": "Processing..."
+                }
+            })),
+        };
+        let payload = serde_json::to_vec(&ack).unwrap_or_default();
+        let mut ack_frame = original.clone();
+        ack_frame.payload = payload;
+        let mut buf = Vec::new();
+        let _ = ack_frame.encode(&mut buf);
+        buf
     }
 
     fn build_ack(&self, original: &Frame, status_code: i32) -> Vec<u8> {
