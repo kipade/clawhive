@@ -329,8 +329,8 @@ impl ContextManager {
 
         // Check if memory flush is needed (approaching compaction but not yet over)
         if self.config.memory_flush.enabled {
-            let flush_threshold = compaction_threshold
-                .saturating_sub(self.config.memory_flush.soft_threshold_tokens);
+            let flush_threshold =
+                compaction_threshold.saturating_sub(self.config.memory_flush.soft_threshold_tokens);
             if tokens >= flush_threshold && tokens < compaction_threshold {
                 return ContextCheckResult::NeedsMemoryFlush {
                     system_prompt: self.config.memory_flush.system_prompt.clone(),
@@ -405,8 +405,8 @@ impl ContextManager {
 
         let tokens = estimate_messages_tokens(messages);
         let compaction_threshold = self.config.available_tokens() * 75 / 100;
-        let flush_threshold = compaction_threshold
-            .saturating_sub(self.config.memory_flush.soft_threshold_tokens);
+        let flush_threshold =
+            compaction_threshold.saturating_sub(self.config.memory_flush.soft_threshold_tokens);
 
         tokens >= flush_threshold && tokens < compaction_threshold
     }
