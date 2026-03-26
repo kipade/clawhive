@@ -117,9 +117,11 @@ impl ContextConfig {
 }
 
 /// Check if messages are approaching the context limit.
+/// Triggers at 75% of available tokens to compact proactively,
+/// preventing the model from slowing down and losing focus in long tasks.
 pub fn should_compact(messages: &[LlmMessage], config: &ContextConfig) -> bool {
     let tokens = estimate_messages_tokens(messages);
-    tokens > config.available_tokens()
+    tokens > config.available_tokens() * 75 / 100
 }
 
 /// Prune tool results from older messages to reduce context size.
@@ -323,12 +325,13 @@ impl ContextManager {
     pub fn check_context(&self, messages: &[LlmMessage]) -> ContextCheckResult {
         let tokens = estimate_messages_tokens(messages);
         let available = self.config.available_tokens();
+        let compaction_threshold = available * 75 / 100;
 
-        // Check if memory flush is needed (approaching limit but not over)
+        // Check if memory flush is needed (approaching compaction but not yet over)
         if self.config.memory_flush.enabled {
-            let flush_threshold =
-                available.saturating_sub(self.config.memory_flush.soft_threshold_tokens);
-            if tokens >= flush_threshold && tokens < available {
+            let flush_threshold = compaction_threshold
+                .saturating_sub(self.config.memory_flush.soft_threshold_tokens);
+            if tokens >= flush_threshold && tokens < compaction_threshold {
                 return ContextCheckResult::NeedsMemoryFlush {
                     system_prompt: self.config.memory_flush.system_prompt.clone(),
                     prompt: self.config.memory_flush.prompt.clone(),
@@ -401,12 +404,11 @@ impl ContextManager {
         }
 
         let tokens = estimate_messages_tokens(messages);
-        let flush_threshold = self
-            .config
-            .available_tokens()
+        let compaction_threshold = self.config.available_tokens() * 75 / 100;
+        let flush_threshold = compaction_threshold
             .saturating_sub(self.config.memory_flush.soft_threshold_tokens);
 
-        tokens >= flush_threshold && tokens < self.config.available_tokens()
+        tokens >= flush_threshold && tokens < compaction_threshold
     }
 
     /// Get memory flush prompts.

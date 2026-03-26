@@ -1734,6 +1734,7 @@ impl Orchestrator {
         let mut memory_flush_triggered = false;
         let loop_started = std::time::Instant::now();
         let mut scheduled_task_retries: u32 = 0;
+        let mut empty_promise_retries: u32 = 0;
         let mut total_tool_calls: usize = 0;
         let attachment_collector: Arc<tokio::sync::Mutex<Vec<Attachment>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -2010,7 +2011,7 @@ impl Orchestrator {
 
                 {
                     let verdict = detect_empty_promise_structural(
-                        scheduled_task_retries,
+                        empty_promise_retries,
                         tool_uses.len(),
                         &resp.text,
                     );
@@ -2030,7 +2031,7 @@ impl Orchestrator {
                     };
 
                     if is_empty_promise {
-                        scheduled_task_retries += 1;
+                        empty_promise_retries += 1;
                         let detection_type = match verdict {
                             EmptyPromiseVerdict::Structural => "structural",
                             _ => "llm",
@@ -2038,7 +2039,7 @@ impl Orchestrator {
                         tracing::warn!(
                             agent_id = %agent_id,
                             iteration = iteration_no,
-                            retry_count = scheduled_task_retries,
+                            retry_count = empty_promise_retries,
                             response_len = resp.text.len(),
                             detection_type,
                             "tool_use_loop: empty promise detected, nudging to deliver content"
@@ -3024,7 +3025,7 @@ fn detect_empty_promise_structural(
     current_tool_calls: usize,
     response_text: &str,
 ) -> EmptyPromiseVerdict {
-    if retry_count >= 1 || current_tool_calls > 0 {
+    if retry_count >= 2 || current_tool_calls > 0 {
         return EmptyPromiseVerdict::No;
     }
 
@@ -3887,9 +3888,17 @@ Body"#,
     }
 
     #[test]
-    fn empty_promise_structural_skips_after_retry() {
+    fn empty_promise_structural_still_detects_after_first_retry() {
         assert_eq!(
             detect_empty_promise_structural(1, 0, "好，让我整合："),
+            EmptyPromiseVerdict::Structural,
+        );
+    }
+
+    #[test]
+    fn empty_promise_structural_skips_after_max_retries() {
+        assert_eq!(
+            detect_empty_promise_structural(2, 0, "好，让我整合："),
             EmptyPromiseVerdict::No,
         );
     }
