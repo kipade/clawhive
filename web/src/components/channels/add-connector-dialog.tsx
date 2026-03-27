@@ -33,6 +33,8 @@ type AddConnectorFormValues = {
   clientSecret: string;
   botId: string;
   secret: string;
+  dmPolicy: string;
+  allowFrom: string;
 };
 
 interface AddConnectorDialogProps {
@@ -54,6 +56,8 @@ export function AddConnectorDialog({ kind, label, onAdded }: AddConnectorDialogP
       clientSecret: "",
       botId: "",
       secret: "",
+      dmPolicy: "allowlist",
+      allowFrom: "",
     },
   });
 
@@ -68,6 +72,10 @@ export function AddConnectorDialog({ kind, label, onAdded }: AddConnectorDialogP
         ...(kind === "feishu" ? { appId: values.appId, appSecret: values.appSecret } : {}),
         ...(kind === "dingtalk" ? { clientId: values.clientId, clientSecret: values.clientSecret } : {}),
         ...(kind === "wecom" ? { botId: values.botId, secret: values.secret } : {}),
+        ...(kind === "telegram" ? { dmPolicy: values.dmPolicy } : {}),
+        ...(kind === "telegram" && values.dmPolicy === "allowlist" && values.allowFrom
+          ? { allowFrom: values.allowFrom.split(",").map(s => s.trim()).filter(Boolean) }
+          : {}),
       });
       toast.success(`${label} connector added`);
       onAdded?.();
@@ -219,6 +227,42 @@ export function AddConnectorDialog({ kind, label, onAdded }: AddConnectorDialogP
                   </FormItem>
                 )}
               />
+            )}
+            {kind === "telegram" && (
+              <>
+                <FormField
+                  control={form.control}
+                  name="dmPolicy"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>DM Access Policy</FormLabel>
+                      <FormControl>
+                        <select {...field} className="w-full rounded-md border px-3 py-2 text-sm">
+                          <option value="allowlist">Allowlist (recommended)</option>
+                          <option value="open">Open</option>
+                        </select>
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                {form.watch("dmPolicy") === "allowlist" && (
+                  <FormField
+                    control={form.control}
+                    name="allowFrom"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Allowed User IDs</FormLabel>
+                        <FormControl>
+                          <Input placeholder="Comma-separated Telegram user IDs" {...field} />
+                        </FormControl>
+                        <p className="text-xs text-muted-foreground">Use @userinfobot on Telegram to find your ID.</p>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                )}
+              </>
             )}
             <DialogFooter>
               <Button type="submit" disabled={addConnector.isPending}>

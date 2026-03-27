@@ -67,6 +67,8 @@ function AddChannelDialog({
   const [clientSecret, setClientSecret] = useState("");
   const [botIdField, setBotIdField] = useState("");
   const [secretField, setSecretField] = useState("");
+  const [dmPolicy, setDmPolicy] = useState<"allowlist" | "open">("allowlist");
+  const [allowFromField, setAllowFromField] = useState("");
   const updateChannels = useUpdateChannels();
   const addConnector = useAddConnector();
   const { data: channels } = useChannels();
@@ -82,6 +84,8 @@ function AddChannelDialog({
     setClientSecret("");
     setBotIdField("");
     setSecretField("");
+    setDmPolicy("allowlist");
+    setAllowFromField("");
   };
 
   const handleSubmit = async () => {
@@ -103,6 +107,10 @@ function AddChannelDialog({
         ...(selectedKind === "feishu" ? { appId, appSecret } : {}),
         ...(selectedKind === "dingtalk" ? { clientId, clientSecret } : {}),
         ...(selectedKind === "wecom" ? { botId: botIdField, secret: secretField } : {}),
+        ...(selectedKind === "telegram" ? { dmPolicy } : {}),
+        ...(selectedKind === "telegram" && dmPolicy === "allowlist" && allowFromField
+          ? { allowFrom: allowFromField.split(",").map(s => s.trim()).filter(Boolean) }
+          : {}),
       });
       toast.success(`${CHANNEL_META[selectedKind]?.label ?? selectedKind} channel added`);
       onDone();
@@ -212,6 +220,47 @@ function AddChannelDialog({
                 <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Bot Token</label>
                 <Input type="password" placeholder={selectedKind === "telegram" ? "123456:ABC-DEF..." : "Bot token from Developer Portal"} value={token} onChange={(e) => setToken(e.target.value)} className="mt-1" />
               </div>
+            )}
+
+            {selectedKind === "telegram" && (
+              <>
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">DM Access Policy</label>
+                  <div className="mt-1.5 flex gap-2">
+                    {([
+                      { label: "Allowlist (recommended)", value: "allowlist" as const },
+                      { label: "Open", value: "open" as const },
+                    ]).map((opt) => (
+                      <button
+                        key={opt.value}
+                        onClick={() => setDmPolicy(opt.value)}
+                        className={`rounded-md border px-3 py-1.5 text-xs font-medium transition-all ${
+                          dmPolicy === opt.value
+                            ? "border-primary bg-primary/5 text-primary ring-1 ring-primary/20"
+                            : "border-border hover:border-primary/40"
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                  {dmPolicy === "open" && (
+                    <p className="text-xs text-amber-600 mt-1">Anyone who finds your bot can chat with it.</p>
+                  )}
+                </div>
+                {dmPolicy === "allowlist" && (
+                  <div>
+                    <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Allowed User IDs</label>
+                    <Input
+                      placeholder="Your Telegram user ID (comma-separated)"
+                      value={allowFromField}
+                      onChange={(e) => setAllowFromField(e.target.value)}
+                      className="mt-1"
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">Use @userinfobot on Telegram to find your ID.</p>
+                  </div>
+                )}
+              </>
             )}
 
             {meta.tokenLink && (
