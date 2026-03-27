@@ -196,8 +196,23 @@ fn build_bot_factory() -> BotFactory {
                 .unwrap_or_default()
                 .to_string();
             let require_mention = config["require_mention"].as_bool().unwrap_or(false);
+            let allow_from = config["allow_from"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
+            let dm_policy = config["dm_policy"]
+                .as_str()
+                .unwrap_or("allowlist")
+                .to_string();
             let bot = TelegramBot::new(token, connector_id, gateway, bus)
-                .with_require_mention(require_mention);
+                .with_require_mention(require_mention)
+                .with_allow_from(allow_from)
+                .with_dm_policy(dm_policy);
             Ok(Box::pin(async move { Box::new(bot).run().await })
                 as std::pin::Pin<
                     Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
@@ -238,7 +253,9 @@ fn build_bot_factory() -> BotFactory {
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            let bot = FeishuBot::new(app_id, app_secret, connector_id, gateway, bus);
+            let require_mention = config["require_mention"].as_bool().unwrap_or(true);
+            let bot = FeishuBot::new(app_id, app_secret, connector_id, gateway, bus)
+                .with_require_mention(require_mention);
             Ok(Box::pin(async move { Box::new(bot).run().await })
                 as std::pin::Pin<
                     Box<dyn std::future::Future<Output = Result<()>> + Send + 'static>,
