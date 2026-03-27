@@ -36,6 +36,7 @@ pub(super) struct ChannelConfig {
     pub(super) db_path: Option<String>,
     pub(super) poll_interval_secs: Option<u64>,
     pub(super) allow_from: Option<Vec<String>>,
+    pub(super) dm_policy: Option<String>,
 }
 
 pub(super) fn handle_add_channel(
@@ -257,6 +258,57 @@ pub(super) fn handle_add_channel(
         (Vec::new(), true)
     };
 
+    // DM access policy: Telegram only
+    let (dm_policy, allow_from_ids) = if channel_type == "telegram" {
+        let policy_options = [
+            "allowlist \u{2014} Only allow specific users (recommended)",
+            "open \u{2014} Allow anyone",
+        ];
+        let policy_idx = Select::with_theme(theme)
+            .with_prompt("DM access policy")
+            .items(&policy_options)
+            .default(0)
+            .interact()?;
+        match policy_idx {
+            1 => {
+                // open: confirm
+                let confirmed = Confirm::with_theme(theme)
+                    .with_prompt("\u{26a0} This allows ANYONE to chat with your bot. Are you sure?")
+                    .default(false)
+                    .interact()?;
+                if !confirmed {
+                    return Ok(());
+                }
+                ("open".to_string(), vec![])
+            }
+            _ => {
+                // allowlist: require at least one user ID
+                let ids_input = loop {
+                    let input = match input_or_back(
+                        theme,
+                        "Your Telegram user ID (comma-separated for multiple)",
+                    )? {
+                        Some(v) => v,
+                        None => return Ok(()),
+                    };
+                    let ids: Vec<String> = input
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if ids.is_empty() {
+                        println!("At least one Telegram user ID is required.");
+                        continue;
+                    }
+                    break ids;
+                };
+                ("allowlist".to_string(), ids_input)
+            }
+        }
+    } else {
+        ("allowlist".to_string(), vec![])
+    };
+
     if !state.agents.is_empty() {
         let agent_labels: Vec<&str> = state.agents.iter().map(|a| a.agent_id.as_str()).collect();
         let agent_idx = Select::with_theme(theme)
@@ -289,7 +341,12 @@ pub(super) fn handle_add_channel(
         bot_token: bot_token_str,
         db_path: None,
         poll_interval_secs: poll_interval,
-        allow_from,
+        allow_from: if channel_type == "telegram" {
+            Some(allow_from_ids)
+        } else {
+            allow_from
+        },
+        dm_policy: Some(dm_policy),
     };
     add_channel_to_config(config_root, channel_type, &cfg)?;
     print_done(
@@ -337,8 +394,11 @@ fn add_channel_to_config(
                 connector_id: cfg.connector_id.clone(),
                 token: cfg.token.clone(),
                 require_mention: cfg.require_mention,
-                allow_from: vec![],
-                dm_policy: "allowlist".to_string(),
+                allow_from: cfg.allow_from.clone().unwrap_or_default(),
+                dm_policy: cfg
+                    .dm_policy
+                    .clone()
+                    .unwrap_or_else(|| "allowlist".to_string()),
             };
             match main_cfg.channels.telegram.as_mut() {
                 Some(tg) => {
