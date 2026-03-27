@@ -63,6 +63,8 @@ pub struct TelegramBot {
     gateway: Arc<Gateway>,
     bus: Arc<EventBus>,
     require_mention: bool,
+    allow_from: Vec<i64>,
+    dm_policy: String,
 }
 
 impl TelegramBot {
@@ -78,11 +80,26 @@ impl TelegramBot {
             gateway,
             bus,
             require_mention: true,
+            allow_from: vec![],
+            dm_policy: "allowlist".to_string(),
         }
     }
 
     pub fn with_require_mention(mut self, require: bool) -> Self {
         self.require_mention = require;
+        self
+    }
+
+    pub fn with_allow_from(mut self, allow_from: Vec<String>) -> Self {
+        self.allow_from = allow_from
+            .iter()
+            .filter_map(|s| s.parse::<i64>().ok())
+            .collect();
+        self
+    }
+
+    pub fn with_dm_policy(mut self, dm_policy: String) -> Self {
+        self.dm_policy = dm_policy;
         self
     }
 
@@ -108,6 +125,7 @@ impl TelegramBot {
         let bus = self.bus;
         let connector_id = self.connector_id.clone();
         let require_mention = self.require_mention;
+        let allow_from: Arc<Vec<i64>> = Arc::new(self.allow_from);
 
         // Create a bot holder for the delivery listener
         let bot_holder: Arc<RwLock<Option<Bot>>> = Arc::new(RwLock::new(Some(bot.clone())));
@@ -143,11 +161,51 @@ impl TelegramBot {
         let adapter_for_callback = adapter.clone();
         let connector_id_for_callback = self.connector_id.clone();
 
+        let allow_from_for_msg = allow_from.clone();
+        let dm_policy_for_msg = self.dm_policy.clone();
+        let connector_id_for_msg = connector_id.clone();
         let message_handler = Update::filter_message().endpoint(move |bot: Bot, msg: Message| {
             let adapter = adapter.clone();
             let gateway = gateway.clone();
+            let allow_from = allow_from_for_msg.clone();
+            let dm_policy = dm_policy_for_msg.clone();
+            let connector_id = connector_id_for_msg.clone();
 
             async move {
+                // DM access control
+                let user_id = msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0);
+                let is_dm = !msg.chat.is_group() && !msg.chat.is_supergroup();
+                if is_dm {
+                    let allowed = match dm_policy.as_str() {
+                        "open" => true,
+                        "disabled" => false,
+                        _ => {
+                            // "allowlist" (default): check allow_from
+                            if allow_from.is_empty() {
+                                false
+                            } else {
+                                allow_from.contains(&user_id)
+                            }
+                        }
+                    };
+                    if !allowed {
+                        if dm_policy != "open" && allow_from.is_empty() {
+                            tracing::warn!(
+                                connector_id = %connector_id,
+                                "telegram DM rejected: dm_policy is '{}' but allow_from is empty — configure allow_from or set dm_policy to 'open'",
+                                dm_policy
+                            );
+                        } else {
+                            tracing::warn!(
+                                user_id,
+                                chat_id = msg.chat.id.0,
+                                "telegram DM rejected: user not in allow_from list"
+                            );
+                        }
+                        return Ok::<(), teloxide::RequestError>(());
+                    }
+                }
+
                 let has_photo = msg.photo().is_some();
                 let has_document = msg.document().is_some();
                 let has_voice = msg.voice().is_some();
@@ -178,7 +236,6 @@ impl TelegramBot {
                 }
 
                 let chat_id = msg.chat.id;
-                let user_id = msg.from.as_ref().map(|user| user.id.0 as i64).unwrap_or(0);
                 let (is_mention, mention_target) = detect_mention(&msg);
                 let message_id = msg.id.0;
 
@@ -448,14 +505,26 @@ impl TelegramBot {
             }
         });
 
+        let allow_from_for_cb = allow_from.clone();
         let callback_handler =
             Update::filter_callback_query().endpoint(move |bot: Bot, q: CallbackQuery| {
                 let gateway = gateway_for_callback.clone();
                 let adapter = adapter_for_callback.clone();
                 let connector_id = connector_id_for_callback.clone();
+                let allow_from = allow_from_for_cb.clone();
 
                 tracing::info!(callback_data = ?q.data, from = q.from.id.0, "telegram callback_query received");
                 async move {
+                    // User allowlist filtering
+                    let cb_user_id = q.from.id.0 as i64;
+                    if !allow_from.is_empty() && !allow_from.contains(&cb_user_id) {
+                        tracing::warn!(
+                            user_id = cb_user_id,
+                            "telegram callback rejected: user not in allow_from list"
+                        );
+                        return Ok::<(), teloxide::RequestError>(());
+                    }
+
                     let Some(data) = q.data else {
                         return Ok::<(), teloxide::RequestError>(());
                     };
