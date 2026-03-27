@@ -67,6 +67,10 @@ struct AddConnectorRequest {
     groups: Option<Vec<String>>,
     #[serde(default)]
     require_mention: Option<bool>,
+    #[serde(default)]
+    dm_policy: Option<String>,
+    #[serde(default)]
+    allow_from: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -646,6 +650,24 @@ async fn add_connector(
             connector.insert(
                 serde_yaml::Value::String("require_mention".to_string()),
                 serde_yaml::Value::Bool(false),
+            );
+        }
+    }
+    if let Some(dm_policy) = &body.dm_policy {
+        connector.insert(
+            serde_yaml::Value::String("dm_policy".to_string()),
+            serde_yaml::Value::String(dm_policy.clone()),
+        );
+    }
+    if let Some(allow_from) = &body.allow_from {
+        if !allow_from.is_empty() {
+            let allow_from_seq: Vec<serde_yaml::Value> = allow_from
+                .iter()
+                .map(|id| serde_yaml::Value::String(id.clone()))
+                .collect();
+            connector.insert(
+                serde_yaml::Value::String("allow_from".to_string()),
+                serde_yaml::Value::Sequence(allow_from_seq),
             );
         }
     }
