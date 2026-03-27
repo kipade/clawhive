@@ -360,12 +360,14 @@ export function useUpdateChannels() {
 export function useAddConnector() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ kind, connectorId, token, groups, requireMention, appId, appSecret, clientId, clientSecret, botId, secret }: {
+    mutationFn: ({ kind, connectorId, token, groups, requireMention, dmPolicy, allowFrom, appId, appSecret, clientId, clientSecret, botId, secret }: {
       kind: string;
       connectorId: string;
       token?: string;
       groups?: string[];
       requireMention?: boolean;
+      dmPolicy?: string;
+      allowFrom?: string[];
       appId?: string;
       appSecret?: string;
       clientId?: string;
@@ -386,6 +388,8 @@ export function useAddConnector() {
           ...(secret ? { secret } : {}),
           ...(groups && groups.length > 0 ? { groups } : {}),
           ...(requireMention !== undefined ? { require_mention: requireMention } : {}),
+          ...(dmPolicy ? { dm_policy: dmPolicy } : {}),
+          ...(allowFrom && allowFrom.length > 0 ? { allow_from: allowFrom } : {}),
         }),
       }),
     onSuccess: () => {
