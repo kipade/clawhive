@@ -1104,8 +1104,8 @@ impl Orchestrator {
             agent
                 .tool_policy
                 .as_ref()
-                .map(|tp| tp.allow.clone())
-                .filter(|v| !v.is_empty()),
+                .map(|tp| tp.allow.clone()),
+            //.filter(|v| !v.is_empty()),
         );
         let source_info = Some((
             inbound.channel_type.clone(),
@@ -1430,8 +1430,8 @@ impl Orchestrator {
             agent
                 .tool_policy
                 .as_ref()
-                .map(|tp| tp.allow.clone())
-                .filter(|v| !v.is_empty()),
+                .map(|tp| tp.allow.clone()),
+            //.filter(|v| !v.is_empty()),
         );
         let source_info_stream = Some((
             inbound.channel_type.clone(),
@@ -2216,8 +2216,8 @@ impl Orchestrator {
                 agent
                     .tool_policy
                     .as_ref()
-                    .map(|tp| tp.allow.as_slice())
-                    .filter(|v| !v.is_empty()),
+                    .map(|tp| tp.allow.as_slice()),
+                // .filter(|v| !v.is_empty()),
                 None,
                 agent.security.clone(),
                 agent

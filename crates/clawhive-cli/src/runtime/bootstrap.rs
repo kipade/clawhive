@@ -827,10 +827,23 @@ pub(crate) async fn build_router_from_config(config: &ClawhiveConfig) -> LlmRout
                         .clone()
                         .filter(|k| !k.is_empty())
                         .unwrap_or_default();
-                    let provider = Arc::new(custom(api_key, provider_config.api_base.clone()));
+                    let timeout_secs = provider_config.timeout_secs.unwrap_or(300);
+                    let client = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(timeout_secs))
+                        .build()
+                        .unwrap_or_default();
+                    let mut p = OpenAiProvider::with_client(
+                        client,
+                        api_key,
+                        provider_config.api_base.clone(),
+                        None,
+                    );
+                    p.set_strip_reasoning(true);
+                    let provider = Arc::new(p);
                     registry.register(&provider_config.provider_id, provider);
                     tracing::info!(
                         provider_id = %provider_config.provider_id,
+                        timeout_secs = timeout_secs,
                         "custom OpenAI-compatible provider registered"
                     );
                 } else {

@@ -411,6 +411,9 @@ pub struct ProviderConfig {
     pub provider_type: Option<String>,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Request timeout in seconds. Defaults to 60s for cloud APIs; set higher for local Ollama.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
